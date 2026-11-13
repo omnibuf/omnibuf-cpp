@@ -1,0 +1,122 @@
+{
+  "language": "cpp",
+  "runtime": "Apple Clang 21.0.0 (C++20)",
+  "platform": "darwin",
+  "arch": "arm64",
+  "cpu": "Apple M1 Pro",
+  "workload": "PeerUpdate",
+  "categories": [
+    {
+      "id": "encode",
+      "title": "Full Message Encode Speed (PeerUpdate)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 370,
+          "opsPerSec": 2705739,
+          "wireBytes": 366,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "Protobuf (LEB128 Wire)",
+          "nsPerOp": 403,
+          "opsPerSec": 2479628,
+          "wireBytes": 341
+        },
+        {
+          "name": "OmniBuf (C++ Struct)",
+          "nsPerOp": 465,
+          "opsPerSec": 2150041,
+          "wireBytes": 366,
+          "highlight": true
+        },
+        {
+          "name": "JSON",
+          "nsPerOp": 1693,
+          "opsPerSec": 590505,
+          "wireBytes": 803
+        }
+      ]
+    },
+    {
+      "id": "decode",
+      "title": "Full Message Decode Speed (PeerUpdate)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 509,
+          "opsPerSec": 1964472,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "Protobuf (LEB128 Wire)",
+          "nsPerOp": 562,
+          "opsPerSec": 1778863
+        },
+        {
+          "name": "OmniBuf (C++ Struct)",
+          "nsPerOp": 1153,
+          "opsPerSec": 867055,
+          "highlight": true
+        },
+        {
+          "name": "JSON",
+          "nsPerOp": 1622,
+          "opsPerSec": 616396
+        }
+      ]
+    },
+    {
+      "id": "lookup_city",
+      "title": "Read a Single Nested Field (peer.location.city)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 118,
+          "opsPerSec": 8472387,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "Protobuf (LEB128 Wire)",
+          "nsPerOp": 562,
+          "opsPerSec": 1778693
+        },
+        {
+          "name": "JSON",
+          "nsPerOp": 1571,
+          "opsPerSec": 636440
+        }
+      ]
+    },
+    {
+      "id": "mutate_sequence",
+      "title": "Selective Single-Field Mutation (peer.sequence)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 153,
+          "opsPerSec": 6541843,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "Protobuf (LEB128 Wire)",
+          "nsPerOp": 974,
+          "opsPerSec": 1026765
+        },
+        {
+          "name": "JSON",
+          "nsPerOp": 3341,
+          "opsPerSec": 299268
+        }
+      ]
+    }
+  ]
+}

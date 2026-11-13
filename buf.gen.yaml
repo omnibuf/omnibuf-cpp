@@ -1,0 +1,4 @@
+version: v2
+plugins:
+  - local: ./build/protoc-gen-omnibuf-cpp
+    out: build/gen
