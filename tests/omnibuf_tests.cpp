@@ -718,47 +718,52 @@ void test_recursive_struct_unordered_map_and_descriptors() {
     };
 
     // 1. TYPE_GROUP rejected
-    omnibuf::proto::FieldDescriptorProto grp{.name = "g",
-                                             .number = 1,
-                                             .label = omnibuf::proto::FieldLabel::Optional,
-                                             .type = omnibuf::proto::FieldType::Group,
-                                             .has_type = true};
+    omnibuf::proto::FieldDescriptorProto grp;
+    grp.name = "g";
+    grp.number = 1;
+    grp.label = omnibuf::proto::FieldLabel::Optional;
+    grp.type = omnibuf::proto::FieldType::Group;
+    grp.has_type = true;
     omnibuf::proto::DescriptorPool p1;
     CHECK(!p1.add_file_descriptor_set(make_single_field_fds(grp)).ok());
 
     // 2. LABEL_REQUIRED rejected
-    omnibuf::proto::FieldDescriptorProto req{.name = "r",
-                                             .number = 1,
-                                             .label = omnibuf::proto::FieldLabel::Required,
-                                             .type = omnibuf::proto::FieldType::Uint32,
-                                             .has_type = true};
+    omnibuf::proto::FieldDescriptorProto req;
+    req.name = "r";
+    req.number = 1;
+    req.label = omnibuf::proto::FieldLabel::Required;
+    req.type = omnibuf::proto::FieldType::Uint32;
+    req.has_type = true;
     omnibuf::proto::DescriptorPool p2;
     CHECK(!p2.add_file_descriptor_set(make_single_field_fds(req)).ok());
 
     // 3. Custom proto2 default_value rejected
-    omnibuf::proto::FieldDescriptorProto def{.name = "d",
-                                             .number = 1,
-                                             .label = omnibuf::proto::FieldLabel::Optional,
-                                             .type = omnibuf::proto::FieldType::Uint32,
-                                             .has_type = true,
-                                             .default_value = "42"};
+    omnibuf::proto::FieldDescriptorProto def;
+    def.name = "d";
+    def.number = 1;
+    def.label = omnibuf::proto::FieldLabel::Optional;
+    def.type = omnibuf::proto::FieldType::Uint32;
+    def.has_type = true;
+    def.default_value = "42";
     omnibuf::proto::DescriptorPool p3;
     CHECK(!p3.add_file_descriptor_set(make_single_field_fds(def)).ok());
 
     // 4. Unknown FieldType / FieldLabel rejected
-    omnibuf::proto::FieldDescriptorProto unk_t{.name = "u",
-                                               .number = 1,
-                                               .label = omnibuf::proto::FieldLabel::Optional,
-                                               .type = omnibuf::proto::FieldType::Unknown,
-                                               .has_type = false};
+    omnibuf::proto::FieldDescriptorProto unk_t;
+    unk_t.name = "u";
+    unk_t.number = 1;
+    unk_t.label = omnibuf::proto::FieldLabel::Optional;
+    unk_t.type = omnibuf::proto::FieldType::Unknown;
+    unk_t.has_type = false;
     omnibuf::proto::DescriptorPool p4;
     CHECK(!p4.add_file_descriptor_set(make_single_field_fds(unk_t)).ok());
 
-    omnibuf::proto::FieldDescriptorProto unk_l{.name = "u",
-                                               .number = 1,
-                                               .label = omnibuf::proto::FieldLabel::Unknown,
-                                               .type = omnibuf::proto::FieldType::Uint32,
-                                               .has_type = true};
+    omnibuf::proto::FieldDescriptorProto unk_l;
+    unk_l.name = "u";
+    unk_l.number = 1;
+    unk_l.label = omnibuf::proto::FieldLabel::Unknown;
+    unk_l.type = omnibuf::proto::FieldType::Uint32;
+    unk_l.has_type = true;
     omnibuf::proto::DescriptorPool p5;
     CHECK(!p5.add_file_descriptor_set(make_single_field_fds(unk_l)).ok());
 

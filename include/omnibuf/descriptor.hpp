@@ -56,66 +56,66 @@ enum class FieldLabel : uint32_t {
 };
 
 struct FieldDescriptorProto {
-  std::string name;
-  std::string extendee;
+  std::string name{};
+  std::string extendee{};
   uint32_t number = 0;
   FieldLabel label = FieldLabel::Optional;
   FieldType type = FieldType::Unknown;
   bool has_type = false;
-  std::string type_name;
-  std::string default_value;
-  std::string json_name;
-  std::optional<uint32_t> oneof_index;
+  std::string type_name{};
+  std::string default_value{};
+  std::string json_name{};
+  std::optional<uint32_t> oneof_index{};
   bool proto3_optional = false;
 };
 
 struct EnumValueDescriptorProto {
-  std::string name;
+  std::string name{};
   int32_t number = 0;
 };
 
 struct EnumDescriptorProto {
-  std::string name;
-  std::vector<EnumValueDescriptorProto> values;
+  std::string name{};
+  std::vector<EnumValueDescriptorProto> values{};
 };
 
 struct OneofDescriptorProto {
-  std::string name;
+  std::string name{};
 };
 
 struct DescriptorProto {
-  std::string name;
-  std::vector<FieldDescriptorProto> fields;
-  std::vector<DescriptorProto> nested_types;
-  std::vector<EnumDescriptorProto> enum_types;
-  std::vector<OneofDescriptorProto> oneof_decls;
+  std::string name{};
+  std::vector<FieldDescriptorProto> fields{};
+  std::vector<DescriptorProto> nested_types{};
+  std::vector<EnumDescriptorProto> enum_types{};
+  std::vector<OneofDescriptorProto> oneof_decls{};
   bool map_entry = false;
   bool has_extensions = false;
 };
 
 struct FileDescriptorProto {
-  std::string name;
-  std::string package;
-  std::vector<std::string> dependencies;
-  std::vector<DescriptorProto> message_types;
-  std::vector<EnumDescriptorProto> enum_types;
-  std::string syntax;
+  std::string name{};
+  std::string package{};
+  std::vector<std::string> dependencies{};
+  std::vector<DescriptorProto> message_types{};
+  std::vector<EnumDescriptorProto> enum_types{};
+  std::string syntax{};
   bool has_extensions = false;
 };
 
 struct FileDescriptorSet {
-  std::vector<FileDescriptorProto> files;
+  std::vector<FileDescriptorProto> files{};
 };
 
 struct CodeGeneratorRequest {
-  std::vector<std::string> files_to_generate;
-  std::string parameter;
-  std::vector<FileDescriptorProto> proto_files;
+  std::vector<std::string> files_to_generate{};
+  std::string parameter{};
+  std::vector<FileDescriptorProto> proto_files{};
 };
 
 struct GeneratedFile {
-  std::string name;
-  std::string content;
+  std::string name{};
+  std::string content{};
 };
 
 namespace detail {
