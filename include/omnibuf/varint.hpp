@@ -254,4 +254,140 @@ inline void patch_reserved_varint(std::vector<uint8_t>& dst, size_t pos, uint64_
   }
 }
 
+// Strict-aliasing-friendly cursor writer over std::vector<uint8_t>.
+// Maintains a __restrict byte pointer and capacity limit in local registers so the compiler
+// does not reload std::vector pointers or struct string/vector lengths on every byte written.
+class FastWriter {
+ public:
+  explicit FastWriter(std::vector<uint8_t>& vec, size_t initial_headroom = 512)
+      : vec_(&vec), pos_(vec.size()), limit_(vec.size()) {
+    if (initial_headroom > 0) {
+      const size_t target = pos_ + initial_headroom;
+      vec.resize(target);
+      limit_ = target;
+    }
+    data_ = vec.data();
+  }
+
+  [[nodiscard]] size_t size() const noexcept { return pos_; }
+
+  void finish() noexcept { vec_->resize(pos_); }
+
+  void ensure(size_t extra) {
+    if (pos_ + extra > limit_) [[unlikely]] {
+      grow(extra);
+    }
+  }
+
+  void write_byte(uint8_t b) {
+    ensure(1);
+    data_[pos_++] = b;
+  }
+
+  void write_u16_raw(uint16_t v) {
+    ensure(2);
+    write_u16_le(data_ + pos_, v);
+    pos_ += 2;
+  }
+
+  void write_u32_raw(uint32_t v) {
+    ensure(4);
+    write_u32_le(data_ + pos_, v);
+    pos_ += 4;
+  }
+
+  void write_u64_raw(uint64_t v) {
+    ensure(8);
+    write_u64_le(data_ + pos_, v);
+    pos_ += 8;
+  }
+
+  void write_bytes(const void* src, size_t len) {
+    if (len == 0) return;
+    ensure(len);
+    std::memcpy(data_ + pos_, src, len);
+    pos_ += len;
+  }
+
+  void write_varint(uint64_t v) {
+    if (v <= 127u) [[likely]] {
+      ensure(1);
+      data_[pos_++] = static_cast<uint8_t>((v << 1) | 1u);
+      return;
+    }
+    write_varint_multi(v);
+  }
+
+  void write_tag(uint32_t field_num, uint8_t wire_type) {
+    const uint64_t tag =
+        (static_cast<uint64_t>(field_num) << 4) | static_cast<uint64_t>(wire_type & 0x0Fu);
+    write_varint(tag);
+  }
+
+  [[nodiscard]] size_t reserve_len_2b() {
+    ensure(2);
+    const size_t p = pos_;
+    data_[p] = 0;
+    data_[p + 1] = 0;
+    pos_ += 2;
+    return p;
+  }
+
+  void backpatch_len(size_t len_pos) {
+    const uint64_t sub_len = static_cast<uint64_t>(pos_ - (len_pos + 2));
+    if (sub_len <= 16383u) [[likely]] {
+      write_u16_le(data_ + len_pos, static_cast<uint16_t>((sub_len << 2) | 2u));
+      return;
+    }
+    backpatch_len_slow(len_pos, sub_len);
+  }
+
+ private:
+  [[gnu::noinline]] void grow(size_t extra) {
+    const size_t needed = pos_ + extra;
+    const size_t doubled = (limit_ <= (SIZE_MAX / 2)) ? (limit_ * 2) : needed;
+    const size_t next = (doubled > needed + 256) ? doubled : (needed + 256);
+    vec_->resize(next);
+    data_ = vec_->data();
+    limit_ = next;
+  }
+
+  [[gnu::noinline]] void write_varint_multi(uint64_t v) {
+    if (v <= 16383u) {
+      ensure(2);
+      write_u16_le(data_ + pos_, static_cast<uint16_t>((v << 2) | 2u));
+      pos_ += 2;
+      return;
+    }
+    if (v <= 536870911u) {
+      ensure(4);
+      write_u32_le(data_ + pos_, static_cast<uint32_t>((v << 3) | 4u));
+      pos_ += 4;
+      return;
+    }
+    ensure(9);
+    data_[pos_] = 0x00;
+    write_u64_le(data_ + pos_ + 1, v);
+    pos_ += 9;
+  }
+
+  [[gnu::noinline]] void backpatch_len_slow(size_t len_pos, uint64_t sub_len) {
+    const size_t extra = (sub_len <= 536870911u) ? 2 : 7;
+    ensure(extra);
+    std::memmove(data_ + len_pos + 2 + extra, data_ + len_pos + 2, pos_ - (len_pos + 2));
+    pos_ += extra;
+    if (extra == 2) {
+      write_u32_le(data_ + len_pos, static_cast<uint32_t>((sub_len << 3) | 4u));
+    } else {
+      data_[len_pos] = 0x00;
+      write_u64_le(data_ + len_pos + 1, sub_len);
+    }
+  }
+
+  std::vector<uint8_t>* vec_ = nullptr;
+  uint8_t* __restrict data_ = nullptr;
+  size_t pos_ = 0;
+  size_t limit_ = 0;
+};
+
 }  // namespace omnibuf

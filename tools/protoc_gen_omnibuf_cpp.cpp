@@ -407,6 +407,173 @@ void emit_encode_single_field(std::ostringstream& out,
   }
 }
 
+void emit_encode_single_field_fast(std::ostringstream& out,
+                                   const FieldDescriptorProto& f,
+                                   const TypeCatalog& catalog,
+                                   std::string_view expr_prefix,
+                                   std::string_view w_var,
+                                   std::string_view indent) {
+  const std::string member = std::string(expr_prefix) + sanitize_ident(f.name);
+  const uint32_t fnum = f.number;
+  const bool is_repeated = (f.label == FieldLabel::Repeated);
+
+  if (f.type == FieldType::Message) {
+    const std::string target = trim_leading_dot(f.type_name);
+    auto map_it = catalog.map_entries.find(target);
+    if (map_it != catalog.map_entries.end()) {
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireMap);\n";
+      out << indent << "::omnibuf::encode_map_string_uint(" << w_var << ", " << member << ");\n";
+      return;
+    }
+    if (is_repeated) {
+      out << indent << "{\n";
+      out << indent << "  " << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireArray);\n";
+      out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+      out << indent << "  " << w_var << ".write_byte(::omnibuf::WireSubMsg);\n";
+      out << indent << "  " << w_var << ".write_varint(" << member << ".size());\n";
+      out << indent << "  for (const auto& elem : " << member << ") {\n";
+      out << indent << "    const size_t elem_pos = " << w_var << ".reserve_len_2b();\n";
+      out << indent << "    elem.marshal_omnibuf_fast(" << w_var << ");\n";
+      out << indent << "    " << w_var << ".backpatch_len(elem_pos);\n";
+      out << indent << "  }\n";
+      out << indent << "  " << w_var << ".backpatch_len(len_pos);\n";
+      out << indent << "}\n";
+      return;
+    }
+    out << indent << "if (" << member << ".has_value()) {\n";
+    out << indent << "  " << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSubMsg);\n";
+    out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+    out << indent << "  " << member << "->marshal_omnibuf_fast(" << w_var << ");\n";
+    out << indent << "  " << w_var << ".backpatch_len(len_pos);\n";
+    out << indent << "}\n";
+    return;
+  }
+
+  if (is_repeated) {
+    out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireArray);\n";
+    switch (f.type) {
+      case FieldType::String:
+        out << indent << "::omnibuf::encode_string_arr(" << w_var << ", " << member << ");\n";
+        break;
+      case FieldType::Bytes:
+        out << indent << "::omnibuf::encode_bytes_arr(" << w_var << ", " << member << ");\n";
+        break;
+      case FieldType::Bool:
+        out << indent << "::omnibuf::encode_bool_arr(" << w_var << ", " << member << ");\n";
+        break;
+      case FieldType::Uint32:
+      case FieldType::Uint64:
+        out << indent << "::omnibuf::encode_uint_arr(" << w_var << ", std::span<const "
+            << scalar_cpp_type(f) << ">(" << member << "));\n";
+        break;
+      case FieldType::Int32:
+      case FieldType::Sint32:
+      case FieldType::Int64:
+      case FieldType::Sint64:
+        out << indent << "::omnibuf::encode_sint_arr(" << w_var << ", std::span<const "
+            << scalar_cpp_type(f) << ">(" << member << "));\n";
+        break;
+      case FieldType::Fixed32:
+        out << indent << "::omnibuf::encode_fixed32_arr(" << w_var
+            << ", std::span<const uint32_t>(" << member << "), ::omnibuf::WireFixed32);\n";
+        break;
+      case FieldType::Sfixed32:
+        out << indent << "::omnibuf::encode_fixed32_arr(" << w_var
+            << ", std::span<const int32_t>(" << member << "), ::omnibuf::WireSfixed32);\n";
+        break;
+      case FieldType::Fixed64:
+        out << indent << "::omnibuf::encode_fixed64_arr(" << w_var
+            << ", std::span<const uint64_t>(" << member << "), ::omnibuf::WireFixed64);\n";
+        break;
+      case FieldType::Sfixed64:
+        out << indent << "::omnibuf::encode_fixed64_arr(" << w_var
+            << ", std::span<const int64_t>(" << member << "), ::omnibuf::WireSfixed64);\n";
+        break;
+      case FieldType::Float:
+        out << indent << "::omnibuf::encode_float32_arr(" << w_var << ", " << member << ");\n";
+        break;
+      case FieldType::Double:
+        out << indent << "::omnibuf::encode_float64_arr(" << w_var << ", " << member << ");\n";
+        break;
+      case FieldType::Enum:
+        out << indent << "{\n";
+        out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+        out << indent << "  " << w_var << ".write_byte(::omnibuf::WireSint);\n";
+        out << indent << "  " << w_var << ".write_varint(" << member << ".size());\n";
+        out << indent << "  for (auto ev : " << member << ") {\n";
+        out << indent << "    " << w_var
+            << ".write_varint(::omnibuf::encode_zigzag(static_cast<int64_t>(static_cast<int32_t>(ev))));\n";
+        out << indent << "  }\n";
+        out << indent << "  " << w_var << ".backpatch_len(len_pos);\n";
+        out << indent << "}\n";
+        break;
+      default:
+        break;
+    }
+    return;
+  }
+
+  switch (f.type) {
+    case FieldType::Uint32:
+    case FieldType::Uint64:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireUint);\n";
+      out << indent << w_var << ".write_varint(static_cast<uint64_t>(" << member << "));\n";
+      break;
+    case FieldType::Int32:
+    case FieldType::Sint32:
+    case FieldType::Int64:
+    case FieldType::Sint64:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSint);\n";
+      out << indent << w_var << ".write_varint(::omnibuf::encode_zigzag(static_cast<int64_t>("
+          << member << ")));\n";
+      break;
+    case FieldType::Enum:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSint);\n";
+      out << indent << w_var
+          << ".write_varint(::omnibuf::encode_zigzag(static_cast<int64_t>(static_cast<int32_t>("
+          << member << "))));\n";
+      break;
+    case FieldType::Bool:
+      out << indent << w_var << ".write_tag(" << fnum << "u, " << member
+          << " ? ::omnibuf::WireBoolTrue : ::omnibuf::WireBoolFalse);\n";
+      break;
+    case FieldType::Fixed32:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFixed32);\n";
+      out << indent << w_var << ".write_u32_raw(" << member << ");\n";
+      break;
+    case FieldType::Sfixed32:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSfixed32);\n";
+      out << indent << w_var << ".write_u32_raw(static_cast<uint32_t>(" << member << "));\n";
+      break;
+    case FieldType::Float:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFloat32);\n";
+      out << indent << w_var << ".write_u32_raw(::omnibuf::float32_to_bits(" << member << "));\n";
+      break;
+    case FieldType::Fixed64:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFixed64);\n";
+      out << indent << w_var << ".write_u64_raw(" << member << ");\n";
+      break;
+    case FieldType::Sfixed64:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSfixed64);\n";
+      out << indent << w_var << ".write_u64_raw(static_cast<uint64_t>(" << member << "));\n";
+      break;
+    case FieldType::Double:
+      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFloat64);\n";
+      out << indent << w_var << ".write_u64_raw(::omnibuf::float64_to_bits(" << member << "));\n";
+      break;
+    case FieldType::String:
+    case FieldType::Bytes:
+      out << indent << w_var << ".write_tag(" << fnum << "u, "
+          << (f.type == FieldType::String ? "::omnibuf::WireString" : "::omnibuf::WireBytes")
+          << ");\n";
+      out << indent << w_var << ".write_varint(" << member << ".size());\n";
+      out << indent << w_var << ".write_bytes(" << member << ".data(), " << member << ".size());\n";
+      break;
+    default:
+      break;
+  }
+}
+
 void emit_message_struct(std::ostringstream& out,
                          const DescriptorProto& msg,
                          const TypeCatalog& catalog) {
@@ -485,36 +652,56 @@ void emit_message_struct(std::ostringstream& out,
   out << "    return meta;\n";
   out << "  }\n\n";
 
-  // marshal_omnibuf_append & marshal_omnibuf
-  out << "  void marshal_omnibuf_append(std::vector<uint8_t>& dst) const {\n";
+  // marshal_omnibuf_fast, marshal_omnibuf_append & marshal_omnibuf
+  out << "  void marshal_omnibuf_fast(::omnibuf::FastWriter& w) const {\n";
+  out << "    (void)w;\n";
   for (const auto& f : msg.fields) {
-    emit_encode_single_field(out, f, catalog, "", "dst", "    ");
+    emit_encode_single_field_fast(out, f, catalog, "", "w", "    ");
   }
+  out << "  }\n\n";
+
+  out << "  void marshal_omnibuf_append(std::vector<uint8_t>& dst) const {\n";
+  out << "    ::omnibuf::FastWriter w(dst, 512);\n";
+  out << "    marshal_omnibuf_fast(w);\n";
+  out << "    w.finish();\n";
   out << "  }\n\n";
 
   out << "  [[nodiscard]] std::vector<uint8_t> marshal_omnibuf(::omnibuf::MarshalOptions opts = {}) const {\n";
   out << "    std::vector<uint8_t> dst;\n";
-  out << "    dst.reserve(512);\n";
   out << "    if (opts.self_describing) {\n";
+  out << "      dst.reserve(512);\n";
   out << "      if (auto meta = schema_meta(0)) {\n";
   out << "        ::omnibuf::append_field0_schema_meta(dst, *meta);\n";
   out << "      }\n";
   out << "    }\n";
-  out << "    marshal_omnibuf_append(dst);\n";
+  out << "    ::omnibuf::FastWriter w(dst, 512);\n";
+  out << "    marshal_omnibuf_fast(w);\n";
+  out << "    w.finish();\n";
   out << "    return dst;\n";
   out << "  }\n\n";
 
   // unmarshal_omnibuf & decode_omnibuf
   out << "  [[nodiscard]] ::omnibuf::Result<void> unmarshal_omnibuf(std::span<const uint8_t> data) {\n";
-  out << "    return decode_omnibuf(data, 0, false, false);\n";
+  out << "    const char* err = decode_omnibuf_raw(data, 0, false, false);\n";
+  out << "    if (err != nullptr) [[unlikely]] return ::omnibuf::Error{err};\n";
+  out << "    return ::omnibuf::Result<void>::success();\n";
   out << "  }\n\n";
 
   out << "  [[nodiscard]] ::omnibuf::Result<void> decode_omnibuf(std::span<const uint8_t> data,\n";
   out << "                                                        int depth,\n";
   out << "                                                        bool merge,\n";
   out << "                                                        bool is_fresh = false) {\n";
-  out << "    if (depth > ::omnibuf::MAX_CONTAINER_DEPTH) {\n";
-  out << "      return ::omnibuf::Error{\"omnibuf: max nesting depth exceeded\"};\n";
+  out << "    const char* err = decode_omnibuf_raw(data, depth, merge, is_fresh);\n";
+  out << "    if (err != nullptr) [[unlikely]] return ::omnibuf::Error{err};\n";
+  out << "    return ::omnibuf::Result<void>::success();\n";
+  out << "  }\n\n";
+
+  out << "  [[nodiscard]] const char* decode_omnibuf_raw(std::span<const uint8_t> data,\n";
+  out << "                                                int depth,\n";
+  out << "                                                bool merge,\n";
+  out << "                                                bool is_fresh = false) {\n";
+  out << "    if (depth > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+  out << "      return \"omnibuf: max nesting depth exceeded\";\n";
   out << "    }\n";
   out << "    if (!merge && !is_fresh) {\n";
   out << "      clear();\n";
@@ -522,20 +709,21 @@ void emit_message_struct(std::ostringstream& out,
   out << "    uint64_t seen_mask = 0;\n";
   out << "    (void)seen_mask;\n";
   out << "    const size_t n = data.size();\n";
+  out << "    const uint8_t* base = data.data();\n";
   out << "    size_t pos = 0;\n";
   out << "    while (pos < n) {\n";
   out << "      uint64_t tag = 0;\n";
-  out << "      const uint8_t b0 = data[pos];\n";
-  out << "      if ((b0 & 1u) != 0) {\n";
+  out << "      const uint8_t b0 = base[pos];\n";
+  out << "      if ((b0 & 1u) != 0) [[likely]] {\n";
   out << "        tag = static_cast<uint64_t>(b0 >> 1);\n";
   out << "        ++pos;\n";
   out << "      } else if ((b0 & 2u) != 0 && pos + 2 <= n) {\n";
-  out << "        tag = static_cast<uint64_t>(::omnibuf::read_u16_le(data.data() + pos) >> 2);\n";
+  out << "        tag = static_cast<uint64_t>(::omnibuf::read_u16_le(base + pos) >> 2);\n";
   out << "        pos += 2;\n";
   out << "      } else {\n";
   out << "        const auto [t64, tn] = ::omnibuf::decode_varint(data.subspan(pos));\n";
-  out << "        if (tn == 0 || (t64 >> 4) > ::omnibuf::MAX_FIELD_NUMBER) {\n";
-  out << "          return ::omnibuf::Error{\"omnibuf: invalid tag\"};\n";
+  out << "        if (tn == 0 || (t64 >> 4) > ::omnibuf::MAX_FIELD_NUMBER) [[unlikely]] {\n";
+  out << "          return \"omnibuf: invalid tag\";\n";
   out << "        }\n";
   out << "        tag = t64;\n";
   out << "        pos += tn;\n";
@@ -543,7 +731,7 @@ void emit_message_struct(std::ostringstream& out,
   out << "      switch (tag) {\n";
   out << "        case ::omnibuf::WireSubMsg: {\n";
   out << "          auto f0 = ::omnibuf::validate_field0(data, pos, ::omnibuf::WireSubMsg, depth);\n";
-  out << "          if (!f0) return ::omnibuf::Error{f0.error()};\n";
+  out << "          if (!f0) return \"omnibuf: invalid Field #0\";\n";
   out << "          pos = f0.value();\n";
   out << "          break;\n";
   out << "        }\n";
@@ -560,16 +748,16 @@ void emit_message_struct(std::ostringstream& out,
       if (catalog.map_entries.contains(target)) {
         const uint64_t case_tag = (fnum << 4) | omnibuf::WireMap;
         out << "        case " << case_tag << "ULL: {\n";
-        out << "          if (depth + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) {\n";
-        out << "            return ::omnibuf::Error{\"omnibuf: max nesting depth exceeded\"};\n";
+        out << "          if (depth + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+        out << "            return \"omnibuf: max nesting depth exceeded\";\n";
         out << "          }\n";
-        out << "          auto mr = ::omnibuf::read_len_slice(data, pos, 3);\n";
-        out << "          if (!mr) return ::omnibuf::Error{mr.error()};\n";
+        out << "          const auto mr = ::omnibuf::read_len_slice_fast(data, pos, 3);\n";
+        out << "          if (!mr) [[unlikely]] return mr.err;\n";
         out << "          if (!::omnibuf::decode_map_string_uint_body(" << ident
-            << ", mr.value().slice)) {\n";
-        out << "            return ::omnibuf::Error{\"omnibuf: invalid map body\"};\n";
+            << ", mr.span())) [[unlikely]] {\n";
+        out << "            return \"omnibuf: invalid map body\";\n";
         out << "          }\n";
-        out << "          pos = mr.value().next_pos;\n";
+        out << "          pos = mr.next_pos;\n";
         out << "          break;\n";
         out << "        }\n";
         continue;
@@ -577,40 +765,39 @@ void emit_message_struct(std::ostringstream& out,
       if (is_repeated) {
         const uint64_t case_tag = (fnum << 4) | omnibuf::WireArray;
         out << "        case " << case_tag << "ULL: {\n";
-        out << "          if (depth + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) {\n";
-        out << "            return ::omnibuf::Error{\"omnibuf: max nesting depth exceeded\"};\n";
+        out << "          if (depth + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+        out << "            return \"omnibuf: max nesting depth exceeded\";\n";
         out << "          }\n";
-        out << "          auto ar = ::omnibuf::read_len_slice(data, pos, 2);\n";
-        out << "          if (!ar) return ::omnibuf::Error{ar.error()};\n";
-        out << "          const auto body = ar.value().slice;\n";
+        out << "          const auto ar = ::omnibuf::read_len_slice_fast(data, pos, 2);\n";
+        out << "          if (!ar) [[unlikely]] return ar.err;\n";
+        out << "          const auto body = ar.span();\n";
         out << "          const auto hdr = ::omnibuf::parse_array_header(body);\n";
-        out << "          if (!hdr.ok || hdr.elem_wt != ::omnibuf::WireSubMsg) {\n";
-        out << "            return ::omnibuf::Error{\"omnibuf: invalid submsg array header\"};\n";
+        out << "          if (!hdr.ok || hdr.elem_wt != ::omnibuf::WireSubMsg) [[unlikely]] {\n";
+        out << "            return \"omnibuf: invalid submsg array header\";\n";
         out << "          }\n";
         out << "          " << ident << ".reserve(::omnibuf::grow_capacity(" << ident
             << ".capacity(), " << ident << ".size() + hdr.count));\n";
         out << "          size_t p = hdr.pos;\n";
         out << "          for (size_t i = 0; i < hdr.count; ++i) {\n";
-        out << "            auto es = ::omnibuf::read_len_slice(body, p, 0);\n";
-        out << "            if (!es) return ::omnibuf::Error{es.error()};\n";
-        out << "            " << qualified_cpp_type(f.type_name) << " elem{};\n";
-        out << "            auto dr = elem.decode_omnibuf(es.value().slice, depth + 2, false, true);\n";
-        out << "            if (!dr) return dr;\n";
-        out << "            " << ident << ".push_back(std::move(elem));\n";
-        out << "            p = es.value().next_pos;\n";
+        out << "            const auto es = ::omnibuf::read_len_slice_fast(body, p, 0);\n";
+        out << "            if (!es) [[unlikely]] return es.err;\n";
+        out << "            auto& elem = " << ident << ".emplace_back();\n";
+        out << "            const char* dr = elem.decode_omnibuf_raw(es.span(), depth + 2, false, true);\n";
+        out << "            if (dr != nullptr) [[unlikely]] return dr;\n";
+        out << "            p = es.next_pos;\n";
         out << "          }\n";
-        out << "          if (p != body.size()) {\n";
-        out << "            return ::omnibuf::Error{\"omnibuf: trailing bytes in submsg array\"};\n";
+        out << "          if (p != body.size()) [[unlikely]] {\n";
+        out << "            return \"omnibuf: trailing bytes in submsg array\";\n";
         out << "          }\n";
-        out << "          pos = ar.value().next_pos;\n";
+        out << "          pos = ar.next_pos;\n";
         out << "          break;\n";
         out << "        }\n";
         continue;
       }
       const uint64_t case_tag = (fnum << 4) | omnibuf::WireSubMsg;
       out << "        case " << case_tag << "ULL: {\n";
-      out << "          auto sr = ::omnibuf::read_len_slice(data, pos, 0);\n";
-      out << "          if (!sr) return ::omnibuf::Error{sr.error()};\n";
+      out << "          const auto sr = ::omnibuf::read_len_slice_fast(data, pos, 0);\n";
+      out << "          if (!sr) [[unlikely]] return sr.err;\n";
       out << "          const bool merge_sub = merge || ((seen_mask & " << bit << "ULL) != 0);\n";
       out << "          bool fresh_sub = false;\n";
       out << "          if (!" << ident << ".has_value() || !merge_sub) {\n";
@@ -620,10 +807,10 @@ void emit_message_struct(std::ostringstream& out,
       if (bit != 0) {
         out << "          seen_mask |= " << bit << "ULL;\n";
       }
-      out << "          auto dr = " << ident
-          << "->decode_omnibuf(sr.value().slice, depth + 1, merge_sub, fresh_sub);\n";
-      out << "          if (!dr) return dr;\n";
-      out << "          pos = sr.value().next_pos;\n";
+      out << "          const char* dr = " << ident
+          << "->decode_omnibuf_raw(sr.span(), depth + 1, merge_sub, fresh_sub);\n";
+      out << "          if (dr != nullptr) [[unlikely]] return dr;\n";
+      out << "          pos = sr.next_pos;\n";
       out << "          break;\n";
       out << "        }\n";
       continue;
@@ -632,65 +819,65 @@ void emit_message_struct(std::ostringstream& out,
     if (is_repeated) {
       const uint64_t case_tag = (fnum << 4) | omnibuf::WireArray;
       out << "        case " << case_tag << "ULL: {\n";
-      out << "          if (depth + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) {\n";
-      out << "            return ::omnibuf::Error{\"omnibuf: max nesting depth exceeded\"};\n";
+      out << "          if (depth + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+      out << "            return \"omnibuf: max nesting depth exceeded\";\n";
       out << "          }\n";
-      out << "          auto ar = ::omnibuf::read_len_slice(data, pos, 2);\n";
-      out << "          if (!ar) return ::omnibuf::Error{ar.error()};\n";
+      out << "          const auto ar = ::omnibuf::read_len_slice_fast(data, pos, 2);\n";
+      out << "          if (!ar) [[unlikely]] return ar.err;\n";
       switch (f.type) {
         case FieldType::String:
           out << "          if (!::omnibuf::append_string_arr_body(" << ident
-              << ", ar.value().slice)) return ::omnibuf::Error{\"omnibuf: invalid string array\"};\n";
+              << ", ar.span())) [[unlikely]] return \"omnibuf: invalid string array\";\n";
           break;
         case FieldType::Bytes:
           out << "          if (!::omnibuf::append_bytes_arr_body(" << ident
-              << ", ar.value().slice)) return ::omnibuf::Error{\"omnibuf: invalid bytes array\"};\n";
+              << ", ar.span())) [[unlikely]] return \"omnibuf: invalid bytes array\";\n";
           break;
         case FieldType::Bool:
           out << "          if (!::omnibuf::append_bool_arr_body(" << ident
-              << ", ar.value().slice)) return ::omnibuf::Error{\"omnibuf: invalid bool array\"};\n";
+              << ", ar.span())) [[unlikely]] return \"omnibuf: invalid bool array\";\n";
           break;
         case FieldType::Uint32:
         case FieldType::Uint64:
           out << "          if (!::omnibuf::append_uint_arr_body(" << ident
-              << ", ar.value().slice)) return ::omnibuf::Error{\"omnibuf: invalid uint array\"};\n";
+              << ", ar.span())) [[unlikely]] return \"omnibuf: invalid uint array\";\n";
           break;
         case FieldType::Int32:
         case FieldType::Sint32:
         case FieldType::Int64:
         case FieldType::Sint64:
           out << "          if (!::omnibuf::append_sint_arr_body(" << ident
-              << ", ar.value().slice)) return ::omnibuf::Error{\"omnibuf: invalid sint array\"};\n";
+              << ", ar.span())) [[unlikely]] return \"omnibuf: invalid sint array\";\n";
           break;
         case FieldType::Fixed32:
           out << "          if (!::omnibuf::append_fixed32_arr_body(" << ident
-              << ", ar.value().slice, ::omnibuf::WireFixed32)) return ::omnibuf::Error{\"omnibuf: invalid fixed32 array\"};\n";
+              << ", ar.span(), ::omnibuf::WireFixed32)) [[unlikely]] return \"omnibuf: invalid fixed32 array\";\n";
           break;
         case FieldType::Sfixed32:
           out << "          if (!::omnibuf::append_fixed32_arr_body(" << ident
-              << ", ar.value().slice, ::omnibuf::WireSfixed32)) return ::omnibuf::Error{\"omnibuf: invalid sfixed32 array\"};\n";
+              << ", ar.span(), ::omnibuf::WireSfixed32)) [[unlikely]] return \"omnibuf: invalid sfixed32 array\";\n";
           break;
         case FieldType::Float:
           out << "          if (!::omnibuf::append_fixed32_arr_body(" << ident
-              << ", ar.value().slice, ::omnibuf::WireFloat32)) return ::omnibuf::Error{\"omnibuf: invalid float32 array\"};\n";
+              << ", ar.span(), ::omnibuf::WireFloat32)) [[unlikely]] return \"omnibuf: invalid float32 array\";\n";
           break;
         case FieldType::Fixed64:
           out << "          if (!::omnibuf::append_fixed64_arr_body(" << ident
-              << ", ar.value().slice, ::omnibuf::WireFixed64)) return ::omnibuf::Error{\"omnibuf: invalid fixed64 array\"};\n";
+              << ", ar.span(), ::omnibuf::WireFixed64)) [[unlikely]] return \"omnibuf: invalid fixed64 array\";\n";
           break;
         case FieldType::Sfixed64:
           out << "          if (!::omnibuf::append_fixed64_arr_body(" << ident
-              << ", ar.value().slice, ::omnibuf::WireSfixed64)) return ::omnibuf::Error{\"omnibuf: invalid sfixed64 array\"};\n";
+              << ", ar.span(), ::omnibuf::WireSfixed64)) [[unlikely]] return \"omnibuf: invalid sfixed64 array\";\n";
           break;
         case FieldType::Double:
           out << "          if (!::omnibuf::append_fixed64_arr_body(" << ident
-              << ", ar.value().slice, ::omnibuf::WireFloat64)) return ::omnibuf::Error{\"omnibuf: invalid float64 array\"};\n";
+              << ", ar.span(), ::omnibuf::WireFloat64)) [[unlikely]] return \"omnibuf: invalid float64 array\";\n";
           break;
         case FieldType::Enum:
           out << "          {\n";
           out << "            std::vector<int32_t> tmp;\n";
-          out << "            if (!::omnibuf::append_sint_arr_body(tmp, ar.value().slice)) {\n";
-          out << "              return ::omnibuf::Error{\"omnibuf: invalid enum array\"};\n";
+          out << "            if (!::omnibuf::append_sint_arr_body(tmp, ar.span())) [[unlikely]] {\n";
+          out << "              return \"omnibuf: invalid enum array\";\n";
           out << "            }\n";
           out << "            for (int32_t ev : tmp) {\n";
           out << "              " << ident << ".push_back(static_cast<" << scalar_cpp_type(f)
@@ -701,7 +888,7 @@ void emit_message_struct(std::ostringstream& out,
         default:
           break;
       }
-      out << "          pos = ar.value().next_pos;\n";
+      out << "          pos = ar.next_pos;\n";
       out << "          break;\n";
       out << "        }\n";
       continue;
@@ -725,19 +912,32 @@ void emit_message_struct(std::ostringstream& out,
     switch (f.type) {
       case FieldType::Uint32:
       case FieldType::Uint64:
-        out << "          const auto [v, vn] = ::omnibuf::decode_varint(data.subspan(pos));\n";
-        out << "          if (vn == 0) return ::omnibuf::Error{\"omnibuf: truncated uint\"};\n";
-        out << "          pos += vn;\n";
-        out << "          " << ident << " = static_cast<" << scalar_cpp_type(f) << ">(v);\n";
+        out << "          if (pos < n && (base[pos] & 1u) != 0) [[likely]] {\n";
+        out << "            " << ident << " = static_cast<" << scalar_cpp_type(f)
+            << ">(base[pos] >> 1);\n";
+        out << "            ++pos;\n";
+        out << "          } else {\n";
+        out << "            const auto [v, vn] = ::omnibuf::decode_varint(data.subspan(pos));\n";
+        out << "            if (vn == 0) [[unlikely]] return \"omnibuf: truncated uint\";\n";
+        out << "            pos += vn;\n";
+        out << "            " << ident << " = static_cast<" << scalar_cpp_type(f) << ">(v);\n";
+        out << "          }\n";
         break;
       case FieldType::Int32:
       case FieldType::Sint32:
       case FieldType::Int64:
       case FieldType::Sint64:
       case FieldType::Enum:
-        out << "          const auto [v, vn] = ::omnibuf::decode_varint(data.subspan(pos));\n";
-        out << "          if (vn == 0) return ::omnibuf::Error{\"omnibuf: truncated sint\"};\n";
-        out << "          pos += vn;\n";
+        out << "          uint64_t v = 0;\n";
+        out << "          if (pos < n && (base[pos] & 1u) != 0) [[likely]] {\n";
+        out << "            v = static_cast<uint64_t>(base[pos] >> 1);\n";
+        out << "            ++pos;\n";
+        out << "          } else {\n";
+        out << "            const auto [v64, vn] = ::omnibuf::decode_varint(data.subspan(pos));\n";
+        out << "            if (vn == 0) [[unlikely]] return \"omnibuf: truncated sint\";\n";
+        out << "            v = v64;\n";
+        out << "            pos += vn;\n";
+        out << "          }\n";
         if (f.type == FieldType::Enum) {
           out << "          " << ident << " = static_cast<" << scalar_cpp_type(f)
               << ">(static_cast<int32_t>(::omnibuf::decode_zigzag(v)));\n";
@@ -749,8 +949,8 @@ void emit_message_struct(std::ostringstream& out,
       case FieldType::Fixed32:
       case FieldType::Sfixed32:
       case FieldType::Float:
-        out << "          if (n - pos < 4) return ::omnibuf::Error{\"omnibuf: truncated 32-bit scalar\"};\n";
-        out << "          const uint32_t bits = ::omnibuf::read_u32_le(data.data() + pos);\n";
+        out << "          if (n - pos < 4) [[unlikely]] return \"omnibuf: truncated 32-bit scalar\";\n";
+        out << "          const uint32_t bits = ::omnibuf::read_u32_le(base + pos);\n";
         out << "          pos += 4;\n";
         if (f.type == FieldType::Float) {
           out << "          " << ident << " = ::omnibuf::bits_to_float32(bits);\n";
@@ -761,8 +961,8 @@ void emit_message_struct(std::ostringstream& out,
       case FieldType::Fixed64:
       case FieldType::Sfixed64:
       case FieldType::Double:
-        out << "          if (n - pos < 8) return ::omnibuf::Error{\"omnibuf: truncated 64-bit scalar\"};\n";
-        out << "          const uint64_t bits = ::omnibuf::read_u64_le(data.data() + pos);\n";
+        out << "          if (n - pos < 8) [[unlikely]] return \"omnibuf: truncated 64-bit scalar\";\n";
+        out << "          const uint64_t bits = ::omnibuf::read_u64_le(base + pos);\n";
         out << "          pos += 8;\n";
         if (f.type == FieldType::Double) {
           out << "          " << ident << " = ::omnibuf::bits_to_float64(bits);\n";
@@ -771,18 +971,16 @@ void emit_message_struct(std::ostringstream& out,
         }
         break;
       case FieldType::String:
-        out << "          auto sr = ::omnibuf::read_str_slice(data, pos);\n";
-        out << "          if (!sr) return ::omnibuf::Error{sr.error()};\n";
-        out << "          const auto sp = sr.value().slice;\n";
-        out << "          " << ident << ".assign(reinterpret_cast<const char*>(sp.data()), sp.size());\n";
-        out << "          pos = sr.value().next_pos;\n";
+        out << "          const auto sr = ::omnibuf::read_str_slice_fast(data, pos);\n";
+        out << "          if (!sr) [[unlikely]] return sr.err;\n";
+        out << "          " << ident << ".assign(reinterpret_cast<const char*>(sr.ptr), sr.len);\n";
+        out << "          pos = sr.next_pos;\n";
         break;
       case FieldType::Bytes:
-        out << "          auto br = ::omnibuf::read_len_slice(data, pos, 0);\n";
-        out << "          if (!br) return ::omnibuf::Error{br.error()};\n";
-        out << "          const auto sp = br.value().slice;\n";
-        out << "          " << ident << ".assign(sp.begin(), sp.end());\n";
-        out << "          pos = br.value().next_pos;\n";
+        out << "          const auto br = ::omnibuf::read_len_slice_fast(data, pos, 0);\n";
+        out << "          if (!br) [[unlikely]] return br.err;\n";
+        out << "          " << ident << ".assign(br.ptr, br.ptr + br.len);\n";
+        out << "          pos = br.next_pos;\n";
         break;
       default:
         break;
@@ -794,17 +992,17 @@ void emit_message_struct(std::ostringstream& out,
   out << "        default: {\n";
   out << "          const uint32_t fnum = static_cast<uint32_t>(tag >> 4);\n";
   out << "          const uint8_t wt = static_cast<uint8_t>(tag & 0x0Fu);\n";
-  out << "          if (fnum == 0) {\n";
-  out << "            return ::omnibuf::Error{\"omnibuf: invalid field number 0\"};\n";
+  out << "          if (fnum == 0) [[unlikely]] {\n";
+  out << "            return \"omnibuf: invalid field number 0\";\n";
   out << "          }\n";
   out << "          auto sk = ::omnibuf::validate_value(data, pos, wt, depth);\n";
-  out << "          if (!sk) return ::omnibuf::Error{sk.error()};\n";
+  out << "          if (!sk) [[unlikely]] return \"omnibuf: invalid unknown field\";\n";
   out << "          pos = sk.value();\n";
   out << "          break;\n";
   out << "        }\n";
   out << "      }\n";
   out << "    }\n";
-  out << "    return ::omnibuf::Result<void>::success();\n";
+  out << "    return nullptr;\n";
   out << "  }\n";
   out << "};\n\n";
 }

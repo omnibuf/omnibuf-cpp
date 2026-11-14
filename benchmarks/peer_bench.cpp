@@ -314,8 +314,9 @@ bool decode_location(std::span<const uint8_t> b, Location& loc) {
     if ((fnum == 1 || fnum == 2 || fnum == 3) && wt == 2) {
       uint64_t len = 0;
       if (!read_leb128(b, pos, len) || len > b.size() - pos) return false;
-      const char* ptr = reinterpret_cast<const char*>(b.data() + pos);
       const size_t n = static_cast<size_t>(len);
+      if (!omnibuf::is_valid_utf8(b.subspan(pos, n))) return false;
+      const char* ptr = reinterpret_cast<const char*>(b.data() + pos);
       if (fnum == 1) loc.region.assign(ptr, n);
       else if (fnum == 2) loc.datacenter.assign(ptr, n);
       else loc.city.assign(ptr, n);
@@ -351,8 +352,10 @@ bool decode_neighbor(std::span<const uint8_t> b, Neighbor& nb) {
     } else if (fnum == 2 && wt == 2) {
       uint64_t len = 0;
       if (!read_leb128(b, pos, len) || len > b.size() - pos) return false;
-      nb.router.assign(reinterpret_cast<const char*>(b.data() + pos), static_cast<size_t>(len));
-      pos += static_cast<size_t>(len);
+      const size_t n = static_cast<size_t>(len);
+      if (!omnibuf::is_valid_utf8(b.subspan(pos, n))) return false;
+      nb.router.assign(reinterpret_cast<const char*>(b.data() + pos), n);
+      pos += n;
     } else if (fnum == 3 && wt == 0) {
       uint64_t v = 0;
       if (!read_leb128(b, pos, v)) return false;
@@ -385,9 +388,10 @@ bool decode_peer_update(std::span<const uint8_t> b, PeerUpdate& out) {
       case 2: {
         uint64_t len = 0;
         if (wt != 2 || !read_leb128(b, pos, len) || len > b.size() - pos) return false;
-        out.router_id.assign(reinterpret_cast<const char*>(b.data() + pos),
-                             static_cast<size_t>(len));
-        pos += static_cast<size_t>(len);
+        const size_t n = static_cast<size_t>(len);
+        if (!omnibuf::is_valid_utf8(b.subspan(pos, n))) return false;
+        out.router_id.assign(reinterpret_cast<const char*>(b.data() + pos), n);
+        pos += n;
         break;
       }
       case 3: {
@@ -417,9 +421,10 @@ bool decode_peer_update(std::span<const uint8_t> b, PeerUpdate& out) {
       case 7: {
         uint64_t len = 0;
         if (wt != 2 || !read_leb128(b, pos, len) || len > b.size() - pos) return false;
-        out.tags.emplace_back(reinterpret_cast<const char*>(b.data() + pos),
-                              static_cast<size_t>(len));
-        pos += static_cast<size_t>(len);
+        const size_t n = static_cast<size_t>(len);
+        if (!omnibuf::is_valid_utf8(b.subspan(pos, n))) return false;
+        out.tags.emplace_back(reinterpret_cast<const char*>(b.data() + pos), n);
+        pos += n;
         break;
       }
       case 8: {

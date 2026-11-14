@@ -212,319 +212,342 @@ inline std::shared_ptr<SchemaMeta> build_struct_schema_meta(int depth,
 }
 
 template <RegisteredStruct T>
-[[nodiscard]] inline Result<void> encode_struct_body(std::vector<uint8_t>& dst,
-                                                     const T& msg,
-                                                     MarshalOptions opts);
+[[nodiscard]] inline const char* encode_struct_body(FastWriter& w,
+                                                    const T& msg,
+                                                    MarshalOptions opts);
 
 template <typename ValT, WireOverride Override>
-[[nodiscard]] inline Result<void> encode_scalar_payload(std::vector<uint8_t>& dst,
-                                                        const ValT& val) {
+[[nodiscard]] inline const char* encode_scalar_payload(FastWriter& w, const ValT& val) {
   constexpr uint8_t wt = scalar_wire_type<ValT, Override>();
   if constexpr (wt == WireBoolFalse) {
-    dst.push_back(val ? uint8_t{1} : uint8_t{0});
+    w.write_byte(val ? uint8_t{1} : uint8_t{0});
   } else if constexpr (wt == WireUint) {
-    append_varint(dst, static_cast<uint64_t>(val));
+    w.write_varint(static_cast<uint64_t>(val));
   } else if constexpr (wt == WireSint) {
-    append_varint(dst, encode_zigzag(static_cast<int64_t>(val)));
+    w.write_varint(encode_zigzag(static_cast<int64_t>(val)));
   } else if constexpr (wt == WireFixed32 || wt == WireSfixed32) {
-    append_u32_le(dst, static_cast<uint32_t>(val));
+    w.write_u32_raw(static_cast<uint32_t>(val));
   } else if constexpr (wt == WireFixed64 || wt == WireSfixed64) {
-    append_u64_le(dst, static_cast<uint64_t>(val));
+    w.write_u64_raw(static_cast<uint64_t>(val));
   } else if constexpr (wt == WireFloat32) {
-    append_u32_le(dst, float32_to_bits(val));
+    w.write_u32_raw(float32_to_bits(val));
   } else if constexpr (wt == WireFloat64) {
-    append_u64_le(dst, float64_to_bits(val));
+    w.write_u64_raw(float64_to_bits(val));
   } else if constexpr (wt == WireString) {
-    if (!is_valid_utf8(val)) {
-      return Error{"omnibuf: string field contains invalid UTF-8"};
+    if (!is_valid_utf8(val)) [[unlikely]] {
+      return "omnibuf: string field contains invalid UTF-8";
     }
-    append_varint(dst, val.size());
-    dst.insert(dst.end(), val.begin(), val.end());
+    w.write_varint(val.size());
+    w.write_bytes(val.data(), val.size());
   } else if constexpr (wt == WireBytes) {
-    append_varint(dst, val.size());
-    dst.insert(dst.end(), val.begin(), val.end());
+    w.write_varint(val.size());
+    w.write_bytes(val.data(), val.size());
   }
-  return Result<void>::success();
+  return nullptr;
 }
 
 template <uint32_t FieldNum, WireOverride Override, typename FieldT>
-[[nodiscard]] inline Result<void> encode_struct_field(std::vector<uint8_t>& dst,
-                                                      const FieldT& value,
-                                                      MarshalOptions opts) {
+[[nodiscard]] inline const char* encode_struct_field(FastWriter& w,
+                                                     const FieldT& value,
+                                                     MarshalOptions opts) {
   if constexpr (RegisteredStruct<FieldT>) {
-    append_tag(dst, FieldNum, WireSubMsg);
-    const size_t len_pos = dst.size();
-    dst.push_back(0);
-    dst.push_back(0);
-    auto res = encode_struct_body(dst, value, opts);
-    if (!res) return res;
-    backpatch_container_len(dst, len_pos);
-    return Result<void>::success();
+    w.write_tag(FieldNum, WireSubMsg);
+    const size_t len_pos = w.reserve_len_2b();
+    const char* err = encode_struct_body(w, value, opts);
+    if (err != nullptr) [[unlikely]] return err;
+    w.backpatch_len(len_pos);
+    return nullptr;
   } else if constexpr (IsStdOptional<FieldT>::value || IsUniquePtr<FieldT>::value) {
     if (!value) {
-      return Result<void>::success();
+      return nullptr;
     }
     using Inner = typename PointeeType<FieldT>::type;
     if constexpr (RegisteredStruct<Inner>) {
-      append_tag(dst, FieldNum, WireSubMsg);
-      const size_t len_pos = dst.size();
-      dst.push_back(0);
-      dst.push_back(0);
-      auto res = encode_struct_body(dst, *value, opts);
-      if (!res) return res;
-      backpatch_container_len(dst, len_pos);
-      return Result<void>::success();
+      w.write_tag(FieldNum, WireSubMsg);
+      const size_t len_pos = w.reserve_len_2b();
+      const char* err = encode_struct_body(w, *value, opts);
+      if (err != nullptr) [[unlikely]] return err;
+      w.backpatch_len(len_pos);
+      return nullptr;
     } else {
-      return encode_struct_field<FieldNum, Override>(dst, *value, opts);
+      return encode_struct_field<FieldNum, Override>(w, *value, opts);
     }
   } else if constexpr (IsStdVector<FieldT>::value &&
                        !std::is_same_v<FieldT, std::vector<uint8_t>>) {
     using Elem = typename FieldT::value_type;
-    append_tag(dst, FieldNum, WireArray);
-    const size_t len_pos = dst.size();
-    dst.push_back(0);
-    dst.push_back(0);
+    w.write_tag(FieldNum, WireArray);
+    const size_t len_pos = w.reserve_len_2b();
     if constexpr (RegisteredStruct<Elem>) {
-      dst.push_back(WireSubMsg);
-      append_varint(dst, value.size());
+      w.write_byte(WireSubMsg);
+      w.write_varint(value.size());
       for (const auto& elem : value) {
-        const size_t e_len_pos = dst.size();
-        dst.push_back(0);
-        dst.push_back(0);
-        auto res = encode_struct_body(dst, elem, opts);
-        if (!res) return res;
-        backpatch_container_len(dst, e_len_pos);
+        const size_t e_len_pos = w.reserve_len_2b();
+        const char* err = encode_struct_body(w, elem, opts);
+        if (err != nullptr) [[unlikely]] return err;
+        w.backpatch_len(e_len_pos);
       }
     } else if constexpr (IsUniquePtr<Elem>::value) {
       using Inner = typename PointeeType<Elem>::type;
       static_assert(RegisteredStruct<Inner>, "unique_ptr vector element must be RegisteredStruct");
-      dst.push_back(WireSubMsg);
-      append_varint(dst, value.size());
+      w.write_byte(WireSubMsg);
+      w.write_varint(value.size());
       for (const auto& elem_ptr : value) {
-        const size_t e_len_pos = dst.size();
-        dst.push_back(0);
-        dst.push_back(0);
+        const size_t e_len_pos = w.reserve_len_2b();
         if (elem_ptr) {
-          auto res = encode_struct_body(dst, *elem_ptr, opts);
-          if (!res) return res;
+          const char* err = encode_struct_body(w, *elem_ptr, opts);
+          if (err != nullptr) [[unlikely]] return err;
         }
-        backpatch_container_len(dst, e_len_pos);
+        w.backpatch_len(e_len_pos);
       }
     } else {
       constexpr uint8_t elem_wt = scalar_wire_type<Elem, Override>();
-      dst.push_back(elem_wt);
-      append_varint(dst, value.size());
+      w.write_byte(elem_wt);
+      w.write_varint(value.size());
       if constexpr (std::is_same_v<Elem, bool>) {
+        w.ensure(value.size());
         for (bool b : value) {
-          dst.push_back(b ? uint8_t{1} : uint8_t{0});
+          w.write_byte(b ? uint8_t{1} : uint8_t{0});
         }
       } else {
         for (const auto& elem : value) {
-          auto res = encode_scalar_payload<Elem, Override>(dst, elem);
-          if (!res) return res;
+          const char* err = encode_scalar_payload<Elem, Override>(w, elem);
+          if (err != nullptr) [[unlikely]] return err;
         }
       }
     }
-    backpatch_container_len(dst, len_pos);
-    return Result<void>::success();
+    w.backpatch_len(len_pos);
+    return nullptr;
   } else if constexpr (IsStdMap<FieldT>::value) {
     using K = typename FieldT::key_type;
     using V = typename FieldT::mapped_type;
     constexpr uint8_t key_wt = scalar_wire_type<K, WireOverride::Default>();
     constexpr uint8_t val_wt =
         RegisteredStruct<V> ? WireSubMsg : scalar_wire_type<V, Override>();
-    append_tag(dst, FieldNum, WireMap);
-    const size_t len_pos = dst.size();
-    dst.push_back(0);
-    dst.push_back(0);
-    dst.push_back(key_wt);
-    dst.push_back(val_wt);
-    append_varint(dst, value.size());
-    // std::map iterates keys in ascending deterministic order automatically.
+    w.write_tag(FieldNum, WireMap);
+    const size_t len_pos = w.reserve_len_2b();
+    w.write_byte(key_wt);
+    w.write_byte(val_wt);
+    w.write_varint(value.size());
     for (const auto& [k, v] : value) {
-      auto k_res = encode_scalar_payload<K, WireOverride::Default>(dst, k);
-      if (!k_res) return k_res;
+      const char* k_err = encode_scalar_payload<K, WireOverride::Default>(w, k);
+      if (k_err != nullptr) [[unlikely]] return k_err;
       if constexpr (RegisteredStruct<V>) {
-        const size_t v_len_pos = dst.size();
-        dst.push_back(0);
-        dst.push_back(0);
-        auto v_res = encode_struct_body(dst, v, opts);
-        if (!v_res) return v_res;
-        backpatch_container_len(dst, v_len_pos);
+        const size_t v_len_pos = w.reserve_len_2b();
+        const char* v_err = encode_struct_body(w, v, opts);
+        if (v_err != nullptr) [[unlikely]] return v_err;
+        w.backpatch_len(v_len_pos);
       } else {
-        auto v_res = encode_scalar_payload<V, Override>(dst, v);
-        if (!v_res) return v_res;
+        const char* v_err = encode_scalar_payload<V, Override>(w, v);
+        if (v_err != nullptr) [[unlikely]] return v_err;
       }
     }
-    backpatch_container_len(dst, len_pos);
-    return Result<void>::success();
+    w.backpatch_len(len_pos);
+    return nullptr;
   } else if constexpr (std::is_same_v<FieldT, bool>) {
-    append_tag(dst, FieldNum, value ? WireBoolTrue : WireBoolFalse);
-    return Result<void>::success();
+    w.write_tag(FieldNum, value ? WireBoolTrue : WireBoolFalse);
+    return nullptr;
   } else {
     constexpr uint8_t wt = scalar_wire_type<FieldT, Override>();
-    append_tag(dst, FieldNum, wt);
-    return encode_scalar_payload<FieldT, Override>(dst, value);
+    w.write_tag(FieldNum, wt);
+    return encode_scalar_payload<FieldT, Override>(w, value);
   }
 }
 
 template <RegisteredStruct T>
-[[nodiscard]] inline Result<void> encode_struct_body(std::vector<uint8_t>& dst,
-                                                     const T& msg,
-                                                     MarshalOptions opts) {
+[[nodiscard]] inline const char* encode_struct_body(FastWriter& w,
+                                                    const T& msg,
+                                                    MarshalOptions opts) {
   const auto fields = StructTraits<T>::fields();
-  Result<void> status = Result<void>::success();
+  const char* err = nullptr;
   std::apply(
       [&](const auto&... fd) {
         (
             [&] {
-              if (!status) return;
+              if (err != nullptr) return;
               using FD = std::remove_cvref_t<decltype(fd)>;
-              status = encode_struct_field<FD::number, FD::wire_override>(dst, msg.*(FD::member), opts);
+              err = encode_struct_field<FD::number, FD::wire_override>(w, msg.*(FD::member), opts);
             }(),
             ...);
       },
       fields);
-  return status;
+  return err;
 }
 
 template <RegisteredStruct T>
-[[nodiscard]] inline Result<void> decode_struct_body(std::span<const uint8_t> data,
-                                                     T& msg,
-                                                     int depth,
-                                                     bool merge,
-                                                     bool is_fresh = false);
+[[nodiscard]] inline const char* decode_struct_body(std::span<const uint8_t> data,
+                                                    T& msg,
+                                                    int depth,
+                                                    bool merge,
+                                                    bool is_fresh = false);
+
+template <typename FieldT>
+inline void clear_struct_member(FieldT& field_ref) {
+  if constexpr (RegisteredStruct<FieldT>) {
+    const auto fields = StructTraits<FieldT>::fields();
+    std::apply([&](const auto&... fd) { (clear_struct_member(field_ref.*(fd.member)), ...); },
+               fields);
+  } else if constexpr (IsStdOptional<FieldT>::value || IsUniquePtr<FieldT>::value) {
+    field_ref.reset();
+  } else if constexpr (IsStdVector<FieldT>::value || IsStdMap<FieldT>::value ||
+                       std::is_same_v<FieldT, std::string>) {
+    field_ref.clear();
+  } else {
+    field_ref = FieldT{};
+  }
+}
 
 template <typename ValT, WireOverride Override>
-[[nodiscard]] inline Result<size_t> decode_scalar_payload(std::span<const uint8_t> data,
-                                                          size_t pos,
-                                                          ValT& out) {
+[[nodiscard]] inline PosStep decode_scalar_payload(std::span<const uint8_t> data,
+                                                   size_t pos,
+                                                   ValT& out) {
   constexpr uint8_t wt = scalar_wire_type<ValT, Override>();
   if constexpr (wt == WireBoolFalse) {
-    if (pos >= data.size() || data[pos] > 1u) {
-      return Error{"omnibuf: invalid bool byte"};
+    if (pos >= data.size() || data[pos] > 1u) [[unlikely]] {
+      return {0, "omnibuf: invalid bool byte"};
     }
     out = (data[pos] == 1u);
-    return pos + 1;
+    return {pos + 1, nullptr};
   } else if constexpr (wt == WireUint) {
+    if (pos < data.size()) [[likely]] {
+      const uint8_t b0 = data[pos];
+      if ((b0 & 1u) != 0) [[likely]] {
+        out = static_cast<ValT>(b0 >> 1);
+        return {pos + 1, nullptr};
+      }
+    }
     const auto [v, vn] = decode_varint(data.subspan(pos));
-    if (vn == 0) return Error{"omnibuf: truncated WireUint"};
+    if (vn == 0) [[unlikely]] return {0, "omnibuf: truncated WireUint"};
     out = static_cast<ValT>(v);
-    return pos + vn;
+    return {pos + vn, nullptr};
   } else if constexpr (wt == WireSint) {
+    if (pos < data.size()) [[likely]] {
+      const uint8_t b0 = data[pos];
+      if ((b0 & 1u) != 0) [[likely]] {
+        out = static_cast<ValT>(decode_zigzag(static_cast<uint64_t>(b0 >> 1)));
+        return {pos + 1, nullptr};
+      }
+    }
     const auto [v, vn] = decode_varint(data.subspan(pos));
-    if (vn == 0) return Error{"omnibuf: truncated WireSint"};
+    if (vn == 0) [[unlikely]] return {0, "omnibuf: truncated WireSint"};
     out = static_cast<ValT>(decode_zigzag(v));
-    return pos + vn;
+    return {pos + vn, nullptr};
   } else if constexpr (wt == WireFixed32 || wt == WireSfixed32) {
-    if (data.size() - pos < 4) return Error{"omnibuf: truncated 32-bit fixed"};
+    if (data.size() - pos < 4) [[unlikely]] return {0, "omnibuf: truncated 32-bit fixed"};
     const uint32_t bits = read_u32_le(data.data() + pos);
     if constexpr (std::is_signed_v<ValT>) {
       out = static_cast<ValT>(static_cast<int32_t>(bits));
     } else {
       out = static_cast<ValT>(bits);
     }
-    return pos + 4;
+    return {pos + 4, nullptr};
   } else if constexpr (wt == WireFixed64 || wt == WireSfixed64) {
-    if (data.size() - pos < 8) return Error{"omnibuf: truncated 64-bit fixed"};
+    if (data.size() - pos < 8) [[unlikely]] return {0, "omnibuf: truncated 64-bit fixed"};
     const uint64_t bits = read_u64_le(data.data() + pos);
     if constexpr (std::is_signed_v<ValT>) {
       out = static_cast<ValT>(static_cast<int64_t>(bits));
     } else {
       out = static_cast<ValT>(bits);
     }
-    return pos + 8;
+    return {pos + 8, nullptr};
   } else if constexpr (wt == WireFloat32) {
-    if (data.size() - pos < 4) return Error{"omnibuf: truncated float32"};
+    if (data.size() - pos < 4) [[unlikely]] return {0, "omnibuf: truncated float32"};
     out = bits_to_float32(read_u32_le(data.data() + pos));
-    return pos + 4;
+    return {pos + 4, nullptr};
   } else if constexpr (wt == WireFloat64) {
-    if (data.size() - pos < 8) return Error{"omnibuf: truncated float64"};
+    if (data.size() - pos < 8) [[unlikely]] return {0, "omnibuf: truncated float64"};
     out = bits_to_float64(read_u64_le(data.data() + pos));
-    return pos + 8;
+    return {pos + 8, nullptr};
   } else if constexpr (wt == WireString) {
-    auto s_res = read_str_slice(data, pos);
-    if (!s_res) return Error{s_res.error()};
-    const auto sp = s_res.value().slice;
-    out.assign(reinterpret_cast<const char*>(sp.data()), sp.size());
-    return s_res.value().next_pos;
+    const auto s_res = read_str_slice_fast(data, pos);
+    if (!s_res) [[unlikely]] return {0, s_res.err};
+    out.assign(reinterpret_cast<const char*>(s_res.ptr), s_res.len);
+    return {s_res.next_pos, nullptr};
   } else if constexpr (wt == WireBytes) {
-    auto b_res = read_len_slice(data, pos, 0);
-    if (!b_res) return Error{b_res.error()};
-    const auto sp = b_res.value().slice;
-    out.assign(sp.begin(), sp.end());
-    return b_res.value().next_pos;
+    const auto b_res = read_len_slice_fast(data, pos, 0);
+    if (!b_res) [[unlikely]] return {0, b_res.err};
+    out.assign(b_res.ptr, b_res.ptr + b_res.len);
+    return {b_res.next_pos, nullptr};
   }
 }
 
+[[nodiscard]] inline PosStep validate_value_step(std::span<const uint8_t> data,
+                                                 size_t pos,
+                                                 uint8_t wt,
+                                                 int depth) {
+  auto res = validate_value(data, pos, wt, depth);
+  if (!res) return {0, "omnibuf: invalid skipped field payload"};
+  return {res.value(), nullptr};
+}
+
 template <WireOverride Override, typename FieldT>
-[[nodiscard]] inline Result<size_t> decode_matched_struct_field(std::span<const uint8_t> data,
-                                                                size_t pos,
-                                                                uint8_t wt,
-                                                                FieldT& field_ref,
-                                                                int depth,
-                                                                bool already_seen) {
+[[nodiscard]] inline PosStep decode_matched_struct_field(std::span<const uint8_t> data,
+                                                         size_t pos,
+                                                         uint8_t wt,
+                                                         FieldT& field_ref,
+                                                         int depth,
+                                                         bool already_seen) {
   if constexpr (RegisteredStruct<FieldT>) {
-    if (wt != WireSubMsg) {
-      return validate_value(data, pos, wt, depth);
+    if (wt != WireSubMsg) [[unlikely]] {
+      return validate_value_step(data, pos, wt, depth);
     }
-    auto sub_res = read_len_slice(data, pos, 0);
-    if (!sub_res) return Error{sub_res.error()};
-    auto dec_res = decode_struct_body(sub_res.value().slice, field_ref, depth + 1, already_seen);
-    if (!dec_res) return Error{dec_res.error()};
-    return sub_res.value().next_pos;
+    const auto sub_res = read_len_slice_fast(data, pos, 0);
+    if (!sub_res) [[unlikely]] return {0, sub_res.err};
+    const char* err = decode_struct_body(sub_res.span(), field_ref, depth + 1, already_seen);
+    if (err != nullptr) [[unlikely]] return {0, err};
+    return {sub_res.next_pos, nullptr};
   } else if constexpr (IsStdOptional<FieldT>::value) {
     using Inner = typename FieldT::value_type;
     if constexpr (RegisteredStruct<Inner>) {
-      if (wt != WireSubMsg) {
-        return validate_value(data, pos, wt, depth);
+      if (wt != WireSubMsg) [[unlikely]] {
+        return validate_value_step(data, pos, wt, depth);
       }
-      auto sub_res = read_len_slice(data, pos, 0);
-      if (!sub_res) return Error{sub_res.error()};
+      const auto sub_res = read_len_slice_fast(data, pos, 0);
+      if (!sub_res) [[unlikely]] return {0, sub_res.err};
       bool fresh = false;
       if (!field_ref.has_value() || !already_seen) {
         field_ref.emplace();
         fresh = true;
       }
-      auto dec_res = decode_struct_body(sub_res.value().slice, *field_ref, depth + 1, already_seen, fresh);
-      if (!dec_res) return Error{dec_res.error()};
-      return sub_res.value().next_pos;
+      const char* err =
+          decode_struct_body(sub_res.span(), *field_ref, depth + 1, already_seen, fresh);
+      if (err != nullptr) [[unlikely]] return {0, err};
+      return {sub_res.next_pos, nullptr};
     } else {
       Inner tmp{};
-      auto res = decode_matched_struct_field<Override>(data, pos, wt, tmp, depth, already_seen);
-      if (!res) return res;
+      const auto res =
+          decode_matched_struct_field<Override>(data, pos, wt, tmp, depth, already_seen);
+      if (!res) [[unlikely]] return res;
       field_ref = std::move(tmp);
       return res;
     }
   } else if constexpr (IsUniquePtr<FieldT>::value) {
     using Inner = typename PointeeType<FieldT>::type;
     static_assert(RegisteredStruct<Inner>, "unique_ptr field must point to RegisteredStruct");
-    if (wt != WireSubMsg) {
-      return validate_value(data, pos, wt, depth);
+    if (wt != WireSubMsg) [[unlikely]] {
+      return validate_value_step(data, pos, wt, depth);
     }
-    auto sub_res = read_len_slice(data, pos, 0);
-    if (!sub_res) return Error{sub_res.error()};
+    const auto sub_res = read_len_slice_fast(data, pos, 0);
+    if (!sub_res) [[unlikely]] return {0, sub_res.err};
     bool fresh = false;
     if (!field_ref || !already_seen) {
       field_ref = std::make_unique<Inner>();
       fresh = true;
     }
-    auto dec_res = decode_struct_body(sub_res.value().slice, *field_ref, depth + 1, already_seen, fresh);
-    if (!dec_res) return Error{dec_res.error()};
-    return sub_res.value().next_pos;
+    const char* err =
+        decode_struct_body(sub_res.span(), *field_ref, depth + 1, already_seen, fresh);
+    if (err != nullptr) [[unlikely]] return {0, err};
+    return {sub_res.next_pos, nullptr};
   } else if constexpr (IsStdVector<FieldT>::value &&
                        !std::is_same_v<FieldT, std::vector<uint8_t>>) {
-    if (wt != WireArray) {
-      return validate_value(data, pos, wt, depth);
+    if (wt != WireArray) [[unlikely]] {
+      return validate_value_step(data, pos, wt, depth);
     }
-    if (depth + 1 > MAX_CONTAINER_DEPTH) {
-      return Error{"omnibuf: array nesting depth exceeds MAX_CONTAINER_DEPTH"};
+    if (depth + 1 > MAX_CONTAINER_DEPTH) [[unlikely]] {
+      return {0, "omnibuf: array nesting depth exceeds MAX_CONTAINER_DEPTH"};
     }
-    auto body_res = read_len_slice(data, pos, 2);
-    if (!body_res) return Error{body_res.error()};
-    const auto body = body_res.value().slice;
-    const auto hdr = parse_array_header(body);
-    if (!hdr.ok) return Error{"omnibuf: invalid WireArray header"};
+    const auto body_res = read_len_slice_fast(data, pos, 2);
+    if (!body_res) [[unlikely]] return {0, body_res.err};
+    const auto body = body_res.span();
 
     if (!already_seen) {
       field_ref.clear();
@@ -532,73 +555,99 @@ template <WireOverride Override, typename FieldT>
 
     using Elem = typename FieldT::value_type;
     if constexpr (RegisteredStruct<Elem>) {
-      if (hdr.elem_wt != WireSubMsg) return Error{"omnibuf: WireArray element type mismatch"};
+      const auto hdr = parse_array_header(body);
+      if (!hdr.ok || hdr.elem_wt != WireSubMsg) [[unlikely]] {
+        return {0, "omnibuf: WireArray element type mismatch"};
+      }
       field_ref.reserve(grow_capacity(field_ref.capacity(), field_ref.size() + hdr.count));
       size_t p = hdr.pos;
       for (size_t i = 0; i < hdr.count; ++i) {
-        auto elem_slice = read_len_slice(body, p, 0);
-        if (!elem_slice) return Error{elem_slice.error()};
-        Elem item{};
-        auto dec_res = decode_struct_body(elem_slice.value().slice, item, depth + 2, false, true);
-        if (!dec_res) return Error{dec_res.error()};
-        field_ref.push_back(std::move(item));
-        p = elem_slice.value().next_pos;
+        const auto elem_slice = read_len_slice_fast(body, p, 0);
+        if (!elem_slice) [[unlikely]] return {0, elem_slice.err};
+        Elem& item = field_ref.emplace_back();
+        const char* err = decode_struct_body(elem_slice.span(), item, depth + 2, false, true);
+        if (err != nullptr) [[unlikely]] return {0, err};
+        p = elem_slice.next_pos;
       }
-      if (p != body.size()) return Error{"omnibuf: WireArray(submsg) trailing bytes"};
+      if (p != body.size()) [[unlikely]] return {0, "omnibuf: WireArray(submsg) trailing bytes"};
     } else if constexpr (IsUniquePtr<Elem>::value) {
       using Inner = typename PointeeType<Elem>::type;
-      if (hdr.elem_wt != WireSubMsg) return Error{"omnibuf: WireArray element type mismatch"};
+      const auto hdr = parse_array_header(body);
+      if (!hdr.ok || hdr.elem_wt != WireSubMsg) [[unlikely]] {
+        return {0, "omnibuf: WireArray element type mismatch"};
+      }
       field_ref.reserve(grow_capacity(field_ref.capacity(), field_ref.size() + hdr.count));
       size_t p = hdr.pos;
       for (size_t i = 0; i < hdr.count; ++i) {
-        auto elem_slice = read_len_slice(body, p, 0);
-        if (!elem_slice) return Error{elem_slice.error()};
+        const auto elem_slice = read_len_slice_fast(body, p, 0);
+        if (!elem_slice) [[unlikely]] return {0, elem_slice.err};
         auto item = std::make_unique<Inner>();
-        auto dec_res = decode_struct_body(elem_slice.value().slice, *item, depth + 2, false, true);
-        if (!dec_res) return Error{dec_res.error()};
+        const char* err = decode_struct_body(elem_slice.span(), *item, depth + 2, false, true);
+        if (err != nullptr) [[unlikely]] return {0, err};
         field_ref.push_back(std::move(item));
-        p = elem_slice.value().next_pos;
+        p = elem_slice.next_pos;
       }
-      if (p != body.size()) return Error{"omnibuf: WireArray(submsg) trailing bytes"};
+      if (p != body.size()) [[unlikely]] return {0, "omnibuf: WireArray(submsg) trailing bytes"};
+    } else if constexpr (std::is_same_v<Elem, std::string>) {
+      if (!append_string_arr_body(field_ref, body)) [[unlikely]] {
+        return {0, "omnibuf: invalid string array"};
+      }
+    } else if constexpr (std::is_same_v<Elem, std::vector<uint8_t>>) {
+      if (!append_bytes_arr_body(field_ref, body)) [[unlikely]] {
+        return {0, "omnibuf: invalid bytes array"};
+      }
+    } else if constexpr (std::is_same_v<Elem, bool>) {
+      if (!append_bool_arr_body(field_ref, body)) [[unlikely]] {
+        return {0, "omnibuf: invalid bool array"};
+      }
     } else {
       constexpr uint8_t exp_elem_wt = scalar_wire_type<Elem, Override>();
-      if (hdr.elem_wt != exp_elem_wt) return Error{"omnibuf: WireArray element type mismatch"};
-      if constexpr (std::is_same_v<Elem, bool>) {
-        if (!append_bool_arr_body(field_ref, body)) return Error{"omnibuf: invalid bool array"};
+      if constexpr (exp_elem_wt == WireUint && !std::is_enum_v<Elem>) {
+        if (!append_uint_arr_body(field_ref, body)) [[unlikely]] {
+          return {0, "omnibuf: invalid uint array"};
+        }
+      } else if constexpr (exp_elem_wt == WireSint && !std::is_enum_v<Elem>) {
+        if (!append_sint_arr_body(field_ref, body)) [[unlikely]] {
+          return {0, "omnibuf: invalid sint array"};
+        }
       } else {
+        const auto hdr = parse_array_header(body);
+        if (!hdr.ok || hdr.elem_wt != exp_elem_wt) [[unlikely]] {
+          return {0, "omnibuf: WireArray element type mismatch"};
+        }
         field_ref.reserve(grow_capacity(field_ref.capacity(), field_ref.size() + hdr.count));
         size_t p = hdr.pos;
         for (size_t i = 0; i < hdr.count; ++i) {
           Elem item{};
-          auto item_res = decode_scalar_payload<Elem, Override>(body, p, item);
-          if (!item_res) return Error{item_res.error()};
+          const auto item_res = decode_scalar_payload<Elem, Override>(body, p, item);
+          if (!item_res) [[unlikely]] return item_res;
           field_ref.push_back(std::move(item));
-          p = item_res.value();
+          p = item_res.pos;
         }
-        if (p != body.size()) return Error{"omnibuf: WireArray trailing bytes"};
+        if (p != body.size()) [[unlikely]] return {0, "omnibuf: WireArray trailing bytes"};
       }
     }
-    return body_res.value().next_pos;
+    return {body_res.next_pos, nullptr};
   } else if constexpr (IsStdMap<FieldT>::value) {
-    if (wt != WireMap) {
-      return validate_value(data, pos, wt, depth);
+    if (wt != WireMap) [[unlikely]] {
+      return validate_value_step(data, pos, wt, depth);
     }
-    if (depth + 1 > MAX_CONTAINER_DEPTH) {
-      return Error{"omnibuf: map nesting depth exceeds MAX_CONTAINER_DEPTH"};
+    if (depth + 1 > MAX_CONTAINER_DEPTH) [[unlikely]] {
+      return {0, "omnibuf: map nesting depth exceeds MAX_CONTAINER_DEPTH"};
     }
-    auto body_res = read_len_slice(data, pos, 3);
-    if (!body_res) return Error{body_res.error()};
-    const auto body = body_res.value().slice;
+    const auto body_res = read_len_slice_fast(data, pos, 3);
+    if (!body_res) [[unlikely]] return {0, body_res.err};
+    const auto body = body_res.span();
     const auto hdr = parse_map_header(body);
-    if (!hdr.ok) return Error{"omnibuf: invalid WireMap header"};
+    if (!hdr.ok) [[unlikely]] return {0, "omnibuf: invalid WireMap header"};
 
     using K = typename FieldT::key_type;
     using V = typename FieldT::mapped_type;
     constexpr uint8_t exp_key_wt = scalar_wire_type<K, WireOverride::Default>();
     constexpr uint8_t exp_val_wt =
         RegisteredStruct<V> ? WireSubMsg : scalar_wire_type<V, Override>();
-    if (hdr.key_wt != exp_key_wt || hdr.val_wt != exp_val_wt) {
-      return Error{"omnibuf: WireMap key/value wire type mismatch"};
+    if (hdr.key_wt != exp_key_wt || hdr.val_wt != exp_val_wt) [[unlikely]] {
+      return {0, "omnibuf: WireMap key/value wire type mismatch"};
     }
     if (!already_seen) {
       field_ref.clear();
@@ -606,98 +655,100 @@ template <WireOverride Override, typename FieldT>
     size_t p = hdr.pos;
     for (size_t i = 0; i < hdr.count; ++i) {
       K key{};
-      auto k_res = decode_scalar_payload<K, WireOverride::Default>(body, p, key);
-      if (!k_res) return Error{k_res.error()};
-      p = k_res.value();
+      const auto k_res = decode_scalar_payload<K, WireOverride::Default>(body, p, key);
+      if (!k_res) [[unlikely]] return k_res;
+      p = k_res.pos;
       if constexpr (RegisteredStruct<V>) {
-        auto v_slice = read_len_slice(body, p, 0);
-        if (!v_slice) return Error{v_slice.error()};
+        const auto v_slice = read_len_slice_fast(body, p, 0);
+        if (!v_slice) [[unlikely]] return {0, v_slice.err};
         V val{};
-        auto dec_res = decode_struct_body(v_slice.value().slice, val, depth + 2, false);
-        if (!dec_res) return Error{dec_res.error()};
+        const char* err = decode_struct_body(v_slice.span(), val, depth + 2, false, true);
+        if (err != nullptr) [[unlikely]] return {0, err};
         field_ref[std::move(key)] = std::move(val);
-        p = v_slice.value().next_pos;
+        p = v_slice.next_pos;
       } else {
         V val{};
-        auto v_res = decode_scalar_payload<V, Override>(body, p, val);
-        if (!v_res) return Error{v_res.error()};
+        const auto v_res = decode_scalar_payload<V, Override>(body, p, val);
+        if (!v_res) [[unlikely]] return v_res;
         field_ref[std::move(key)] = std::move(val);
-        p = v_res.value();
+        p = v_res.pos;
       }
     }
-    if (p != body.size()) return Error{"omnibuf: WireMap trailing bytes"};
-    return body_res.value().next_pos;
+    if (p != body.size()) [[unlikely]] return {0, "omnibuf: WireMap trailing bytes"};
+    return {body_res.next_pos, nullptr};
   } else if constexpr (std::is_same_v<FieldT, bool>) {
     if (wt == WireBoolTrue) {
       field_ref = true;
-      return pos;
+      return {pos, nullptr};
     }
     if (wt == WireBoolFalse) {
       field_ref = false;
-      return pos;
+      return {pos, nullptr};
     }
-    return validate_value(data, pos, wt, depth);
+    return validate_value_step(data, pos, wt, depth);
   } else {
     constexpr uint8_t exp_wt = scalar_wire_type<FieldT, Override>();
-    if (wt != exp_wt) {
-      return validate_value(data, pos, wt, depth);
+    if (wt != exp_wt) [[unlikely]] {
+      return validate_value_step(data, pos, wt, depth);
     }
     return decode_scalar_payload<FieldT, Override>(data, pos, field_ref);
   }
 }
 
 template <RegisteredStruct T>
-[[nodiscard]] inline Result<void> decode_struct_body(std::span<const uint8_t> data,
-                                                     T& msg,
-                                                     int depth,
-                                                     bool merge,
-                                                     bool is_fresh) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf: message nesting depth exceeds MAX_CONTAINER_DEPTH"};
-  }
-  if (!merge && !is_fresh) {
-    msg = T{};
+[[nodiscard]] inline const char* decode_struct_body(std::span<const uint8_t> data,
+                                                    T& msg,
+                                                    int depth,
+                                                    bool merge,
+                                                    bool is_fresh) {
+  if (depth > MAX_CONTAINER_DEPTH) [[unlikely]] {
+    return "omnibuf: message nesting depth exceeds MAX_CONTAINER_DEPTH";
   }
   const auto fields = StructTraits<T>::fields();
+  if (!merge && !is_fresh) {
+    std::apply([&](const auto&... fd) { (clear_struct_member(msg.*(fd.member)), ...); }, fields);
+  }
   constexpr size_t num_fields = std::tuple_size_v<std::remove_cvref_t<decltype(fields)>>;
-  std::array<bool, (num_fields > 0 ? num_fields : 1)> seen{};
-  if (merge) {
-    seen.fill(true);
+  uint64_t seen_mask = merge ? ~uint64_t{0} : uint64_t{0};
+  std::array<bool, (num_fields > 64 ? num_fields : 1)> seen_large{};
+  if constexpr (num_fields > 64) {
+    if (merge) seen_large.fill(true);
   }
 
   size_t pos = 0;
   const size_t n = data.size();
+  const uint8_t* base = data.data();
   while (pos < n) {
     uint32_t fnum = 0;
     uint8_t wt = 0;
-    const uint8_t b0 = data[pos];
-    if ((b0 & 1u) != 0) {
+    const uint8_t b0 = base[pos];
+    if ((b0 & 1u) != 0) [[likely]] {
       fnum = static_cast<uint32_t>(b0 >> 5);
       wt = static_cast<uint8_t>((b0 >> 1) & 0x0Fu);
       ++pos;
     } else if ((b0 & 2u) != 0 && pos + 2 <= n) {
-      const uint16_t u = static_cast<uint16_t>(read_u16_le(data.data() + pos) >> 2);
+      const uint16_t u = static_cast<uint16_t>(read_u16_le(base + pos) >> 2);
       fnum = static_cast<uint32_t>(u >> 4);
       wt = static_cast<uint8_t>(u & 0x0Fu);
       pos += 2;
     } else {
       const auto [tag, tn] = decode_varint(data.subspan(pos));
-      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) {
-        return Error{"omnibuf: invalid or truncated tag"};
+      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) [[unlikely]] {
+        return "omnibuf: invalid or truncated tag";
       }
       pos += tn;
       fnum = static_cast<uint32_t>(tag >> 4);
       wt = static_cast<uint8_t>(tag & 0x0Fu);
     }
 
-    if (fnum == 0) {
+    if (fnum == 0) [[unlikely]] {
       auto f0_res = validate_field0(data, pos, wt, depth);
-      if (!f0_res) return Error{f0_res.error()};
+      if (!f0_res) return "omnibuf: invalid Field #0";
       pos = f0_res.value();
       continue;
     }
 
-    Result<size_t> step_res = pos;
+    PosStep step_res{pos, nullptr};
     const bool matched = [&]<size_t... Is>(std::index_sequence<Is...>) {
       return (
           [&]() -> bool {
@@ -706,24 +757,31 @@ template <RegisteredStruct T>
             if (FD::number != fnum) {
               return false;
             }
-            const bool was_seen = seen[Is];
+            bool was_seen = false;
+            if constexpr (num_fields <= 64) {
+              constexpr uint64_t bit = uint64_t{1} << Is;
+              was_seen = (seen_mask & bit) != 0;
+              seen_mask |= bit;
+            } else {
+              was_seen = seen_large[Is];
+              seen_large[Is] = true;
+            }
             step_res = decode_matched_struct_field<FD::wire_override>(
                 data, pos, wt, msg.*(FD::member), depth, was_seen);
-            seen[Is] = true;
             return true;
           }() ||
           ...);
     }(std::make_index_sequence<num_fields>{});
 
-    if (!matched) {
-      step_res = validate_value(data, pos, wt, depth);
+    if (!matched) [[unlikely]] {
+      step_res = validate_value_step(data, pos, wt, depth);
     }
-    if (!step_res) {
-      return Error{step_res.error()};
+    if (!step_res) [[unlikely]] {
+      return step_res.err;
     }
-    pos = step_res.value();
+    pos = step_res.pos;
   }
-  return Result<void>::success();
+  return nullptr;
 }
 
 }  // namespace detail
@@ -739,8 +797,8 @@ template <RegisteredStruct T>
 [[nodiscard]] inline Result<std::vector<uint8_t>> marshal(const T& msg,
                                                           MarshalOptions opts = {}) {
   std::vector<uint8_t> dst;
-  dst.reserve(512);
   if (opts.self_describing) {
+    dst.reserve(512);
     std::set<const void*> active;
     if (auto meta = detail::build_struct_schema_meta<T>(0, active)) {
       append_field0_schema_meta(dst, *meta);
@@ -748,14 +806,18 @@ template <RegisteredStruct T>
   }
   MarshalOptions body_opts = opts;
   body_opts.self_describing = false;
-  auto res = detail::encode_struct_body(dst, msg, body_opts);
-  if (!res) return Error{res.error()};
+  FastWriter w(dst, 512);
+  const char* err = detail::encode_struct_body(w, msg, body_opts);
+  if (err != nullptr) [[unlikely]] return Error{err};
+  w.finish();
   return dst;
 }
 
 template <RegisteredStruct T>
 [[nodiscard]] inline Result<void> unmarshal(std::span<const uint8_t> data, T& msg) {
-  return detail::decode_struct_body(data, msg, 0, false);
+  const char* err = detail::decode_struct_body(data, msg, 0, false);
+  if (err != nullptr) [[unlikely]] return Error{err};
+  return Result<void>::success();
 }
 
 }  // namespace omnibuf

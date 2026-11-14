@@ -266,31 +266,75 @@ struct SliceResult {
   size_t next_pos = 0;
 };
 
+// Trivially copyable register-returned step types for zero-allocation hot-path decoding.
+struct PosStep {
+  size_t pos = 0;
+  const char* err = nullptr;
+  [[nodiscard]] explicit constexpr operator bool() const noexcept { return err == nullptr; }
+};
+
+struct SliceStep {
+  const uint8_t* ptr = nullptr;
+  size_t len = 0;
+  size_t next_pos = 0;
+  const char* err = nullptr;
+  [[nodiscard]] explicit constexpr operator bool() const noexcept { return err == nullptr; }
+  [[nodiscard]] constexpr std::span<const uint8_t> span() const noexcept { return {ptr, len}; }
+};
+
+[[nodiscard]] inline SliceStep read_len_slice_fast(std::span<const uint8_t> data,
+                                                   size_t pos,
+                                                   uint64_t min_len = 0) noexcept {
+  const size_t size = data.size();
+  const uint8_t* base = data.data();
+  if (pos >= size) [[unlikely]] {
+    return {nullptr, 0, 0, "omnibuf: truncated length varint"};
+  }
+  uint64_t b_len = 0;
+  const uint8_t b0 = base[pos];
+  if ((b0 & 1u) != 0) [[likely]] {
+    b_len = static_cast<uint64_t>(b0 >> 1);
+    ++pos;
+  } else if ((b0 & 2u) != 0 && pos + 2 <= size) {
+    b_len = static_cast<uint64_t>(read_u16_le(base + pos) >> 2);
+    pos += 2;
+  } else {
+    const auto [v, bn] = decode_varint(data.subspan(pos));
+    if (bn == 0) {
+      return {nullptr, 0, 0, "omnibuf: invalid or truncated length varint"};
+    }
+    b_len = v;
+    pos += bn;
+  }
+  if (b_len < min_len || b_len > static_cast<uint64_t>(size - pos)) [[unlikely]] {
+    return {nullptr, 0, 0, "omnibuf: length exceeds packet bounds"};
+  }
+  const size_t len_sz = static_cast<size_t>(b_len);
+  return {base + pos, len_sz, pos + len_sz, nullptr};
+}
+
+[[nodiscard]] inline SliceStep read_str_slice_fast(std::span<const uint8_t> data,
+                                                   size_t pos) noexcept {
+  const auto res = read_len_slice_fast(data, pos, 0);
+  if (!res) [[unlikely]] return res;
+  if (!is_valid_utf8(res.span())) [[unlikely]] {
+    return {nullptr, 0, 0, "omnibuf: invalid UTF-8 in WireString"};
+  }
+  return res;
+}
+
 [[nodiscard]] inline Result<SliceResult> read_len_slice(std::span<const uint8_t> data,
                                                         size_t pos,
                                                         uint64_t min_len = 0) {
-  if (pos >= data.size()) {
-    return Error{"omnibuf: truncated length varint"};
-  }
-  const auto [b_len, bn] = decode_varint(data.subspan(pos));
-  if (bn == 0) {
-    return Error{"omnibuf: invalid or truncated length varint"};
-  }
-  pos += bn;
-  if (b_len < min_len || b_len > static_cast<uint64_t>(data.size() - pos)) {
-    return Error{"omnibuf: length exceeds packet bounds"};
-  }
-  const size_t len_sz = static_cast<size_t>(b_len);
-  return SliceResult{data.subspan(pos, len_sz), pos + len_sz};
+  const auto res = read_len_slice_fast(data, pos, min_len);
+  if (!res) return Error{res.err};
+  return SliceResult{res.span(), res.next_pos};
 }
 
 [[nodiscard]] inline Result<SliceResult> read_str_slice(std::span<const uint8_t> data, size_t pos) {
-  auto res = read_len_slice(data, pos, 0);
-  if (!res) return Error{res.error()};
-  if (!is_valid_utf8(res.value().slice)) {
-    return Error{"omnibuf: invalid UTF-8 in WireString"};
-  }
-  return res;
+  const auto res = read_str_slice_fast(data, pos);
+  if (!res) return Error{res.err};
+  return SliceResult{res.span(), res.next_pos};
 }
 
 [[nodiscard]] inline size_t grow_capacity(size_t current, size_t required) noexcept {
@@ -450,11 +494,10 @@ struct SliceResult {
   size_t p = hdr.pos;
   dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
-    auto s_res = read_str_slice(body, p);
+    const auto s_res = read_str_slice_fast(body, p);
     if (!s_res) return false;
-    const auto sp = s_res.value().slice;
-    dst.emplace_back(reinterpret_cast<const char*>(sp.data()), sp.size());
-    p = s_res.value().next_pos;
+    dst.emplace_back(reinterpret_cast<const char*>(s_res.ptr), s_res.len);
+    p = s_res.next_pos;
   }
   return p == body.size();
 }
@@ -466,11 +509,10 @@ struct SliceResult {
   size_t p = hdr.pos;
   dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
-    auto b_res = read_len_slice(body, p, 0);
+    const auto b_res = read_len_slice_fast(body, p, 0);
     if (!b_res) return false;
-    const auto sp = b_res.value().slice;
-    dst.emplace_back(sp.begin(), sp.end());
-    p = b_res.value().next_pos;
+    dst.emplace_back(b_res.ptr, b_res.ptr + b_res.len);
+    p = b_res.next_pos;
   }
   return p == body.size();
 }

@@ -190,6 +190,125 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
   backpatch_container_len(dst, len_pos);
 }
 
+// FastWriter overloads for register-resident generated and struct encoding.
+inline void encode_string_arr(FastWriter& w, std::span<const std::string> items) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireString);
+  w.write_varint(items.size());
+  for (const auto& s : items) {
+    w.write_varint(s.size());
+    w.write_bytes(s.data(), s.size());
+  }
+  w.backpatch_len(len_pos);
+}
+
+inline void encode_bytes_arr(FastWriter& w, std::span<const std::vector<uint8_t>> items) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireBytes);
+  w.write_varint(items.size());
+  for (const auto& b : items) {
+    w.write_varint(b.size());
+    w.write_bytes(b.data(), b.size());
+  }
+  w.backpatch_len(len_pos);
+}
+
+inline void encode_bool_arr(FastWriter& w, const std::vector<bool>& items) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireBoolFalse);
+  w.write_varint(items.size());
+  w.ensure(items.size());
+  for (bool v : items) {
+    w.write_byte(v ? uint8_t{1} : uint8_t{0});
+  }
+  w.backpatch_len(len_pos);
+}
+
+template <detail::IntOrUint T>
+inline void encode_uint_arr(FastWriter& w, std::span<const T> items) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireUint);
+  w.write_varint(items.size());
+  for (T v : items) {
+    w.write_varint(static_cast<uint64_t>(v));
+  }
+  w.backpatch_len(len_pos);
+}
+
+template <detail::IntOrUint T>
+inline void encode_sint_arr(FastWriter& w, std::span<const T> items) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireSint);
+  w.write_varint(items.size());
+  for (T v : items) {
+    w.write_varint(encode_zigzag(static_cast<int64_t>(v)));
+  }
+  w.backpatch_len(len_pos);
+}
+
+template <detail::IntOrUint T>
+inline void encode_fixed32_arr(FastWriter& w,
+                               std::span<const T> items,
+                               uint8_t elem_wt = WireFixed32) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(elem_wt);
+  w.write_varint(items.size());
+  w.ensure(items.size() * 4);
+  for (T v : items) {
+    w.write_u32_raw(static_cast<uint32_t>(v));
+  }
+  w.backpatch_len(len_pos);
+}
+
+template <detail::IntOrUint T>
+inline void encode_fixed64_arr(FastWriter& w,
+                               std::span<const T> items,
+                               uint8_t elem_wt = WireFixed64) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(elem_wt);
+  w.write_varint(items.size());
+  w.ensure(items.size() * 8);
+  for (T v : items) {
+    w.write_u64_raw(static_cast<uint64_t>(v));
+  }
+  w.backpatch_len(len_pos);
+}
+
+inline void encode_float32_arr(FastWriter& w, std::span<const float> items) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireFloat32);
+  w.write_varint(items.size());
+  w.ensure(items.size() * 4);
+  for (float v : items) {
+    w.write_u32_raw(float32_to_bits(v));
+  }
+  w.backpatch_len(len_pos);
+}
+
+inline void encode_float64_arr(FastWriter& w, std::span<const double> items) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireFloat64);
+  w.write_varint(items.size());
+  w.ensure(items.size() * 8);
+  for (double v : items) {
+    w.write_u64_raw(float64_to_bits(v));
+  }
+  w.backpatch_len(len_pos);
+}
+
+inline void encode_map_string_uint(FastWriter& w, const std::map<std::string, uint64_t>& m) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(WireString);
+  w.write_byte(WireUint);
+  w.write_varint(m.size());
+  for (const auto& [k, v] : m) {
+    w.write_varint(k.size());
+    w.write_bytes(k.data(), k.size());
+    w.write_varint(v);
+  }
+  w.backpatch_len(len_pos);
+}
+
 // Single-pass forward streaming Encoder with inline stack fast-path and dynamic overflow growth.
 class Encoder {
  public:
