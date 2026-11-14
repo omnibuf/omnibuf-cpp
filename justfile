@@ -25,9 +25,23 @@ build: configure
 test: build
     ctest --test-dir build --output-on-failure
 
-# Run the language-independent OmniBuf conformance suite across all 4 tiers
+# Run the language-independent 758-case OmniBuf conformance suite across all 4 tiers
 conformance adapter="./build/conformance-cpp": build
-    /Users/kevin/Projects/omnibuf/omnibuf-go/bin/conformance-runner "{{adapter}}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "${CONFORMANCE_RUNNER:-}" ]]; then
+        RUNNER="$CONFORMANCE_RUNNER"
+    elif [[ -x "../omnibuf-go/bin/conformance-runner" ]]; then
+        RUNNER="../omnibuf-go/bin/conformance-runner"
+    elif command -v conformance-runner >/dev/null 2>&1; then
+        RUNNER="conformance-runner"
+    elif command -v go >/dev/null 2>&1; then
+        exec go run github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab "{{adapter}}"
+    else
+        echo "conformance-runner binary not found; set CONFORMANCE_RUNNER or install conformance-runner" >&2
+        exit 1
+    fi
+    "$RUNNER" "{{adapter}}"
 
 # Run reproducible PeerUpdate benchmarks (-O3 -DNDEBUG) and emit testdata/benchmarks.json
 bench: build

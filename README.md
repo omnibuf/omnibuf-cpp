@@ -1,5 +1,7 @@
 # OmniBuf for C++20
 
+[![CI](https://github.com/omnibuf/omnibuf-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/omnibuf/omnibuf-cpp/actions/workflows/ci.yml)
+
 **[Website](https://omnibuf.com)** · **[How It Works](https://omnibuf.com/how-it-works)** · **[Go Implementation](https://github.com/omnibuf/omnibuf-go)** · **[TypeScript Implementation](https://github.com/omnibuf/omnibuf-es)** · **[Wire Format Specification](https://omnibuf.com/spec)**
 
 Self-contained C++20 header library (`include/omnibuf/`) and `protoc-gen-omnibuf-cpp` code generator for the **OmniBuf** binary wire format. Zero external C++ library dependencies.
