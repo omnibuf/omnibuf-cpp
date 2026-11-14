@@ -957,6 +957,7 @@ void emit_struct_declaration_recursive(std::ostringstream& out,
                                        const DescriptorProto& msg,
                                        const TypeCatalog& catalog,
                                        std::unordered_set<std::string>& defined_messages,
+                                       std::vector<std::string>& pending_defined,
                                        std::vector<MessagePlan>& ordered_plans,
                                        std::string_view indent) {
   const std::string full_proto =
@@ -978,7 +979,7 @@ void emit_struct_declaration_recursive(std::ostringstream& out,
     out << "\n";
     for (const DescriptorProto* nm : sorted_nested) {
       emit_struct_declaration_recursive(out, full_proto, *nm, catalog, defined_messages,
-                                        ordered_plans, inner);
+                                        pending_defined, ordered_plans, inner);
     }
   }
 
@@ -1086,7 +1087,13 @@ void emit_struct_declaration_recursive(std::ostringstream& out,
       << "[[nodiscard]] const char* decode_omnibuf_raw(std::span<const uint8_t> data, int depth, bool merge, bool is_fresh = false);\n";
   out << indent << "};\n\n";
 
-  defined_messages.insert(full_proto);
+  pending_defined.push_back(full_proto);
+  if (indent.empty()) {
+    for (const auto& name : pending_defined) {
+      defined_messages.insert(name);
+    }
+    pending_defined.clear();
+  }
   ordered_plans.push_back(std::move(plan));
 }
 
@@ -2531,9 +2538,10 @@ GeneratedFile generate_header_for_file(const FileDescriptorProto& file,
   }
 
   std::vector<MessagePlan> ordered_plans;
+  std::vector<std::string> pending_defined;
   for (const DescriptorProto* m : sorted_top) {
     emit_struct_declaration_recursive(out, file.package, *m, catalog, defined_messages,
-                                      ordered_plans, "");
+                                      pending_defined, ordered_plans, "");
   }
 
   for (const auto& plan : ordered_plans) {

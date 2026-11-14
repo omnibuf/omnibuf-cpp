@@ -239,6 +239,21 @@ inline std::shared_ptr<SchemaMeta> build_nested_type_schema_meta(int schema_dept
   }
 }
 
+template <typename T, typename FD>
+inline void populate_one_schema_field(SchemaMeta& meta,
+                                      int schema_depth,
+                                      std::set<const void*>& active,
+                                      bool* cyclic,
+                                      const FD& fd) {
+  using MemberType = std::remove_cvref_t<decltype(std::declval<T>().*(FD::member))>;
+  meta.fields[FD::number] = std::string(fd.name);
+  if (schema_depth + 3 <= MAX_CONTAINER_DEPTH) {
+    if (auto c = build_nested_type_schema_meta<MemberType>(schema_depth + 2, active, cyclic)) {
+      meta.children[FD::number] = std::move(c);
+    }
+  }
+}
+
 template <RegisteredStruct T>
 inline std::shared_ptr<SchemaMeta> build_struct_schema_meta(int schema_depth,
                                                             std::set<const void*>& active,
@@ -262,19 +277,7 @@ inline std::shared_ptr<SchemaMeta> build_struct_schema_meta(int schema_depth,
   const auto fields = StructTraits<T>::fields();
   std::apply(
       [&](const auto&... fd) {
-        (
-            [&] {
-              using MemberType =
-                  std::remove_cvref_t<decltype(std::declval<T>().*(fd.member))>;
-              meta->fields[fd.number] = std::string(fd.name);
-              if (schema_depth + 3 <= MAX_CONTAINER_DEPTH) {
-                if (auto c = build_nested_type_schema_meta<MemberType>(schema_depth + 2, active,
-                                                                       cyclic)) {
-                  meta->children[fd.number] = std::move(c);
-                }
-              }
-            }(),
-            ...);
+        (populate_one_schema_field<T>(*meta, schema_depth, active, cyclic, fd), ...);
       },
       fields);
 
@@ -309,6 +312,19 @@ inline std::shared_ptr<SchemaMeta> build_field_value_schema_meta(const FieldT& v
   }
 }
 
+template <typename T, typename FD>
+inline void populate_one_value_schema_field(SchemaMeta& meta,
+                                            const T& msg,
+                                            int schema_depth,
+                                            const FD& fd) {
+  meta.fields[FD::number] = std::string(fd.name);
+  if (schema_depth + 3 <= MAX_CONTAINER_DEPTH) {
+    if (auto c = build_field_value_schema_meta(msg.*(FD::member), schema_depth + 2)) {
+      meta.children[FD::number] = std::move(c);
+    }
+  }
+}
+
 template <RegisteredStruct T>
 inline std::shared_ptr<SchemaMeta> build_struct_value_schema_meta(const T& msg, int schema_depth) {
   if (schema_depth + 1 > MAX_CONTAINER_DEPTH) {
@@ -322,16 +338,7 @@ inline std::shared_ptr<SchemaMeta> build_struct_value_schema_meta(const T& msg, 
   const auto fields = StructTraits<T>::fields();
   std::apply(
       [&](const auto&... fd) {
-        (
-            [&] {
-              meta->fields[fd.number] = std::string(fd.name);
-              if (schema_depth + 3 <= MAX_CONTAINER_DEPTH) {
-                if (auto c = build_field_value_schema_meta(msg.*(fd.member), schema_depth + 2)) {
-                  meta->children[fd.number] = std::move(c);
-                }
-              }
-            }(),
-            ...);
+        (populate_one_value_schema_field(*meta, msg, schema_depth, fd), ...);
       },
       fields);
   return meta;
@@ -528,6 +535,17 @@ template <uint32_t FieldNum,
   }
 }
 
+template <typename T, typename FD>
+inline void encode_one_struct_descriptor(FastWriter& w,
+                                         const T& msg,
+                                         MarshalOptions opts,
+                                         const char*& err,
+                                         const FD&) {
+  if (err != nullptr) return;
+  err = encode_struct_field<FD::number, FD::wire_override, FD::key_wire_override>(
+      w, msg.*(FD::member), opts);
+}
+
 template <RegisteredStruct T>
 [[nodiscard]] inline const char* encode_struct_body(FastWriter& w,
                                                     const T& msg,
@@ -538,14 +556,7 @@ template <RegisteredStruct T>
   const char* err = nullptr;
   std::apply(
       [&](const auto&... fd) {
-        (
-            [&] {
-              if (err != nullptr) return;
-              using FD = std::remove_cvref_t<decltype(fd)>;
-              err = encode_struct_field<FD::number, FD::wire_override, FD::key_wire_override>(
-                  w, msg.*(FD::member), opts);
-            }(),
-            ...);
+        (encode_one_struct_descriptor(w, msg, opts, err, fd), ...);
       },
       fields);
   return err;
@@ -959,6 +970,51 @@ template <WireOverride Override,
   }
 }
 
+template <size_t Idx, typename Tuple, typename T, size_t SeenWords>
+inline bool decode_one_struct_index(const Tuple& fields,
+                                    uint32_t fnum,
+                                    uint8_t wt,
+                                    std::span<const uint8_t> data,
+                                    size_t pos,
+                                    T& msg,
+                                    int depth,
+                                    std::array<uint64_t, SeenWords>& seen_words,
+                                    DecodeState& state,
+                                    PosStep& step_res) {
+  using FD = std::remove_cvref_t<std::tuple_element_t<Idx, Tuple>>;
+  if (FD::number != fnum) {
+    return false;
+  }
+  (void)fields;
+  constexpr size_t word_idx = Idx / 64;
+  constexpr uint64_t bit = uint64_t{1} << (Idx % 64);
+  const bool was_seen = (seen_words[word_idx] & bit) != 0;
+  bool mark_seen = false;
+  step_res = decode_matched_struct_field<FD::wire_override, FD::key_wire_override>(
+      data, pos, wt, msg.*(FD::member), depth, was_seen, mark_seen, state);
+  if (mark_seen) {
+    seen_words[word_idx] |= bit;
+  }
+  return true;
+}
+
+template <typename Tuple, typename T, size_t SeenWords, size_t... Is>
+inline bool dispatch_struct_fields(const Tuple& fields,
+                                   uint32_t fnum,
+                                   uint8_t wt,
+                                   std::span<const uint8_t> data,
+                                   size_t pos,
+                                   T& msg,
+                                   int depth,
+                                   std::array<uint64_t, SeenWords>& seen_words,
+                                   DecodeState& state,
+                                   PosStep& step_res,
+                                   std::index_sequence<Is...>) {
+  return (decode_one_struct_index<Is>(
+              fields, fnum, wt, data, pos, msg, depth, seen_words, state, step_res) ||
+          ...);
+}
+
 template <RegisteredStruct T>
 [[nodiscard]] inline const char* decode_struct_body(std::span<const uint8_t> data,
                                                     T& msg,
@@ -978,7 +1034,8 @@ template <RegisteredStruct T>
   if (!merge && !is_fresh) {
     std::apply([&](const auto&... fd) { (clear_struct_member(msg.*(fd.member)), ...); }, fields);
   }
-  constexpr size_t num_fields = std::tuple_size_v<std::remove_cvref_t<decltype(fields)>>;
+  using Tuple = std::remove_cvref_t<decltype(fields)>;
+  constexpr size_t num_fields = std::tuple_size_v<Tuple>;
   constexpr size_t kSeenWords = (num_fields == 0) ? 1 : ((num_fields + 63) / 64);
   std::array<uint64_t, kSeenWords> seen_words{};
   if (merge) {
@@ -1019,27 +1076,9 @@ template <RegisteredStruct T>
     }
 
     PosStep step_res{pos, nullptr};
-    const bool matched = [&]<size_t... Is>(std::index_sequence<Is...>) {
-      return (
-          [&]() -> bool {
-            const auto& fd = std::get<Is>(fields);
-            using FD = std::remove_cvref_t<decltype(fd)>;
-            if (FD::number != fnum) {
-              return false;
-            }
-            constexpr size_t word_idx = Is / 64;
-            constexpr uint64_t bit = uint64_t{1} << (Is % 64);
-            const bool was_seen = (seen_words[word_idx] & bit) != 0;
-            bool mark_seen = false;
-            step_res = decode_matched_struct_field<FD::wire_override, FD::key_wire_override>(
-                data, pos, wt, msg.*(FD::member), depth, was_seen, mark_seen, state);
-            if (mark_seen) {
-              seen_words[word_idx] |= bit;
-            }
-            return true;
-          }() ||
-          ...);
-    }(std::make_index_sequence<num_fields>{});
+    const bool matched = dispatch_struct_fields(fields, fnum, wt, data, pos, msg, depth, seen_words,
+                                                state, step_res,
+                                                std::make_index_sequence<num_fields>{});
 
     if (!matched) [[unlikely]] {
       step_res = validate_value_step(data, pos, wt, depth, state);

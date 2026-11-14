@@ -146,9 +146,17 @@ class Box {
   template <typename... Args>
   T& emplace(Args&&... args) {
     if (ptr_) {
-      *ptr_ = T(std::forward<Args>(args)...);
+      if constexpr (sizeof...(Args) == 0) {
+        *ptr_ = T{};
+      } else {
+        *ptr_ = T(std::forward<Args>(args)...);
+      }
     } else {
-      ptr_ = new T(std::forward<Args>(args)...);
+      if constexpr (sizeof...(Args) == 0) {
+        ptr_ = new T{};
+      } else {
+        ptr_ = new T(std::forward<Args>(args)...);
+      }
     }
     return *ptr_;
   }
