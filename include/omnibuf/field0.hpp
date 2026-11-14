@@ -116,9 +116,13 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
 
 [[nodiscard]] inline Result<std::shared_ptr<SchemaMeta>> decode_schema_meta(
     std::span<const uint8_t> data,
-    int depth = 0) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf: SchemaMeta nesting depth exceeds MAX_CONTAINER_DEPTH"};
+    int depth,
+    DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf: SchemaMeta nesting depth exceeds max_depth"};
+  }
+  if (data.size() > state.opts.max_message_bytes) {
+    return Error{"omnibuf: SchemaMeta payload exceeds max_message_bytes"};
   }
   auto meta = std::make_shared<SchemaMeta>();
   size_t pos = 0;
@@ -149,8 +153,8 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
         if (wt != WireMap) {
           return Error{"omnibuf: SchemaMeta field #2 (fields) must be WireMap"};
         }
-        if (depth + 1 > MAX_CONTAINER_DEPTH) {
-          return Error{"omnibuf: SchemaMeta fields map exceeds MAX_CONTAINER_DEPTH"};
+        if (depth + 1 > state.opts.max_depth) {
+          return Error{"omnibuf: SchemaMeta fields map exceeds max_depth"};
         }
         auto body_res = read_len_slice(data, pos, 3);
         if (!body_res) return Error{body_res.error()};
@@ -159,6 +163,9 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
         const auto hdr = parse_map_header(body);
         if (!hdr.ok || hdr.key_wt != WireUint || hdr.val_wt != WireString) {
           return Error{"omnibuf: invalid SchemaMeta fields map header"};
+        }
+        if (!state.charge_elements(hdr.count)) {
+          return Error{"omnibuf: SchemaMeta fields map exceeds max_total_elements"};
         }
         size_t p = hdr.pos;
         for (size_t i = 0; i < hdr.count; ++i) {
@@ -183,8 +190,8 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
         if (wt != WireMap) {
           return Error{"omnibuf: SchemaMeta field #3 (children) must be WireMap"};
         }
-        if (depth + 1 > MAX_CONTAINER_DEPTH) {
-          return Error{"omnibuf: SchemaMeta children map exceeds MAX_CONTAINER_DEPTH"};
+        if (depth + 1 > state.opts.max_depth) {
+          return Error{"omnibuf: SchemaMeta children map exceeds max_depth"};
         }
         auto body_res = read_len_slice(data, pos, 3);
         if (!body_res) return Error{body_res.error()};
@@ -194,6 +201,10 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
         if (!hdr.ok || hdr.key_wt != WireUint || hdr.val_wt != WireSubMsg) {
           return Error{"omnibuf: invalid SchemaMeta children map header"};
         }
+        if (!state.charge_elements(hdr.count)) {
+          return Error{"omnibuf: SchemaMeta children map exceeds max_total_elements"};
+        }
+        std::map<uint32_t, std::shared_ptr<SchemaMeta>> map_children;
         size_t p = hdr.pos;
         for (size_t i = 0; i < hdr.count; ++i) {
           const auto [k64, kn] = decode_varint(body.subspan(p));
@@ -203,19 +214,22 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
           p += kn;
           auto child_slice = read_len_slice(body, p, 0);
           if (!child_slice) return Error{child_slice.error()};
-          auto child_meta = decode_schema_meta(child_slice.value().slice, depth + 1);
+          auto child_meta = decode_schema_meta(child_slice.value().slice, depth + 2, state);
           if (!child_meta) return Error{child_meta.error()};
-          const uint32_t key_num = static_cast<uint32_t>(k64);
-          auto it = meta->children.find(key_num);
-          if (it != meta->children.end()) {
-            it->second = merge_schema_meta(it->second, child_meta.value());
-          } else {
-            meta->children[key_num] = child_meta.value();
-          }
+          // Duplicate keys within a single WireMap replace the earlier entry.
+          map_children[static_cast<uint32_t>(k64)] = std::move(child_meta.value());
           p = child_slice.value().next_pos;
         }
         if (p != body.size()) {
           return Error{"omnibuf: SchemaMeta children map trailing bytes"};
+        }
+        for (auto& [key_num, child_meta] : map_children) {
+          auto it = meta->children.find(key_num);
+          if (it != meta->children.end()) {
+            it->second = merge_schema_meta(it->second, child_meta);
+          } else {
+            meta->children[key_num] = std::move(child_meta);
+          }
         }
         break;
       }
@@ -223,7 +237,7 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
         if (fnum == 0) {
           return Error{"omnibuf: invalid field #0 inside SchemaMeta"};
         }
-        auto skip_res = validate_value(data, pos, wt, depth);
+        auto skip_res = validate_value(data, pos, wt, depth, state);
         if (!skip_res) return Error{skip_res.error()};
         pos = skip_res.value();
         break;
@@ -233,23 +247,44 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
   return meta;
 }
 
+[[nodiscard]] inline Result<std::shared_ptr<SchemaMeta>> decode_schema_meta(
+    std::span<const uint8_t> data,
+    int depth = 0) {
+  DecodeState state{};
+  return decode_schema_meta(data, depth, state);
+}
+
 [[nodiscard]] inline Result<size_t> validate_field0(std::span<const uint8_t> data,
                                                     size_t pos,
                                                     uint8_t wt,
-                                                    int depth) {
+                                                    int depth,
+                                                    DecodeState& state) {
   if (wt != WireSubMsg) {
     return Error{"omnibuf: Field #0 must use WireSubMsg (12)"};
   }
   auto body_res = read_len_slice(data, pos, 0);
   if (!body_res) return Error{body_res.error()};
-  auto meta_res = decode_schema_meta(body_res.value().slice, depth + 1);
+  auto meta_res = decode_schema_meta(body_res.value().slice, depth + 1, state);
   if (!meta_res) return Error{meta_res.error()};
   return body_res.value().next_pos;
 }
 
-[[nodiscard]] inline Result<void> validate_message_bytes(std::span<const uint8_t> data, int depth) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf: message nesting depth exceeds MAX_CONTAINER_DEPTH"};
+[[nodiscard]] inline Result<size_t> validate_field0(std::span<const uint8_t> data,
+                                                    size_t pos,
+                                                    uint8_t wt,
+                                                    int depth) {
+  DecodeState state{};
+  return validate_field0(data, pos, wt, depth, state);
+}
+
+[[nodiscard]] inline Result<void> validate_message_bytes(std::span<const uint8_t> data,
+                                                         int depth,
+                                                         DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf: message nesting depth exceeds max_depth"};
+  }
+  if (data.size() > state.opts.max_message_bytes) {
+    return Error{"omnibuf: message exceeds max_message_bytes"};
   }
   size_t pos = 0;
   const size_t n = data.size();
@@ -262,21 +297,31 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
     const uint32_t fnum = static_cast<uint32_t>(tag >> 4);
     const uint8_t wt = static_cast<uint8_t>(tag & 0x0Fu);
     if (fnum == 0) {
-      auto f0_res = validate_field0(data, pos, wt, depth);
+      auto f0_res = validate_field0(data, pos, wt, depth, state);
       if (!f0_res) return Error{f0_res.error()};
       pos = f0_res.value();
       continue;
     }
-    auto val_res = validate_value(data, pos, wt, depth);
+    auto val_res = validate_value(data, pos, wt, depth, state);
     if (!val_res) return Error{val_res.error()};
     pos = val_res.value();
   }
   return Result<void>::success();
 }
 
+[[nodiscard]] inline Result<void> validate_message_bytes(std::span<const uint8_t> data, int depth) {
+  DecodeState state{};
+  return validate_message_bytes(data, depth, state);
+}
+
 // Decodes and merges all Field #0 SchemaMeta blocks in packet.
 [[nodiscard]] inline std::optional<SchemaMeta> read_field0_schema_meta(
-    std::span<const uint8_t> packet) {
+    std::span<const uint8_t> packet,
+    DecodeOptions opts = {}) {
+  DecodeState state{opts, 0};
+  if (packet.size() > state.opts.max_message_bytes) {
+    return std::nullopt;
+  }
   std::shared_ptr<SchemaMeta> merged;
   size_t pos = 0;
   const size_t n = packet.size();
@@ -292,13 +337,13 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
       if (wt != WireSubMsg) return std::nullopt;
       auto body_res = read_len_slice(packet, pos, 0);
       if (!body_res) return std::nullopt;
-      auto meta_res = decode_schema_meta(body_res.value().slice, 0);
+      auto meta_res = decode_schema_meta(body_res.value().slice, 1, state);
       if (!meta_res) return std::nullopt;
       merged = merge_schema_meta(merged, meta_res.value());
       pos = body_res.value().next_pos;
       continue;
     }
-    auto skip_res = skip_value(packet, pos, wt);
+    auto skip_res = validate_value(packet, pos, wt, 0, state);
     if (!skip_res) return std::nullopt;
     pos = skip_res.value();
   }

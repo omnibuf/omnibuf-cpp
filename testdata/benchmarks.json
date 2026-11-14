@@ -8,113 +8,174 @@
   "categories": [
     {
       "id": "encode",
-      "title": "Full Message Encode Speed (PeerUpdate)",
+      "title": "Full Message Encode Speed",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 252,
-          "opsPerSec": 3964856,
+          "nsPerOp": 281,
+          "opsPerSec": 3553425,
           "wireBytes": 366,
           "highlight": true,
           "baseline": true
         },
         {
+          "name": "Protobuf (LEB128 Wire)",
+          "nsPerOp": 306,
+          "opsPerSec": 3270107,
+          "wireBytes": 341
+        },
+        {
           "name": "OmniBuf (C++ Struct)",
-          "nsPerOp": 339,
-          "opsPerSec": 2948903,
+          "nsPerOp": 348,
+          "opsPerSec": 2872389,
           "wireBytes": 366,
           "highlight": true
         },
         {
-          "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 404,
-          "opsPerSec": 2475737,
-          "wireBytes": 341
-        },
-        {
           "name": "JSON",
-          "nsPerOp": 1681,
-          "opsPerSec": 594889,
+          "nsPerOp": 670,
+          "opsPerSec": 1491883,
           "wireBytes": 803
         }
       ]
     },
     {
       "id": "decode",
-      "title": "Full Message Decode Speed (PeerUpdate)",
+      "title": "Full Message Decode Speed",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 448,
-          "opsPerSec": 2231476,
+          "nsPerOp": 654,
+          "opsPerSec": 1528536,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 626,
-          "opsPerSec": 1598508
+          "nsPerOp": 791,
+          "opsPerSec": 1264700
         },
         {
           "name": "OmniBuf (C++ Struct)",
-          "nsPerOp": 643,
-          "opsPerSec": 1554062,
+          "nsPerOp": 877,
+          "opsPerSec": 1139920,
           "highlight": true
         },
         {
           "name": "JSON",
-          "nsPerOp": 1573,
-          "opsPerSec": 635653
+          "nsPerOp": 1701,
+          "opsPerSec": 587904
         }
       ]
     },
     {
       "id": "lookup_city",
-      "title": "Read a Single Nested Field (peer.location.city)",
+      "title": "Read a Single Nested Field",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 122,
-          "opsPerSec": 8194852,
+          "nsPerOp": 120,
+          "opsPerSec": 8364830,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 629,
-          "opsPerSec": 1589555
+          "nsPerOp": 591,
+          "opsPerSec": 1692104
         },
         {
           "name": "JSON",
-          "nsPerOp": 1577,
-          "opsPerSec": 633970
+          "nsPerOp": 1495,
+          "opsPerSec": 669027
         }
       ]
     },
     {
       "id": "mutate_sequence",
-      "title": "Selective Single-Field Mutation (peer.sequence)",
+      "title": "Selective Single-Field Mutation",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 149,
-          "opsPerSec": 6699690,
+          "nsPerOp": 436,
+          "opsPerSec": 2295029,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 1040,
-          "opsPerSec": 961635
+          "nsPerOp": 960,
+          "opsPerSec": 1041489
         },
         {
           "name": "JSON",
-          "nsPerOp": 3280,
-          "opsPerSec": 304855
+          "nsPerOp": 2375,
+          "opsPerSec": 421020
+        }
+      ]
+    },
+    {
+      "id": "encode_nested_shift",
+      "title": "Large Embedded Message Encode",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "Protobuf (LEB128 Wire)",
+          "nsPerOp": 4203,
+          "opsPerSec": 237945,
+          "wireBytes": 39227
+        },
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 5240,
+          "opsPerSec": 190832,
+          "wireBytes": 39256,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "OmniBuf (C++ Struct)",
+          "nsPerOp": 5327,
+          "opsPerSec": 187735,
+          "wireBytes": 39256,
+          "highlight": true
+        },
+        {
+          "name": "JSON",
+          "nsPerOp": 53581,
+          "opsPerSec": 18663,
+          "wireBytes": 39681
+        }
+      ]
+    },
+    {
+      "id": "mutate_embedded_grow",
+      "title": "Embedded Message Growth",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 3640,
+          "opsPerSec": 274706,
+          "wireBytes": 21935,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "Protobuf (LEB128 Wire)",
+          "nsPerOp": 5967,
+          "opsPerSec": 167599,
+          "wireBytes": 21923
+        },
+        {
+          "name": "JSON",
+          "nsPerOp": 36900,
+          "opsPerSec": 27101,
+          "wireBytes": 23914
         }
       ]
     }

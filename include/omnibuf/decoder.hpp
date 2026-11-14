@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -64,6 +65,146 @@ class Result<void> {
 
  private:
   std::unique_ptr<std::string> error_;
+};
+
+// Deep-copying, value-comparable heap wrapper for recursive singular submessages.
+// Supports incomplete T at member-declaration time while providing std::optional-like ergonomics.
+template <typename T>
+class Box {
+ public:
+  constexpr Box() noexcept = default;
+  constexpr Box(std::nullptr_t) noexcept {}  // NOLINT(google-explicit-constructor)
+  constexpr Box(std::nullopt_t) noexcept {}  // NOLINT(google-explicit-constructor)
+
+  Box(const T& v) : ptr_(new T(v)) {}      // NOLINT(google-explicit-constructor)
+  Box(T&& v) : ptr_(new T(std::move(v))) {}  // NOLINT(google-explicit-constructor)
+
+  template <typename U>
+    requires std::is_same_v<U, T>
+  Box(const std::optional<U>& opt)  // NOLINT(google-explicit-constructor)
+      : ptr_(opt ? new T(*opt) : nullptr) {}
+
+  template <typename U>
+    requires std::is_same_v<U, T>
+  Box(std::optional<U>&& opt)  // NOLINT(google-explicit-constructor)
+      : ptr_(opt ? new T(std::move(*opt)) : nullptr) {}
+
+  Box(const Box& other) : ptr_(other.ptr_ ? new T(*other.ptr_) : nullptr) {}
+  Box(Box&& other) noexcept : ptr_(std::exchange(other.ptr_, nullptr)) {}
+
+  ~Box() { delete ptr_; }
+
+  Box& operator=(const Box& other) {
+    if (this != &other) {
+      if (!other.ptr_) {
+        reset();
+      } else if (ptr_) {
+        *ptr_ = *other.ptr_;
+      } else {
+        ptr_ = new T(*other.ptr_);
+      }
+    }
+    return *this;
+  }
+
+  Box& operator=(Box&& other) noexcept {
+    if (this != &other) {
+      delete ptr_;
+      ptr_ = std::exchange(other.ptr_, nullptr);
+    }
+    return *this;
+  }
+
+  Box& operator=(std::nullopt_t) noexcept {
+    reset();
+    return *this;
+  }
+
+  Box& operator=(const T& v) {
+    if (ptr_) {
+      *ptr_ = v;
+    } else {
+      ptr_ = new T(v);
+    }
+    return *this;
+  }
+
+  Box& operator=(T&& v) {
+    if (ptr_) {
+      *ptr_ = std::move(v);
+    } else {
+      ptr_ = new T(std::move(v));
+    }
+    return *this;
+  }
+
+  void reset() noexcept {
+    delete ptr_;
+    ptr_ = nullptr;
+  }
+
+  template <typename... Args>
+  T& emplace(Args&&... args) {
+    if (ptr_) {
+      *ptr_ = T(std::forward<Args>(args)...);
+    } else {
+      ptr_ = new T(std::forward<Args>(args)...);
+    }
+    return *ptr_;
+  }
+
+  [[nodiscard]] constexpr bool has_value() const noexcept { return ptr_ != nullptr; }
+  [[nodiscard]] constexpr explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+  [[nodiscard]] T* get() noexcept { return ptr_; }
+  [[nodiscard]] const T* get() const noexcept { return ptr_; }
+
+  [[nodiscard]] T& value() {
+    if (!ptr_) throw std::bad_optional_access();
+    return *ptr_;
+  }
+
+  [[nodiscard]] const T& value() const {
+    if (!ptr_) throw std::bad_optional_access();
+    return *ptr_;
+  }
+
+  [[nodiscard]] T& operator*() noexcept { return *ptr_; }
+  [[nodiscard]] const T& operator*() const noexcept { return *ptr_; }
+  [[nodiscard]] T* operator->() noexcept { return ptr_; }
+  [[nodiscard]] const T* operator->() const noexcept { return ptr_; }
+
+  friend bool operator==(const Box& a, const Box& b) {
+    if (a.ptr_ == b.ptr_) return true;
+    if (!a.ptr_ || !b.ptr_) return false;
+    return *a.ptr_ == *b.ptr_;
+  }
+
+  friend bool operator!=(const Box& a, const Box& b) { return !(a == b); }
+
+ private:
+  T* ptr_ = nullptr;
+};
+
+inline constexpr size_t kMaxInitialReserve = 4096;
+
+struct DecodeOptions {
+  int max_depth = MAX_CONTAINER_DEPTH;
+  size_t max_message_bytes = 64u * 1024u * 1024u;
+  size_t max_total_elements = 16u * 1024u * 1024u;
+};
+
+struct DecodeState {
+  DecodeOptions opts{};
+  size_t total_elements = 0;
+
+  [[nodiscard]] bool charge_elements(size_t n) noexcept {
+    if (n > opts.max_total_elements || total_elements > opts.max_total_elements - n) {
+      return false;
+    }
+    total_elements += n;
+    return true;
+  }
 };
 
 struct ArrayHeader {
@@ -344,8 +485,28 @@ struct SliceStep {
   return required;
 }
 
+[[nodiscard]] inline size_t bounded_reserve_target(
+    size_t current_cap,
+    size_t current_size,
+    size_t incoming_count,
+    size_t max_initial_batch = kMaxInitialReserve) noexcept {
+  const size_t batch = std::min(incoming_count, max_initial_batch);
+  if (batch > SIZE_MAX - current_size) {
+    return current_cap;
+  }
+  return grow_capacity(current_cap, current_size + batch);
+}
+
 // Forward declarations for mutual recursion in full validation (defined in field0.hpp).
+[[nodiscard]] inline Result<void> validate_message_bytes(std::span<const uint8_t> data,
+                                                         int depth,
+                                                         DecodeState& state);
 [[nodiscard]] inline Result<void> validate_message_bytes(std::span<const uint8_t> data, int depth);
+[[nodiscard]] inline Result<size_t> validate_field0(std::span<const uint8_t> data,
+                                                    size_t pos,
+                                                    uint8_t wt,
+                                                    int depth,
+                                                    DecodeState& state);
 [[nodiscard]] inline Result<size_t> validate_field0(std::span<const uint8_t> data,
                                                     size_t pos,
                                                     uint8_t wt,
@@ -354,26 +515,29 @@ struct SliceStep {
 [[nodiscard]] inline Result<size_t> validate_value(std::span<const uint8_t> b,
                                                    size_t pos,
                                                    uint8_t wt,
-                                                   int depth);
+                                                   int depth,
+                                                   DecodeState& state);
 
 [[nodiscard]] inline Result<size_t> validate_container_entry(std::span<const uint8_t> body,
                                                              size_t p,
                                                              uint8_t wt,
-                                                             int depth) {
+                                                             int depth,
+                                                             DecodeState& state) {
   if (wt == WireBoolFalse) {
     if (p >= body.size() || body[p] > 1u) {
       return Error{"omnibuf: invalid bool padding bits in container"};
     }
     return p + 1;
   }
-  return validate_value(body, p, wt, depth);
+  return validate_value(body, p, wt, depth, state);
 }
 
 [[nodiscard]] inline Result<void> validate_array_body(std::span<const uint8_t> body,
                                                       size_t p,
                                                       uint8_t elem_wt,
                                                       size_t count,
-                                                      int depth) {
+                                                      int depth,
+                                                      DecodeState& state) {
   switch (elem_wt) {
     case WireBoolFalse:
       if (body.size() - p != count) {
@@ -388,14 +552,14 @@ struct SliceStep {
     case WireFixed32:
     case WireSfixed32:
     case WireFloat32:
-      if (body.size() - p != count * 4) {
+      if (count > (body.size() - p) / 4 || body.size() - p != count * 4) {
         return Error{"omnibuf: invalid 32-bit array byte length"};
       }
       return Result<void>::success();
     case WireFixed64:
     case WireSfixed64:
     case WireFloat64:
-      if (body.size() - p != count * 8) {
+      if (count > (body.size() - p) / 8 || body.size() - p != count * 8) {
         return Error{"omnibuf: invalid 64-bit array byte length"};
       }
       return Result<void>::success();
@@ -403,7 +567,7 @@ struct SliceStep {
       break;
   }
   for (size_t i = 0; i < count; ++i) {
-    auto next_res = validate_container_entry(body, p, elem_wt, depth);
+    auto next_res = validate_container_entry(body, p, elem_wt, depth, state);
     if (!next_res) return Error{next_res.error()};
     p = next_res.value();
   }
@@ -416,9 +580,10 @@ struct SliceStep {
 [[nodiscard]] inline Result<size_t> validate_value(std::span<const uint8_t> b,
                                                    size_t pos,
                                                    uint8_t wt,
-                                                   int depth) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf: nesting depth exceeds MAX_CONTAINER_DEPTH"};
+                                                   int depth,
+                                                   DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf: nesting depth exceeds max_depth"};
   }
   if (pos > b.size()) {
     return Error{"omnibuf: position out of bounds"};
@@ -431,7 +596,10 @@ struct SliceStep {
   if (wt == WireSubMsg) {
     auto sub_res = read_len_slice(b, pos, 0);
     if (!sub_res) return Error{sub_res.error()};
-    auto v_res = validate_message_bytes(sub_res.value().slice, depth + 1);
+    if (sub_res.value().slice.size() > state.opts.max_message_bytes) {
+      return Error{"omnibuf: submessage exceeds max_message_bytes"};
+    }
+    auto v_res = validate_message_bytes(sub_res.value().slice, depth + 1, state);
     if (!v_res) return Error{v_res.error()};
     return sub_res.value().next_pos;
   }
@@ -446,28 +614,34 @@ struct SliceStep {
     const size_t end = pos + ln + static_cast<size_t>(length);
     const auto body = b.subspan(pos + ln, static_cast<size_t>(length));
     if (wt == WireArray) {
-      if (depth + 1 > MAX_CONTAINER_DEPTH) {
-        return Error{"omnibuf: array nesting depth exceeds MAX_CONTAINER_DEPTH"};
+      if (depth + 1 > state.opts.max_depth) {
+        return Error{"omnibuf: array nesting depth exceeds max_depth"};
       }
       const auto hdr = parse_array_header(body);
       if (!hdr.ok) {
         return Error{"omnibuf: invalid WireArray header"};
       }
-      auto a_res = validate_array_body(body, hdr.pos, hdr.elem_wt, hdr.count, depth + 1);
+      if (!state.charge_elements(hdr.count)) {
+        return Error{"omnibuf: total decoded elements exceed max_total_elements"};
+      }
+      auto a_res = validate_array_body(body, hdr.pos, hdr.elem_wt, hdr.count, depth + 1, state);
       if (!a_res) return Error{a_res.error()};
     } else if (wt == WireMap) {
-      if (depth + 1 > MAX_CONTAINER_DEPTH) {
-        return Error{"omnibuf: map nesting depth exceeds MAX_CONTAINER_DEPTH"};
+      if (depth + 1 > state.opts.max_depth) {
+        return Error{"omnibuf: map nesting depth exceeds max_depth"};
       }
       const auto hdr = parse_map_header(body);
       if (!hdr.ok) {
         return Error{"omnibuf: invalid WireMap header"};
       }
+      if (!state.charge_elements(hdr.count)) {
+        return Error{"omnibuf: total decoded elements exceed max_total_elements"};
+      }
       size_t p = hdr.pos;
       for (size_t i = 0; i < hdr.count; ++i) {
-        auto k_res = validate_container_entry(body, p, hdr.key_wt, depth + 1);
+        auto k_res = validate_container_entry(body, p, hdr.key_wt, depth + 1, state);
         if (!k_res) return Error{k_res.error()};
-        auto v_res = validate_container_entry(body, k_res.value(), hdr.val_wt, depth + 1);
+        auto v_res = validate_container_entry(body, k_res.value(), hdr.val_wt, depth + 1, state);
         if (!v_res) return Error{v_res.error()};
         p = v_res.value();
       }
@@ -486,13 +660,23 @@ struct SliceStep {
   return skip.next_pos;
 }
 
+[[nodiscard]] inline Result<size_t> validate_value(std::span<const uint8_t> b,
+                                                   size_t pos,
+                                                   uint8_t wt,
+                                                   int depth) {
+  DecodeState state{};
+  return validate_value(b, pos, wt, depth, state);
+}
+
 // Array body decoders for generated and reflection-driven codecs.
 [[nodiscard]] inline bool append_string_arr_body(std::vector<std::string>& dst,
-                                                 std::span<const uint8_t> body) {
+                                                 std::span<const uint8_t> body,
+                                                 DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != WireString) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
   size_t p = hdr.pos;
-  dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
+  dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
     const auto s_res = read_str_slice_fast(body, p);
     if (!s_res) return false;
@@ -503,11 +687,13 @@ struct SliceStep {
 }
 
 [[nodiscard]] inline bool append_bytes_arr_body(std::vector<std::vector<uint8_t>>& dst,
-                                                std::span<const uint8_t> body) {
+                                                std::span<const uint8_t> body,
+                                                DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != WireBytes) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
   size_t p = hdr.pos;
-  dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
+  dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
     const auto b_res = read_len_slice_fast(body, p, 0);
     if (!b_res) return false;
@@ -518,9 +704,11 @@ struct SliceStep {
 }
 
 [[nodiscard]] inline bool append_bool_arr_body(std::vector<bool>& dst,
-                                               std::span<const uint8_t> body) {
+                                               std::span<const uint8_t> body,
+                                               DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != WireBoolFalse) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
   dst.reserve(dst.size() + hdr.count);
   for (size_t i = 0; i < hdr.count; ++i) {
     const uint8_t v = body[hdr.pos + i];
@@ -531,11 +719,14 @@ struct SliceStep {
 }
 
 template <typename T>
-[[nodiscard]] inline bool append_uint_arr_body(std::vector<T>& dst, std::span<const uint8_t> body) {
+[[nodiscard]] inline bool append_uint_arr_body(std::vector<T>& dst,
+                                               std::span<const uint8_t> body,
+                                               DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != WireUint) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
   size_t p = hdr.pos;
-  dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
+  dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
     const auto [v, vn] = decode_varint(body.subspan(p));
     if (vn == 0) return false;
@@ -546,11 +737,14 @@ template <typename T>
 }
 
 template <typename T>
-[[nodiscard]] inline bool append_sint_arr_body(std::vector<T>& dst, std::span<const uint8_t> body) {
+[[nodiscard]] inline bool append_sint_arr_body(std::vector<T>& dst,
+                                               std::span<const uint8_t> body,
+                                               DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != WireSint) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
   size_t p = hdr.pos;
-  dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
+  dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
     const auto [v, vn] = decode_varint(body.subspan(p));
     if (vn == 0) return false;
@@ -563,9 +757,11 @@ template <typename T>
 template <typename T>
 [[nodiscard]] inline bool append_fixed32_arr_body(std::vector<T>& dst,
                                                   std::span<const uint8_t> body,
-                                                  uint8_t expected_wt) {
+                                                  uint8_t expected_wt,
+                                                  DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != expected_wt) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
   size_t p = hdr.pos;
   dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
@@ -585,9 +781,11 @@ template <typename T>
 template <typename T>
 [[nodiscard]] inline bool append_fixed64_arr_body(std::vector<T>& dst,
                                                   std::span<const uint8_t> body,
-                                                  uint8_t expected_wt) {
+                                                  uint8_t expected_wt,
+                                                  DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != expected_wt) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
   size_t p = hdr.pos;
   dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
@@ -604,22 +802,119 @@ template <typename T>
   return true;
 }
 
-[[nodiscard]] inline bool decode_map_string_uint_body(std::map<std::string, uint64_t>& dst,
-                                                      std::span<const uint8_t> body) {
-  const auto hdr = parse_map_header(body);
-  if (!hdr.ok || hdr.key_wt != WireString || hdr.val_wt != WireUint) return false;
-  size_t p = hdr.pos;
-  for (size_t i = 0; i < hdr.count; ++i) {
-    auto k_res = read_str_slice(body, p);
-    if (!k_res) return false;
-    p = k_res.value().next_pos;
+template <uint8_t WT, typename T>
+[[nodiscard]] inline bool decode_container_scalar(std::span<const uint8_t> body,
+                                                  size_t& p,
+                                                  T& out) {
+  if constexpr (WT == WireUint) {
     const auto [v, vn] = decode_varint(body.subspan(p));
     if (vn == 0) return false;
     p += vn;
-    const auto ksp = k_res.value().slice;
-    dst[std::string(reinterpret_cast<const char*>(ksp.data()), ksp.size())] = v;
+    out = static_cast<T>(v);
+    return true;
+  } else if constexpr (WT == WireSint) {
+    const auto [v, vn] = decode_varint(body.subspan(p));
+    if (vn == 0) return false;
+    p += vn;
+    if constexpr (std::is_enum_v<T>) {
+      out = static_cast<T>(static_cast<std::underlying_type_t<T>>(decode_zigzag(v)));
+    } else {
+      out = static_cast<T>(decode_zigzag(v));
+    }
+    return true;
+  } else if constexpr (WT == WireBoolFalse) {
+    if (p >= body.size() || body[p] > 1u) return false;
+    out = (body[p++] == 1u);
+    return true;
+  } else if constexpr (WT == WireFixed32 || WT == WireSfixed32 || WT == WireFloat32) {
+    if (p > body.size() || body.size() - p < 4) return false;
+    const uint32_t bits = read_u32_le(body.data() + p);
+    p += 4;
+    if constexpr (std::is_same_v<T, float>) {
+      out = bits_to_float32(bits);
+    } else if constexpr (std::is_signed_v<T>) {
+      out = static_cast<T>(static_cast<int32_t>(bits));
+    } else {
+      out = static_cast<T>(bits);
+    }
+    return true;
+  } else if constexpr (WT == WireFixed64 || WT == WireSfixed64 || WT == WireFloat64) {
+    if (p > body.size() || body.size() - p < 8) return false;
+    const uint64_t bits = read_u64_le(body.data() + p);
+    p += 8;
+    if constexpr (std::is_same_v<T, double>) {
+      out = bits_to_float64(bits);
+    } else if constexpr (std::is_signed_v<T>) {
+      out = static_cast<T>(static_cast<int64_t>(bits));
+    } else {
+      out = static_cast<T>(bits);
+    }
+    return true;
+  } else if constexpr (WT == WireString) {
+    const auto s_res = read_str_slice_fast(body, p);
+    if (!s_res) return false;
+    out.assign(reinterpret_cast<const char*>(s_res.ptr), s_res.len);
+    p = s_res.next_pos;
+    return true;
+  } else if constexpr (WT == WireBytes) {
+    const auto b_res = read_len_slice_fast(body, p, 0);
+    if (!b_res) return false;
+    out.assign(b_res.ptr, b_res.ptr + b_res.len);
+    p = b_res.next_pos;
+    return true;
+  } else {
+    return false;
+  }
+}
+
+template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
+[[nodiscard]] inline bool decode_scalar_map_body(MapT& dst,
+                                                 std::span<const uint8_t> body,
+                                                 DecodeState* state = nullptr) {
+  const auto hdr = parse_map_header(body);
+  if (!hdr.ok || hdr.key_wt != KeyWT || hdr.val_wt != ValWT) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
+  size_t p = hdr.pos;
+  using K = typename MapT::key_type;
+  using V = typename MapT::mapped_type;
+  for (size_t i = 0; i < hdr.count; ++i) {
+    K k{};
+    V v{};
+    if (!decode_container_scalar<KeyWT, K>(body, p, k)) return false;
+    if (!decode_container_scalar<ValWT, V>(body, p, v)) return false;
+    dst[std::move(k)] = std::move(v);
   }
   return p == body.size();
+}
+
+template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
+[[nodiscard]] inline bool decode_submsg_map_body(MapT& dst,
+                                                 std::span<const uint8_t> body,
+                                                 SubDecodeFn&& decode_sub,
+                                                 DecodeState* state = nullptr) {
+  const auto hdr = parse_map_header(body);
+  if (!hdr.ok || hdr.key_wt != KeyWT || hdr.val_wt != WireSubMsg) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
+  size_t p = hdr.pos;
+  using K = typename MapT::key_type;
+  using V = typename MapT::mapped_type;
+  for (size_t i = 0; i < hdr.count; ++i) {
+    K k{};
+    if (!decode_container_scalar<KeyWT, K>(body, p, k)) return false;
+    const auto sub_res = read_len_slice_fast(body, p, 0);
+    if (!sub_res) return false;
+    p = sub_res.next_pos;
+    V v{};
+    if (!decode_sub(sub_res.span(), v)) return false;
+    dst[std::move(k)] = std::move(v);
+  }
+  return p == body.size();
+}
+
+[[nodiscard]] inline bool decode_map_string_uint_body(std::map<std::string, uint64_t>& dst,
+                                                      std::span<const uint8_t> body,
+                                                      DecodeState* state = nullptr) {
+  return decode_scalar_map_body<WireString, WireUint>(dst, body, state);
 }
 
 }  // namespace omnibuf

@@ -1,20 +1,23 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "omnibuf/bench/peer.omnibuf.pb.hpp"
 #include "omnibuf/conformance/conformance.omnibuf.pb.hpp"
 #include "omnibuf/omnibuf.hpp"
+#include "omnibuf/test/edge.omnibuf.pb.hpp"
 
 namespace {
 
@@ -25,6 +28,22 @@ int g_failed = 0;
   do {                                                                            \
     if (!(cond)) {                                                                \
       std::fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, #cond);      \
+      ++g_failed;                                                                 \
+      return;                                                                     \
+    }                                                                             \
+  } while (0)
+
+#define CHECK_THROWS(expr, exc_type)                                              \
+  do {                                                                            \
+    bool caught = false;                                                          \
+    try {                                                                         \
+      (void)(expr);                                                               \
+    } catch (const exc_type&) {                                                   \
+      caught = true;                                                              \
+    }                                                                             \
+    if (!caught) {                                                                \
+      std::fprintf(stderr, "FAIL [%s:%d]: expected %s from %s\n", __FILE__,       \
+                   __LINE__, #exc_type, #expr);                                   \
       ++g_failed;                                                                 \
       return;                                                                     \
     }                                                                             \
@@ -45,9 +64,16 @@ struct RecursiveNode {
   std::string name{};
   int64_t weight = 0;
   std::unique_ptr<RecursiveNode> primary{};
+  omnibuf::Box<RecursiveNode> boxed_backup{};
   std::vector<RecursiveNode> children{};
   std::vector<std::unique_ptr<RecursiveNode>> branches{};
   std::map<std::string, uint64_t> labels{};
+};
+
+struct UnorderedMapShowcase {
+  std::unordered_map<std::string, uint64_t> metrics{};
+  std::unordered_map<int32_t, std::string> sint_keyed{};
+  std::map<uint64_t, uint32_t> fixed_keyed{};
 };
 
 }  // namespace
@@ -64,7 +90,22 @@ struct omnibuf::StructTraits<RecursiveNode> {
         omnibuf::field<4, &T::primary>("primary"),
         omnibuf::field<5, &T::children>("children"),
         omnibuf::field<6, &T::branches>("branches"),
-        omnibuf::field<7, &T::labels>("labels"));
+        omnibuf::field<7, &T::labels>("labels"),
+        omnibuf::field<8, &T::boxed_backup>("boxed_backup"));
+  }
+};
+
+template <>
+struct omnibuf::StructTraits<UnorderedMapShowcase> {
+  static constexpr std::string_view type_name = "omnibuf.test.UnorderedMapShowcase";
+  static constexpr auto fields() {
+    using T = UnorderedMapShowcase;
+    return std::make_tuple(
+        omnibuf::field<1, &T::metrics>("metrics"),
+        omnibuf::field<2, &T::sint_keyed, omnibuf::WireOverride::Default,
+                       omnibuf::WireOverride::Sint>("sint_keyed"),
+        omnibuf::field<3, &T::fixed_keyed, omnibuf::WireOverride::Fixed32,
+                       omnibuf::WireOverride::Fixed64>("fixed_keyed"));
   }
 };
 
@@ -175,7 +216,7 @@ void test_encoder_overflow_and_depth_limit() {
   omnibuf::conformance::TestAllTypes gen_msg;
   CHECK(!gen_msg.unmarshal_omnibuf(deep_pkt).ok());
 
-  // Also verify Encoder handles >70 open containers (overflowing inline stack of 64)
+  // Verify Encoder handles >70 open containers (overflowing inline stack of 64)
   omnibuf::Encoder huge_enc;
   for (int i = 0; i < 72; ++i) {
     huge_enc.begin_submsg(1);
@@ -199,6 +240,29 @@ void test_encoder_overflow_and_depth_limit() {
   }
   const auto ok_pkt = std::move(ok_enc).finish();
   CHECK(omnibuf::decode_blind(ok_pkt).ok());
+
+  // >127 submessage array elements must expand the 1B count slot via patch_reserved_varint
+  omnibuf::Encoder arr_enc;
+  arr_enc.begin_submsg_arr(9);
+  for (uint32_t i = 0; i < 150; ++i) {
+    arr_enc.begin_submsg_elem();
+    arr_enc.write_uint(1, i + 1000u);
+    arr_enc.end_submsg_elem();
+  }
+  arr_enc.end_submsg_arr();
+  const auto arr_pkt = std::move(arr_enc).finish();
+  const auto arr_blind = omnibuf::decode_blind(arr_pkt);
+  CHECK(arr_blind.ok());
+  const auto* f9_arr =
+      std::get_if<omnibuf::BlindArray>(&arr_blind.value().at("field_9").v);
+  CHECK(f9_arr != nullptr && f9_arr->size() == 150);
+
+  // Stack underflow and unclosed container guards
+  omnibuf::Encoder underflow_enc;
+  CHECK_THROWS(underflow_enc.end_submsg(), std::logic_error);
+  omnibuf::Encoder unclosed_enc;
+  unclosed_enc.begin_submsg(1);
+  CHECK_THROWS(std::move(unclosed_enc).finish(), std::logic_error);
 }
 
 void test_wire_invariants_and_extended() {
@@ -282,14 +346,44 @@ void test_field0_and_blind_json() {
   CHECK(js.find("\"f7_bytes\":\"3q2+7w==\"") != std::string::npos);
   CHECK(js.find("\"f13_float32\":-0") != std::string::npos);
 
-  // Non-finite float falls back to "{}" when fallback_on_non_finite is enabled
-  omnibuf::Encoder nan_enc;
-  nan_enc.write_float64(1, std::numeric_limits<double>::quiet_NaN());
-  const auto nan_pkt = std::move(nan_enc).finish();
-  const auto nan_blind = omnibuf::decode_blind(nan_pkt);
-  CHECK(nan_blind.ok());
-  const std::string nan_json = omnibuf::stringify_blind_json(nan_blind.value(), true);
-  CHECK(nan_json == "{}");
+  // Public stringify_blind_json / decode_blind_json must return an error on NaN and Inf
+  for (double bad_f : {std::numeric_limits<double>::quiet_NaN(),
+                       std::numeric_limits<double>::infinity(),
+                       -std::numeric_limits<double>::infinity()}) {
+    omnibuf::Encoder nan_enc;
+    nan_enc.write_float64(1, bad_f);
+    const auto nan_pkt = std::move(nan_enc).finish();
+    const auto nan_blind = omnibuf::decode_blind(nan_pkt);
+    CHECK(nan_blind.ok());
+    CHECK(!omnibuf::stringify_blind_json(nan_blind.value()).ok());
+    CHECK(!omnibuf::decode_blind_json(nan_pkt).ok());
+  }
+
+  // Recursive TreeNode self_describing Field #0 must preserve child field names across depths
+  omnibuf::conformance::TreeNode tree;
+  tree.id = 1;
+  tree.name = "root";
+  tree.weight = -5;
+  omnibuf::conformance::TreeNode left;
+  left.id = 2;
+  left.name = "left";
+  omnibuf::conformance::TreeNode leaf;
+  leaf.id = 3;
+  leaf.name = "leaf";
+  left.primary.emplace(std::move(leaf));
+  tree.primary.emplace(std::move(left));
+
+  const auto tree_wire = tree.marshal_omnibuf({.deterministic = true, .self_describing = true});
+  const auto tree_obj = omnibuf::decode_blind(tree_wire);
+  CHECK(tree_obj.ok());
+  const auto* p1 = std::get_if<omnibuf::BlindObject>(&tree_obj.value().at("primary").v);
+  CHECK(p1 != nullptr && std::get<std::string>(p1->at("name").v) == "left");
+  const auto* p2 = std::get_if<omnibuf::BlindObject>(&p1->at("primary").v);
+  CHECK(p2 != nullptr && std::get<std::string>(p2->at("name").v) == "leaf");
+  const auto tree_json = omnibuf::decode_blind_json(tree_wire);
+  CHECK(tree_json.ok());
+  CHECK(tree_json.value().find("\"name\":\"left\"") != std::string::npos);
+  CHECK(tree_json.value().find("\"name\":\"leaf\"") != std::string::npos);
 
   // High 29-bit field numbers must not wrap into 16-bit
   omnibuf::Encoder hi_enc;
@@ -309,7 +403,7 @@ void test_opaque_and_aliased_splice() {
   peer.active = true;
   peer.uptime_sec = 1849203;
   peer.rssi_dbm = -62;
-  peer.cpu_load = 0.42875;
+  peer.cpu_load = -0.0;
   peer.tags = {"tier1", "ebgp"};
   peer.prefixes = {167772160, 172032000};
   peer.location = omnibuf::bench::Location{
@@ -317,36 +411,46 @@ void test_opaque_and_aliased_splice() {
       .datacenter = "FRA-FR5",
       .city = "Frankfurt",
       .rack = 42,
-      .latitude = 50.1109f,
+      .latitude = -0.0f,
       .longitude = 8.6821f,
   };
   peer.neighbors = {
-      omnibuf::bench::Neighbor{.peer_asn = 3356, .router = "level3", .latency_us = 850, .established = true},
+      omnibuf::bench::Neighbor{
+          .peer_asn = 3356, .router = "level3", .latency_us = 850, .established = true},
   };
   peer.sequence = 9876543210ULL;
 
   const auto raw = peer.marshal_omnibuf();
   omnibuf::bench::OpaquePeerUpdate view(raw);
+  CHECK(view.validate().ok());
   CHECK(view.get_asn() == 64512);
+  CHECK(omnibuf::float64_to_bits(view.get_cpu_load()) == omnibuf::float64_to_bits(-0.0));
+  CHECK(omnibuf::float32_to_bits(view.get_location().get_latitude()) ==
+        omnibuf::float32_to_bits(-0.0f));
   CHECK(view.get_location().get_city_view() == "Frankfurt");
   CHECK(view.neighbors_len() == 1);
   CHECK(view.get_neighbors(0).get_peer_asn() == 3356);
 
   view.set_sequence(9876543211ULL);
-  const auto mutated = view.marshal();
+  const auto try_mutated = view.try_marshal();
+  CHECK(try_mutated.ok());
+  const auto& mutated = try_mutated.value();
 
   omnibuf::bench::PeerUpdate decoded;
   CHECK(decoded.unmarshal_omnibuf(mutated).ok());
   peer.sequence = 9876543211ULL;
   CHECK(decoded == peer);
+  CHECK(omnibuf::float64_to_bits(decoded.cpu_load) == omnibuf::float64_to_bits(-0.0));
+  CHECK(omnibuf::float32_to_bits(decoded.location->latitude) == omnibuf::float32_to_bits(-0.0f));
 
   // Verify aliased prefix splice preserves prefix and never mutates raw tail
   std::vector<uint8_t> storage = {0xAA, 0xBB, 0xCC};
   storage.reserve(3 + raw.size() + 128);
   storage.insert(storage.end(), raw.begin(), raw.end());
-  const auto splice_cb = [](std::vector<uint8_t>& b, uint16_t fnum) {
+  const auto splice_cb = [](std::vector<uint8_t>& b, uint32_t fnum) -> const char* {
     omnibuf::append_tag(b, fnum, omnibuf::WireUint);
     omnibuf::append_varint(b, 9876543211ULL);
+    return nullptr;
   };
   const auto got = omnibuf::splice_fields(
       std::span<uint8_t>(storage), 3, std::span<const uint8_t>(storage.data() + 3, raw.size()),
@@ -355,16 +459,189 @@ void test_opaque_and_aliased_splice() {
   CHECK(std::equal(raw.begin(), raw.end(), storage.data() + 3));
   CHECK(std::equal(mutated.begin(), mutated.end(), got.begin() + 3, got.end()));
 
-  // Also verify in-place splice_fields_into when raw aliases storage's unused capacity
-  const uint8_t* raw_ptr = storage.data() + 3;
-  const size_t raw_len = raw.size();
-  storage.resize(3);
-  omnibuf::splice_fields_into(storage, std::span<const uint8_t>(raw_ptr, raw_len),
+  // ASan-safe self-aliasing splice_fields_into (live elements inside dst; appends after prefix)
+  std::vector<uint8_t> self_buf = raw;
+  omnibuf::splice_fields_into(self_buf, std::span<const uint8_t>(self_buf.data(), self_buf.size()),
                               uint64_t{1} << 11, 11, splice_cb);
-  CHECK(storage == got);
+  CHECK(self_buf.size() == raw.size() + mutated.size());
+  CHECK(std::equal(raw.begin(), raw.end(), self_buf.begin()));
+  CHECK(std::equal(mutated.begin(), mutated.end(),
+                   self_buf.begin() + static_cast<std::ptrdiff_t>(raw.size()), self_buf.end()));
+
+  // Corrupt packet splicing must fail cleanly via try_marshal()
+  std::vector<uint8_t> corrupt = raw;
+  corrupt.push_back(0xFF);
+  omnibuf::bench::OpaquePeerUpdate bad_view(corrupt);
+  bad_view.set_sequence(42);
+  CHECK(!bad_view.try_marshal().ok());
 }
 
-void test_recursive_struct_and_descriptors() {
+void test_edge_showcase_and_wide_message() {
+  using omnibuf::test::EdgeShowcase;
+  using omnibuf::test::EdgeStatus;
+  using omnibuf::test::OpaqueEdgeShowcase;
+  using omnibuf::test::OpaqueWideMessage;
+  using omnibuf::test::WideMessage;
+
+  // 1. proto3_optional distinguishes unset from explicit zero; zero-valued active oneof preserved
+  EdgeShowcase es;
+  es.opt_count = 0;  // explicit zero!
+  es.opt_flag = false;
+  // opt_label and opt_status intentionally left std::nullopt
+  es.statuses = {EdgeStatus::EDGE_STATUS_READY, EdgeStatus::EDGE_STATUS_OFFLINE};
+  es.modes = {EdgeShowcase::NestedMode::NESTED_MODE_FAST,
+              EdgeShowcase::NestedMode::NESTED_MODE_SAFE};
+
+  EdgeShowcase::InnerPayload inner1;
+  inner1.code = 10;
+  inner1.detail = "head";
+  EdgeShowcase::InnerPayload inner2;
+  inner2.code = 20;
+  inner2.detail = "tail";
+  inner1.next_inner.emplace(std::move(inner2));
+  es.by_id[-7] = inner1;
+  es.by_flag[true] = EdgeStatus::EDGE_STATUS_DRAINING;
+  es.by_flag[false] = EdgeStatus::EDGE_STATUS_UNSPECIFIED;
+  es.annotations["k"] = "v";
+  es.blobs[0x0102030405060708ULL] = {0xCA, 0xFE};
+  es.set_action_code(0);  // zero-valued active oneof branch!
+  es.and_ = "kw-and";
+  es.class_ = 99;
+  es.clear_ = true;
+  es.schema_meta_ = 1234;
+
+  const auto wire_res = es.try_marshal_omnibuf({.deterministic = true, .self_describing = true});
+  CHECK(wire_res.ok());
+  const auto& wire = wire_res.value();
+
+  EdgeShowcase out;
+  out.opt_label = "stale";
+  out.set_action_name("stale-branch");
+  CHECK(out.unmarshal_omnibuf(wire).ok());
+  CHECK(out == es);
+  CHECK(out.opt_count.has_value() && *out.opt_count == 0);
+  CHECK(out.opt_flag.has_value() && !*out.opt_flag);
+  CHECK(!out.opt_label.has_value());
+  CHECK(!out.opt_status.has_value());
+  CHECK(out.has_action_code() && out.action_code == 0);
+  CHECK(!out.has_action_name());
+
+  // Wire-type mismatch on another oneof branch must NOT clobber the active branch
+  std::vector<uint8_t> mismatch_wire = es.marshal_omnibuf();
+  // Field 12 (action_name) expects WireString, append WireUint instead -> skipped, branch 11 stays active
+  omnibuf::append_tag(mismatch_wire, 12, omnibuf::WireUint);
+  omnibuf::append_varint(mismatch_wire, 777);
+  EdgeShowcase mismatch_out;
+  CHECK(mismatch_out.unmarshal_omnibuf(mismatch_wire).ok());
+  CHECK(mismatch_out.has_action_code() && mismatch_out.action_code == 0);
+
+  // OpaqueEdgeShowcase getters, lookups, and oneof splice
+  OpaqueEdgeShowcase oview(wire);
+  CHECK(oview.validate().ok());
+  CHECK(oview.get_opt_count() == std::optional<uint32_t>{0});
+  CHECK(oview.get_opt_label() == std::nullopt);
+  CHECK(oview.get_statuses() == es.statuses);
+  CHECK(oview.get_modes() == es.modes);
+  CHECK(oview.lookup_by_flag(true).second &&
+        oview.lookup_by_flag(true).first == EdgeStatus::EDGE_STATUS_DRAINING);
+  CHECK(oview.lookup_annotations("k") == std::make_pair(std::string("v"), true));
+  CHECK(oview.lookup_blobs(0x0102030405060708ULL).second);
+  const auto [sub_view, sub_found] = oview.lookup_by_id(-7);
+  CHECK(sub_found && sub_view.get_code() == 10 && sub_view.get_detail_view() == "head");
+  CHECK(oview.get_and_view() == "kw-and" && oview.get_class() == 99 && oview.get_clear());
+
+  // Mutate oneof branch via OpaqueEdgeShowcase (switches from action_code=0 to action_name="go")
+  oview.set_action_name("go");
+  oview.set_opt_label(std::string("now-set"));
+  const auto spliced_es = oview.try_marshal();
+  CHECK(spliced_es.ok());
+  EdgeShowcase decoded_spliced;
+  CHECK(decoded_spliced.unmarshal_omnibuf(spliced_es.value()).ok());
+  CHECK(decoded_spliced.has_action_name() && decoded_spliced.action_name == "go");
+  CHECK(!decoded_spliced.has_action_code());
+  CHECK(decoded_spliced.opt_label == std::optional<std::string>{"now-set"});
+
+  // 2. WideMessage (>64 fields): tests multi-word seen_words and Opaque dirty_ bitset on field #70
+  WideMessage wide;
+  wide.f1 = 11;
+  wide.f64 = 640;
+  wide.f65 = 650;
+  wide.f66_str = "sixty-six";
+  wide.f67_sub = EdgeShowcase::InnerPayload{.code = 67, .detail = "sub67", .next_inner = {}};
+  wide.f69_arr = {100, 200, 300};
+  wide.f70_tail = 70000000000ULL;
+
+  const auto wide_wire = wide.marshal_omnibuf({.deterministic = true});
+  WideMessage wide_dec;
+  CHECK(wide_dec.unmarshal_omnibuf(wide_wire).ok());
+  CHECK(wide_dec == wide);
+
+  OpaqueWideMessage wide_view(wide_wire);
+  CHECK(wide_view.get_f1() == 11);
+  CHECK(wide_view.get_f64() == 640);
+  CHECK(wide_view.get_f65() == 650);
+  CHECK(wide_view.get_f66_str_view() == "sixty-six");
+  CHECK(wide_view.get_f70_tail() == 70000000000ULL);
+
+  wide_view.set_f1(12);
+  wide_view.set_f65(651);
+  wide_view.set_f70_tail(99999999999ULL);
+  const auto wide_spliced = wide_view.try_marshal();
+  CHECK(wide_spliced.ok());
+  WideMessage wide_after;
+  CHECK(wide_after.unmarshal_omnibuf(wide_spliced.value()).ok());
+  CHECK(wide_after.f1 == 12 && wide_after.f64 == 640 && wide_after.f65 == 651);
+  CHECK(wide_after.f70_tail == 99999999999ULL);
+}
+
+void test_large_container_shift_and_limits() {
+  // >16 KiB nested sub-message + >16 KiB submsg array backpatch expansion round-trip
+  omnibuf::bench::PeerUpdate large;
+  large.asn = 64512;
+  large.router_id = "edge-rtr-large";
+  large.location = omnibuf::bench::Location{
+      .region = "eu-central-1",
+      .datacenter = std::string(20480, 'd'),
+      .city = "Frankfurt",
+      .rack = 42,
+      .latitude = 50.1109f,
+      .longitude = 8.6821f,
+  };
+  large.neighbors = {
+      omnibuf::bench::Neighbor{
+          .peer_asn = 3356, .router = std::string(18432, 'n'), .latency_us = 850, .established = true},
+  };
+  large.sequence = 7;
+
+  const auto large_wire = large.marshal_omnibuf();
+  CHECK(large_wire.size() > 38912);
+  omnibuf::bench::PeerUpdate large_dec;
+  CHECK(large_dec.unmarshal_omnibuf(large_wire).ok());
+  CHECK(large_dec == large);
+
+  // DecodeOptions limits across generated, StructTraits, Blind, and Opaque::validate()
+  CHECK(!large_dec.unmarshal_omnibuf(large_wire, {.max_message_bytes = 4096}).ok());
+  CHECK(!omnibuf::decode_blind(large_wire, {.max_message_bytes = 4096}).ok());
+  omnibuf::bench::OpaquePeerUpdate large_view(large_wire);
+  CHECK(!large_view.validate({.max_message_bytes = 4096}).ok());
+
+  // max_total_elements limit on array elements
+  omnibuf::bench::PeerUpdate many_prefixes;
+  many_prefixes.prefixes.assign(200, 0x0A000001u);
+  const auto pref_wire = many_prefixes.marshal_omnibuf();
+  omnibuf::bench::PeerUpdate pref_out;
+  CHECK(!pref_out.unmarshal_omnibuf(pref_wire, {.max_total_elements = 50}).ok());
+  CHECK(!omnibuf::decode_blind(pref_wire, {.max_total_elements = 50}).ok());
+
+  // max_depth limit
+  omnibuf::bench::PeerUpdate nested_peer;
+  nested_peer.location = omnibuf::bench::Location{.city = "Berlin"};
+  const auto nested_wire = nested_peer.marshal_omnibuf();
+  CHECK(!pref_out.unmarshal_omnibuf(nested_wire, {.max_depth = 0}).ok());
+  CHECK(pref_out.unmarshal_omnibuf(nested_wire, {.max_depth = 2}).ok());
+}
+
+void test_recursive_struct_unordered_map_and_descriptors() {
   RecursiveNode root;
   root.id = 1;
   root.name = "root";
@@ -372,6 +649,10 @@ void test_recursive_struct_and_descriptors() {
   root.primary = std::make_unique<RecursiveNode>();
   root.primary->id = 2;
   root.primary->name = "primary-child";
+  RecursiveNode backup;
+  backup.id = 9;
+  backup.name = "boxed";
+  root.boxed_backup.emplace(std::move(backup));
   RecursiveNode c1;
   c1.id = 3;
   c1.name = "vec-child";
@@ -392,9 +673,105 @@ void test_recursive_struct_and_descriptors() {
   CHECK(omnibuf::unmarshal(bytes_res.value(), out).ok());
   CHECK(out.id == 1 && out.name == "root" && out.weight == -42);
   CHECK(out.primary != nullptr && out.primary->id == 2);
+  CHECK(out.boxed_backup.has_value() && out.boxed_backup->id == 9);
   CHECK(out.children.size() == 1 && out.children[0].id == 3);
   CHECK(out.branches.size() == 1 && out.branches[0]->id == 4);
   CHECK(out.labels.at("env") == 7);
+
+  // Unordered map canonical deterministic key sorting + KeyOverride (Sint & Fixed64)
+  UnorderedMapShowcase um1;
+  um1.metrics = {{"zeta", 3}, {"alpha", 1}, {"mu", 2}};
+  um1.sint_keyed = {{-100, "neg"}, {50, "pos"}, {0, "zero"}};
+  um1.fixed_keyed = {{0xAABBCCDDEEFF0011ULL, 77}};
+
+  UnorderedMapShowcase um2;
+  um2.metrics = {{"mu", 2}, {"zeta", 3}, {"alpha", 1}};
+  um2.sint_keyed = {{50, "pos"}, {-100, "neg"}, {0, "zero"}};
+  um2.fixed_keyed = {{0xAABBCCDDEEFF0011ULL, 77}};
+
+  const auto um1_wire = omnibuf::marshal(um1, {.deterministic = true});
+  const auto um2_wire = omnibuf::marshal(um2, {.deterministic = true});
+  CHECK(um1_wire.ok() && um2_wire.ok());
+  CHECK(um1_wire.value() == um2_wire.value());
+
+  UnorderedMapShowcase um_out;
+  CHECK(omnibuf::unmarshal(um1_wire.value(), um_out).ok());
+  CHECK(um_out.metrics == um1.metrics);
+  CHECK(um_out.sint_keyed == um1.sint_keyed);
+  CHECK(um_out.fixed_keyed == um1.fixed_keyed);
+
+  // DescriptorPool validation of unsupported constructs
+  {
+    auto make_single_field_fds = [](omnibuf::proto::FieldDescriptorProto f,
+                                    std::string syntax = "proto2") {
+      omnibuf::proto::FileDescriptorSet fds;
+      omnibuf::proto::FileDescriptorProto file;
+      file.name = "bad.proto";
+      file.package = "bad";
+      file.syntax = std::move(syntax);
+      omnibuf::proto::DescriptorProto msg;
+      msg.name = "BadMsg";
+      msg.fields.push_back(std::move(f));
+      file.message_types.push_back(std::move(msg));
+      fds.files.push_back(std::move(file));
+      return fds;
+    };
+
+    // 1. TYPE_GROUP rejected
+    omnibuf::proto::FieldDescriptorProto grp{.name = "g",
+                                             .number = 1,
+                                             .label = omnibuf::proto::FieldLabel::Optional,
+                                             .type = omnibuf::proto::FieldType::Group,
+                                             .has_type = true};
+    omnibuf::proto::DescriptorPool p1;
+    CHECK(!p1.add_file_descriptor_set(make_single_field_fds(grp)).ok());
+
+    // 2. LABEL_REQUIRED rejected
+    omnibuf::proto::FieldDescriptorProto req{.name = "r",
+                                             .number = 1,
+                                             .label = omnibuf::proto::FieldLabel::Required,
+                                             .type = omnibuf::proto::FieldType::Uint32,
+                                             .has_type = true};
+    omnibuf::proto::DescriptorPool p2;
+    CHECK(!p2.add_file_descriptor_set(make_single_field_fds(req)).ok());
+
+    // 3. Custom proto2 default_value rejected
+    omnibuf::proto::FieldDescriptorProto def{.name = "d",
+                                             .number = 1,
+                                             .label = omnibuf::proto::FieldLabel::Optional,
+                                             .type = omnibuf::proto::FieldType::Uint32,
+                                             .has_type = true,
+                                             .default_value = "42"};
+    omnibuf::proto::DescriptorPool p3;
+    CHECK(!p3.add_file_descriptor_set(make_single_field_fds(def)).ok());
+
+    // 4. Unknown FieldType / FieldLabel rejected
+    omnibuf::proto::FieldDescriptorProto unk_t{.name = "u",
+                                               .number = 1,
+                                               .label = omnibuf::proto::FieldLabel::Optional,
+                                               .type = omnibuf::proto::FieldType::Unknown,
+                                               .has_type = false};
+    omnibuf::proto::DescriptorPool p4;
+    CHECK(!p4.add_file_descriptor_set(make_single_field_fds(unk_t)).ok());
+
+    omnibuf::proto::FieldDescriptorProto unk_l{.name = "u",
+                                               .number = 1,
+                                               .label = omnibuf::proto::FieldLabel::Unknown,
+                                               .type = omnibuf::proto::FieldType::Uint32,
+                                               .has_type = true};
+    omnibuf::proto::DescriptorPool p5;
+    CHECK(!p5.add_file_descriptor_set(make_single_field_fds(unk_l)).ok());
+
+    // 5. Proto2 extensions rejected
+    omnibuf::proto::FileDescriptorSet ext_fds;
+    omnibuf::proto::FileDescriptorProto ext_file;
+    ext_file.name = "ext.proto";
+    ext_file.syntax = "proto2";
+    ext_file.has_extensions = true;
+    ext_fds.files.push_back(std::move(ext_file));
+    omnibuf::proto::DescriptorPool p6;
+    CHECK(!p6.add_file_descriptor_set(ext_fds).ok());
+  }
 
   // DescriptorPool + DynamicMessage round-trip from schemas.fds.pb
 #ifdef OMNIBUF_SCHEMAS_FDS_PATH
@@ -414,6 +791,9 @@ void test_recursive_struct_and_descriptors() {
   const auto dyn_wire = omnibuf::proto::to_binary(*desc, dmsg, {.deterministic = true});
   CHECK(dyn_wire.ok());
   CHECK(dyn_wire.value() == orig_wire);
+
+  // Also verify DynamicMessage respects DecodeOptions resource limits
+  CHECK(!omnibuf::proto::from_binary(*desc, orig_wire, dmsg, {.max_message_bytes = 4}).ok());
 #endif
 }
 
@@ -426,7 +806,9 @@ int main() {
   RUN_TEST(test_wire_invariants_and_extended);
   RUN_TEST(test_field0_and_blind_json);
   RUN_TEST(test_opaque_and_aliased_splice);
-  RUN_TEST(test_recursive_struct_and_descriptors);
+  RUN_TEST(test_edge_showcase_and_wide_message);
+  RUN_TEST(test_large_container_shift_and_limits);
+  RUN_TEST(test_recursive_struct_unordered_map_and_descriptors);
 
   std::printf("\nSummary: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

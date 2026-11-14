@@ -27,6 +27,7 @@ namespace omnibuf::proto {
 
 // Standard google.protobuf.FieldDescriptorProto.Type numbers (1..18).
 enum class FieldType : uint32_t {
+  Unknown = 0,
   Double = 1,
   Float = 2,
   Int64 = 3,
@@ -48,6 +49,7 @@ enum class FieldType : uint32_t {
 };
 
 enum class FieldLabel : uint32_t {
+  Unknown = 0,
   Optional = 1,
   Required = 2,
   Repeated = 3,
@@ -55,10 +57,13 @@ enum class FieldLabel : uint32_t {
 
 struct FieldDescriptorProto {
   std::string name;
+  std::string extendee;
   uint32_t number = 0;
   FieldLabel label = FieldLabel::Optional;
-  FieldType type = FieldType::Uint32;
+  FieldType type = FieldType::Unknown;
+  bool has_type = false;
   std::string type_name;
+  std::string default_value;
   std::string json_name;
   std::optional<uint32_t> oneof_index;
   bool proto3_optional = false;
@@ -85,6 +90,7 @@ struct DescriptorProto {
   std::vector<EnumDescriptorProto> enum_types;
   std::vector<OneofDescriptorProto> oneof_decls;
   bool map_entry = false;
+  bool has_extensions = false;
 };
 
 struct FileDescriptorProto {
@@ -94,6 +100,7 @@ struct FileDescriptorProto {
   std::vector<DescriptorProto> message_types;
   std::vector<EnumDescriptorProto> enum_types;
   std::string syntax;
+  bool has_extensions = false;
 };
 
 struct FileDescriptorSet {
@@ -195,25 +202,40 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
     pos = tag_res.value().next_pos;
     const uint32_t fnum = static_cast<uint32_t>(tag_res.value().val >> 3);
     const uint32_t wt = static_cast<uint32_t>(tag_res.value().val & 7u);
-    if (wt == 2 && (fnum == 1 || fnum == 6 || fnum == 10)) {
+    if (wt == 2 && (fnum == 1 || fnum == 2 || fnum == 6 || fnum == 7 || fnum == 10)) {
       auto s_res = read_pb_bytes(b, pos);
       if (!s_res) return Error{s_res.error()};
       pos = s_res.value().next_pos;
       const auto sp = s_res.value().slice;
       std::string str(reinterpret_cast<const char*>(sp.data()), sp.size());
       if (fnum == 1) out.name = std::move(str);
+      else if (fnum == 2) out.extendee = std::move(str);
       else if (fnum == 6) out.type_name = std::move(str);
+      else if (fnum == 7) out.default_value = std::move(str);
       else out.json_name = std::move(str);
     } else if (wt == 0 && (fnum == 3 || fnum == 4 || fnum == 5 || fnum == 9 || fnum == 17)) {
       auto v_res = read_pb_varint(b, pos);
       if (!v_res) return Error{v_res.error()};
       pos = v_res.value().next_pos;
       const uint64_t val = v_res.value().val;
-      if (fnum == 3) out.number = static_cast<uint32_t>(val);
-      else if (fnum == 4) out.label = static_cast<FieldLabel>(val);
-      else if (fnum == 5) out.type = static_cast<FieldType>(val);
-      else if (fnum == 9) out.oneof_index = static_cast<uint32_t>(val);
-      else out.proto3_optional = (val != 0);
+      if (fnum == 3) {
+        out.number = static_cast<uint32_t>(val);
+      } else if (fnum == 4) {
+        if (val < 1 || val > 3) {
+          return Error{"omnibuf::proto: unknown FieldDescriptorProto.Label value"};
+        }
+        out.label = static_cast<FieldLabel>(val);
+      } else if (fnum == 5) {
+        if (val < 1 || val > 18) {
+          return Error{"omnibuf::proto: unknown FieldDescriptorProto.Type value"};
+        }
+        out.type = static_cast<FieldType>(val);
+        out.has_type = true;
+      } else if (fnum == 9) {
+        out.oneof_index = static_cast<uint32_t>(val);
+      } else {
+        out.proto3_optional = (val != 0);
+      }
     } else {
       auto sk = skip_pb_field(b, pos, wt);
       if (!sk) return Error{sk.error()};
@@ -355,6 +377,9 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
         out.oneof_decls.push_back(std::move(od));
       }
     } else {
+      if (fnum == 5 || fnum == 6) {
+        out.has_extensions = true;
+      }
       auto sk = skip_pb_field(b, pos, wt);
       if (!sk) return Error{sk.error()};
       pos = sk.value();
@@ -398,6 +423,9 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
         out.syntax.assign(reinterpret_cast<const char*>(sp.data()), sp.size());
       }
     } else {
+      if (fnum == 7) {
+        out.has_extensions = true;
+      }
       auto sk = detail::skip_pb_field(b, pos, wt);
       if (!sk) return Error{sk.error()};
       pos = sk.value();
@@ -650,6 +678,9 @@ class DescriptorPool {
     };
 
     for (const auto& file : fds.files) {
+      if (file.has_extensions) {
+        return Error{"omnibuf::proto: proto2 extensions are not supported"};
+      }
       for (const auto& msg : file.message_types) {
         register_rec(register_rec, file.package, msg, file.syntax);
       }
@@ -664,11 +695,29 @@ class DescriptorPool {
       auto raw_it = raw_map.find(full);
       if (raw_it == raw_map.end() || !md_ptr->fields.empty()) continue;
       const auto& dp = raw_it->second.proto;
+      if (dp.has_extensions) {
+        return Error{"omnibuf::proto: proto2 extensions are not supported"};
+      }
       const bool is_proto2 = (raw_it->second.syntax == "proto2" || raw_it->second.syntax.empty());
 
       for (const auto& f : dp.fields) {
+        if (!f.extendee.empty()) {
+          return Error{"omnibuf::proto: proto2 extensions are not supported"};
+        }
+        if (!f.has_type || f.type == FieldType::Unknown) {
+          return Error{"omnibuf::proto: missing or unknown field type on " + full + "." + f.name};
+        }
         if (f.type == FieldType::Group) {
           return Error{"omnibuf::proto: TYPE_GROUP is not supported"};
+        }
+        if (f.label == FieldLabel::Unknown) {
+          return Error{"omnibuf::proto: unknown field label on " + full + "." + f.name};
+        }
+        if (f.label == FieldLabel::Required) {
+          return Error{"omnibuf::proto: proto2 required fields are not supported"};
+        }
+        if (is_proto2 && !f.default_value.empty()) {
+          return Error{"omnibuf::proto: proto2 custom default values are not supported"};
         }
         FieldDesc fd;
         fd.number = f.number;
@@ -749,9 +798,14 @@ class DescriptorPool {
 namespace detail {
 
 inline std::shared_ptr<SchemaMeta> build_proto_schema_meta(const MessageDescriptor* md,
-                                                           int depth,
-                                                           std::set<std::string_view>& active) {
-  if (md == nullptr || depth > MAX_CONTAINER_DEPTH || active.contains(md->full_name)) {
+                                                           int schema_depth,
+                                                           std::set<std::string_view>& active,
+                                                           bool* cyclic = nullptr) {
+  if (md == nullptr || schema_depth + 1 > MAX_CONTAINER_DEPTH) {
+    return nullptr;
+  }
+  if (active.contains(md->full_name)) {
+    if (cyclic != nullptr) *cyclic = true;
     return nullptr;
   }
   active.insert(md->full_name);
@@ -759,14 +813,55 @@ inline std::shared_ptr<SchemaMeta> build_proto_schema_meta(const MessageDescript
   meta->type_name = md->short_name;
   for (const auto& fd : md->fields) {
     meta->fields[fd.number] = fd.name;
-    if (fd.message_desc != nullptr) {
-      const int child_depth = (fd.is_repeated || fd.is_map) ? (depth + 2) : (depth + 1);
-      if (auto child = build_proto_schema_meta(fd.message_desc, child_depth, active)) {
+    if (fd.message_desc != nullptr && schema_depth + 3 <= MAX_CONTAINER_DEPTH) {
+      if (auto child =
+              build_proto_schema_meta(fd.message_desc, schema_depth + 2, active, cyclic)) {
         meta->children[fd.number] = std::move(child);
       }
     }
   }
   active.erase(md->full_name);
+  return meta;
+}
+
+inline std::shared_ptr<SchemaMeta> build_proto_value_schema_meta(const MessageDescriptor* md,
+                                                                 const DynamicMessage& msg,
+                                                                 int schema_depth) {
+  if (md == nullptr || schema_depth + 1 > MAX_CONTAINER_DEPTH) {
+    return nullptr;
+  }
+  auto meta = std::make_shared<SchemaMeta>();
+  meta->type_name = md->short_name;
+  for (const auto& fd : md->fields) {
+    meta->fields[fd.number] = fd.name;
+    if (fd.message_desc == nullptr || schema_depth + 3 > MAX_CONTAINER_DEPTH) {
+      continue;
+    }
+    auto it = msg.fields().find(fd.number);
+    if (it == msg.fields().end()) continue;
+    const auto& fv = it->second;
+    std::shared_ptr<SchemaMeta> child;
+    if (fd.is_map) {
+      for (const auto& [_, sub] : fv.submsg_map) {
+        if (sub) {
+          child = merge_schema_meta(
+              child, build_proto_value_schema_meta(fd.message_desc, *sub, schema_depth + 2));
+        }
+      }
+    } else if (fd.is_repeated) {
+      for (const auto& sub : fv.submsg_list) {
+        if (sub) {
+          child = merge_schema_meta(
+              child, build_proto_value_schema_meta(fd.message_desc, *sub, schema_depth + 2));
+        }
+      }
+    } else if (fv.submsg) {
+      child = build_proto_value_schema_meta(fd.message_desc, *fv.submsg, schema_depth + 2);
+    }
+    if (child) {
+      meta->children[fd.number] = std::move(child);
+    }
+  }
   return meta;
 }
 
@@ -1103,9 +1198,13 @@ struct DecodedMapKey {
                                                      std::span<const uint8_t> data,
                                                      DynamicMessage& out,
                                                      int depth,
-                                                     bool merge) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf::proto: nesting depth exceeds MAX_CONTAINER_DEPTH"};
+                                                     bool merge,
+                                                     DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf::proto: nesting depth exceeds max_depth"};
+  }
+  if (data.size() > state.opts.max_message_bytes) {
+    return Error{"omnibuf::proto: message exceeds max_message_bytes"};
   }
   if (!merge) {
     out.clear();
@@ -1124,7 +1223,7 @@ struct DecodedMapKey {
     const uint8_t wt = static_cast<uint8_t>(tag & 0x0Fu);
 
     if (fnum == 0) {
-      auto f0 = validate_field0(data, pos, wt, depth);
+      auto f0 = validate_field0(data, pos, wt, depth, state);
       if (!f0) return Error{f0.error()};
       pos = f0.value();
       continue;
@@ -1132,7 +1231,7 @@ struct DecodedMapKey {
 
     auto idx_it = md.field_index_by_number.find(fnum);
     if (idx_it == md.field_index_by_number.end()) {
-      auto sk = validate_value(data, pos, wt, depth);
+      auto sk = validate_value(data, pos, wt, depth, state);
       if (!sk) return Error{sk.error()};
       pos = sk.value();
       continue;
@@ -1140,24 +1239,25 @@ struct DecodedMapKey {
 
     const auto& fd = md.fields[idx_it->second];
     const bool already_seen = merge || seen.contains(fnum);
-
-    if (fd.real_oneof_index.has_value()) {
-      for (const auto& sibling : md.fields) {
-        if (sibling.real_oneof_index == fd.real_oneof_index && sibling.number != fd.number) {
-          out.mutable_fields().erase(sibling.number);
+    auto erase_oneof_siblings = [&]() {
+      if (fd.real_oneof_index.has_value()) {
+        for (const auto& sibling : md.fields) {
+          if (sibling.real_oneof_index == fd.real_oneof_index && sibling.number != fd.number) {
+            out.mutable_fields().erase(sibling.number);
+          }
         }
       }
-    }
+    };
 
     if (fd.is_map) {
       if (wt != WireMap) {
-        auto sk = validate_value(data, pos, wt, depth);
+        auto sk = validate_value(data, pos, wt, depth, state);
         if (!sk) return Error{sk.error()};
         pos = sk.value();
         continue;
       }
-      if (depth + 1 > MAX_CONTAINER_DEPTH) {
-        return Error{"omnibuf::proto: map nesting depth exceeds MAX_CONTAINER_DEPTH"};
+      if (depth + 1 > state.opts.max_depth) {
+        return Error{"omnibuf::proto: map nesting depth exceeds max_depth"};
       }
       auto body_res = read_len_slice(data, pos, 3);
       if (!body_res) return Error{body_res.error()};
@@ -1169,6 +1269,10 @@ struct DecodedMapKey {
       if (!exp_k || !exp_v || hdr.key_wt != exp_k.value() || hdr.val_wt != exp_v.value()) {
         return Error{"omnibuf::proto: WireMap wire type mismatch"};
       }
+      if (!state.charge_elements(hdr.count)) {
+        return Error{"omnibuf::proto: WireMap exceeds max_total_elements"};
+      }
+      erase_oneof_siblings();
       auto& fv = out.mutable_fields()[fnum];
       fv.present = true;
       if (!already_seen) {
@@ -1185,7 +1289,8 @@ struct DecodedMapKey {
           auto vs = read_len_slice(body, p, 0);
           if (!vs) return Error{vs.error()};
           auto sub = std::make_unique<DynamicMessage>();
-          auto dr = decode_dynamic_msg(*fd.message_desc, vs.value().slice, *sub, depth + 2, false);
+          auto dr =
+              decode_dynamic_msg(*fd.message_desc, vs.value().slice, *sub, depth + 2, false, state);
           if (!dr) return Error{dr.error()};
           fv.submsg_map[std::move(kr.value().key)] = std::move(sub);
           p = vs.value().next_pos;
@@ -1203,13 +1308,13 @@ struct DecodedMapKey {
 
     if (fd.is_repeated) {
       if (wt != WireArray) {
-        auto sk = validate_value(data, pos, wt, depth);
+        auto sk = validate_value(data, pos, wt, depth, state);
         if (!sk) return Error{sk.error()};
         pos = sk.value();
         continue;
       }
-      if (depth + 1 > MAX_CONTAINER_DEPTH) {
-        return Error{"omnibuf::proto: array nesting depth exceeds MAX_CONTAINER_DEPTH"};
+      if (depth + 1 > state.opts.max_depth) {
+        return Error{"omnibuf::proto: array nesting depth exceeds max_depth"};
       }
       auto body_res = read_len_slice(data, pos, 2);
       if (!body_res) return Error{body_res.error()};
@@ -1220,6 +1325,10 @@ struct DecodedMapKey {
       if (!exp_elem || hdr.elem_wt != exp_elem.value()) {
         return Error{"omnibuf::proto: WireArray element type mismatch"};
       }
+      if (!state.charge_elements(hdr.count)) {
+        return Error{"omnibuf::proto: WireArray exceeds max_total_elements"};
+      }
+      erase_oneof_siblings();
       auto& fv = out.mutable_fields()[fnum];
       fv.present = true;
       if (!already_seen) {
@@ -1229,18 +1338,21 @@ struct DecodedMapKey {
       seen.insert(fnum);
       size_t p = hdr.pos;
       if (fd.type == FieldType::Message) {
-        fv.submsg_list.reserve(grow_capacity(fv.submsg_list.capacity(), fv.submsg_list.size() + hdr.count));
+        fv.submsg_list.reserve(
+            bounded_reserve_target(fv.submsg_list.capacity(), fv.submsg_list.size(), hdr.count));
         for (size_t i = 0; i < hdr.count; ++i) {
           auto es = read_len_slice(body, p, 0);
           if (!es) return Error{es.error()};
           auto sub = std::make_unique<DynamicMessage>();
-          auto dr = decode_dynamic_msg(*fd.message_desc, es.value().slice, *sub, depth + 2, false);
+          auto dr =
+              decode_dynamic_msg(*fd.message_desc, es.value().slice, *sub, depth + 2, false, state);
           if (!dr) return Error{dr.error()};
           fv.submsg_list.push_back(std::move(sub));
           p = es.value().next_pos;
         }
       } else {
-        fv.scalar_list.reserve(grow_capacity(fv.scalar_list.capacity(), fv.scalar_list.size() + hdr.count));
+        fv.scalar_list.reserve(
+            bounded_reserve_target(fv.scalar_list.capacity(), fv.scalar_list.size(), hdr.count));
         for (size_t i = 0; i < hdr.count; ++i) {
           auto er = decode_proto_scalar(body, p, fd.type);
           if (!er) return Error{er.error()};
@@ -1255,13 +1367,14 @@ struct DecodedMapKey {
 
     if (fd.type == FieldType::Message) {
       if (wt != WireSubMsg) {
-        auto sk = validate_value(data, pos, wt, depth);
+        auto sk = validate_value(data, pos, wt, depth, state);
         if (!sk) return Error{sk.error()};
         pos = sk.value();
         continue;
       }
       auto sub_res = read_len_slice(data, pos, 0);
       if (!sub_res) return Error{sub_res.error()};
+      erase_oneof_siblings();
       auto& fv = out.mutable_fields()[fnum];
       fv.present = true;
       if (!fv.submsg || !already_seen) {
@@ -1269,7 +1382,7 @@ struct DecodedMapKey {
       }
       seen.insert(fnum);
       auto dr = decode_dynamic_msg(
-          *fd.message_desc, sub_res.value().slice, *fv.submsg, depth + 1, already_seen);
+          *fd.message_desc, sub_res.value().slice, *fv.submsg, depth + 1, already_seen, state);
       if (!dr) return Error{dr.error()};
       pos = sub_res.value().next_pos;
       continue;
@@ -1277,11 +1390,12 @@ struct DecodedMapKey {
 
     if (fd.type == FieldType::Bool) {
       if (wt != WireBoolFalse && wt != WireBoolTrue) {
-        auto sk = validate_value(data, pos, wt, depth);
+        auto sk = validate_value(data, pos, wt, depth, state);
         if (!sk) return Error{sk.error()};
         pos = sk.value();
         continue;
       }
+      erase_oneof_siblings();
       auto& fv = out.mutable_fields()[fnum];
       fv.present = true;
       fv.scalar = (wt == WireBoolTrue);
@@ -1291,13 +1405,14 @@ struct DecodedMapKey {
 
     auto exp_wt = proto_type_to_wire_type(fd.type);
     if (!exp_wt || wt != exp_wt.value()) {
-      auto sk = validate_value(data, pos, wt, depth);
+      auto sk = validate_value(data, pos, wt, depth, state);
       if (!sk) return Error{sk.error()};
       pos = sk.value();
       continue;
     }
     auto sr = decode_proto_scalar(data, pos, fd.type);
     if (!sr) return Error{sr.error()};
+    erase_oneof_siblings();
     auto& fv = out.mutable_fields()[fnum];
     fv.present = true;
     fv.scalar = std::move(sr.value().val);
@@ -1312,8 +1427,10 @@ struct DecodedMapKey {
 
 [[nodiscard]] inline Result<void> from_binary(const MessageDescriptor& desc,
                                               std::span<const uint8_t> data,
-                                              DynamicMessage& out) {
-  return detail::decode_dynamic_msg(desc, data, out, 0, false);
+                                              DynamicMessage& out,
+                                              DecodeOptions opts = {}) {
+  DecodeState state{opts, 0};
+  return detail::decode_dynamic_msg(desc, data, out, 0, false, state);
 }
 
 [[nodiscard]] inline Result<std::vector<uint8_t>> to_binary(const MessageDescriptor& desc,
@@ -1323,7 +1440,12 @@ struct DecodedMapKey {
   dst.reserve(256);
   if (opts.self_describing) {
     std::set<std::string_view> active;
-    if (auto meta = detail::build_proto_schema_meta(&desc, 0, active)) {
+    bool cyclic = false;
+    auto meta = detail::build_proto_schema_meta(&desc, 1, active, &cyclic);
+    if (cyclic) {
+      meta = detail::build_proto_value_schema_meta(&desc, msg, 1);
+    }
+    if (meta) {
       append_field0_schema_meta(dst, *meta);
     }
   }

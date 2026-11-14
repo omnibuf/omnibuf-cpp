@@ -176,42 +176,166 @@ template <typename IntT>
   return std::string(buf, ptr);
 }
 
-[[nodiscard]] inline Result<uint32_t> blind_field_shape(std::span<const uint8_t> data,
-                                                        size_t pos,
-                                                        uint8_t wt) {
-  if (wt == WireBoolTrue) {
-    return static_cast<uint32_t>(WireBoolFalse);
+struct BlindShape {
+  uint8_t wt = 0;
+  uint8_t key_wt = 0;
+  bool any_map = false;
+  std::shared_ptr<const BlindShape> elem;
+};
+
+[[nodiscard]] inline std::pair<std::shared_ptr<const BlindShape>, bool> unify_blind_shapes(
+    const std::shared_ptr<const BlindShape>& a,
+    const std::shared_ptr<const BlindShape>& b) {
+  if (!a) return {b, true};
+  if (!b) return {a, true};
+  if (a->wt != b->wt) return {nullptr, false};
+  if (a->wt == WireMap) {
+    if (a->any_map) return {b, true};
+    if (b->any_map) return {a, true};
+    if (a->key_wt != b->key_wt) return {nullptr, false};
   }
-  if (wt == WireArray || wt == WireMap) {
-    const uint64_t min_len = (wt == WireMap) ? 3 : 2;
-    auto body_res = read_len_slice(data, pos, min_len);
+  if (a->wt != WireArray && a->wt != WireMap) {
+    return {a, true};
+  }
+  auto [u, ok] = unify_blind_shapes(a->elem, b->elem);
+  if (!ok) return {nullptr, false};
+  return {std::make_shared<BlindShape>(BlindShape{a->wt, a->key_wt, false, std::move(u)}), true};
+}
+
+struct BlindContainerShapeResult {
+  std::shared_ptr<const BlindShape> shape;
+  size_t next_pos = 0;
+};
+
+[[nodiscard]] inline Result<BlindContainerShapeResult> parse_blind_container_shape(
+    std::span<const uint8_t> data,
+    size_t pos,
+    uint8_t wt,
+    int depth,
+    DecodeState& state) {
+  if (depth + 1 > state.opts.max_depth) {
+    return Error{"omnibuf: container nesting depth exceeds max_depth"};
+  }
+  if (wt == WireArray) {
+    auto body_res = read_len_slice(data, pos, 2);
     if (!body_res) return Error{body_res.error()};
     const auto body = body_res.value().slice;
-    uint32_t shape = static_cast<uint32_t>(wt) | (static_cast<uint32_t>(body[0]) << 8);
-    if (wt == WireMap) {
-      shape |= static_cast<uint32_t>(body[1]) << 16;
+    const size_t next_pos = body_res.value().next_pos;
+    const auto hdr = parse_array_header(body);
+    if (!hdr.ok) {
+      return Error{"omnibuf: invalid WireArray header"};
     }
-    return shape;
+    if (hdr.elem_wt != WireArray && hdr.elem_wt != WireMap) {
+      auto leaf = std::make_shared<BlindShape>(BlindShape{hdr.elem_wt, 0, false, nullptr});
+      auto outer = std::make_shared<BlindShape>(BlindShape{WireArray, 0, false, std::move(leaf)});
+      return BlindContainerShapeResult{std::move(outer), next_pos};
+    }
+    if (hdr.count == 0) {
+      auto inner = (hdr.elem_wt == WireArray)
+                       ? std::make_shared<BlindShape>(BlindShape{WireArray, 0, false, nullptr})
+                       : std::make_shared<BlindShape>(BlindShape{WireMap, 0, true, nullptr});
+      auto outer = std::make_shared<BlindShape>(BlindShape{WireArray, 0, false, std::move(inner)});
+      return BlindContainerShapeResult{std::move(outer), next_pos};
+    }
+    std::shared_ptr<const BlindShape> merged;
+    size_t p = hdr.pos;
+    for (size_t i = 0; i < hdr.count; ++i) {
+      auto elem_res = parse_blind_container_shape(body, p, hdr.elem_wt, depth + 1, state);
+      if (!elem_res) return Error{elem_res.error()};
+      auto [u, compat] = unify_blind_shapes(merged, elem_res.value().shape);
+      if (!compat) {
+        return Error{"omnibuf: inconsistent nested container element shapes in WireArray"};
+      }
+      merged = std::move(u);
+      p = elem_res.value().next_pos;
+    }
+    if (p != body.size()) {
+      return Error{"omnibuf: WireArray count/length mismatch"};
+    }
+    auto outer = std::make_shared<BlindShape>(BlindShape{WireArray, 0, false, std::move(merged)});
+    return BlindContainerShapeResult{std::move(outer), next_pos};
   }
-  return static_cast<uint32_t>(wt);
+
+  auto body_res = read_len_slice(data, pos, 3);
+  if (!body_res) return Error{body_res.error()};
+  const auto body = body_res.value().slice;
+  const size_t next_pos = body_res.value().next_pos;
+  const auto hdr = parse_map_header(body);
+  if (!hdr.ok) {
+    return Error{"omnibuf: invalid WireMap header"};
+  }
+  if (hdr.val_wt != WireArray && hdr.val_wt != WireMap) {
+    auto leaf = std::make_shared<BlindShape>(BlindShape{hdr.val_wt, 0, false, nullptr});
+    auto outer =
+        std::make_shared<BlindShape>(BlindShape{WireMap, hdr.key_wt, false, std::move(leaf)});
+    return BlindContainerShapeResult{std::move(outer), next_pos};
+  }
+  if (hdr.count == 0) {
+    auto inner = (hdr.val_wt == WireArray)
+                     ? std::make_shared<BlindShape>(BlindShape{WireArray, 0, false, nullptr})
+                     : std::make_shared<BlindShape>(BlindShape{WireMap, 0, true, nullptr});
+    auto outer =
+        std::make_shared<BlindShape>(BlindShape{WireMap, hdr.key_wt, false, std::move(inner)});
+    return BlindContainerShapeResult{std::move(outer), next_pos};
+  }
+  std::shared_ptr<const BlindShape> merged;
+  size_t p = hdr.pos;
+  for (size_t i = 0; i < hdr.count; ++i) {
+    auto next_p = validate_container_entry(body, p, hdr.key_wt, depth + 1, state);
+    if (!next_p) return Error{next_p.error()};
+    auto val_res = parse_blind_container_shape(body, next_p.value(), hdr.val_wt, depth + 1, state);
+    if (!val_res) return Error{val_res.error()};
+    auto [u, compat] = unify_blind_shapes(merged, val_res.value().shape);
+    if (!compat) {
+      return Error{"omnibuf: inconsistent nested container value shapes in WireMap"};
+    }
+    merged = std::move(u);
+    p = val_res.value().next_pos;
+  }
+  if (p != body.size()) {
+    return Error{"omnibuf: WireMap trailing bytes"};
+  }
+  auto outer =
+      std::make_shared<BlindShape>(BlindShape{WireMap, hdr.key_wt, false, std::move(merged)});
+  return BlindContainerShapeResult{std::move(outer), next_pos};
+}
+
+[[nodiscard]] inline Result<std::shared_ptr<const BlindShape>> blind_field_shape(
+    std::span<const uint8_t> data,
+    size_t pos,
+    uint8_t wt,
+    int depth,
+    DecodeState& state) {
+  if (wt == WireBoolTrue) {
+    wt = WireBoolFalse;
+  }
+  if (wt != WireArray && wt != WireMap) {
+    return std::make_shared<const BlindShape>(BlindShape{wt, 0, false, nullptr});
+  }
+  auto res = parse_blind_container_shape(data, pos, wt, depth, state);
+  if (!res) return Error{res.error()};
+  return res.value().shape;
 }
 
 [[nodiscard]] inline Result<BlindObject> decode_blind_with_schema(
     std::span<const uint8_t> data,
     const std::shared_ptr<const BlindSchema>& inherited,
-    int depth);
+    int depth,
+    DecodeState& state);
 
 [[nodiscard]] inline Result<void> decode_array_body_blind(
     BlindArray& dst,
     std::span<const uint8_t> body,
     const std::shared_ptr<const BlindSchema>& child_schema,
-    int depth);
+    int depth,
+    DecodeState& state);
 
 [[nodiscard]] inline Result<void> decode_map_body_blind(
     BlindObject& dst,
     std::span<const uint8_t> body,
     const std::shared_ptr<const BlindSchema>& child_schema,
-    int depth);
+    int depth,
+    DecodeState& state);
 
 struct MapKeyResult {
   std::string key;
@@ -278,7 +402,8 @@ struct MapValResult {
     size_t p,
     uint8_t val_wt,
     const std::shared_ptr<const BlindSchema>& child_schema,
-    int depth) {
+    int depth,
+    DecodeState& state) {
   switch (val_wt) {
     case WireUint: {
       const auto [v, vn] = decode_varint(body.subspan(p));
@@ -308,7 +433,8 @@ struct MapValResult {
     case WireSubMsg: {
       auto sub_res = read_len_slice(body, p, 0);
       if (!sub_res) return Error{sub_res.error()};
-      auto sub_obj = decode_blind_with_schema(sub_res.value().slice, child_schema, depth + 1);
+      auto sub_obj =
+          decode_blind_with_schema(sub_res.value().slice, child_schema, depth + 1, state);
       if (!sub_obj) return Error{sub_obj.error()};
       return MapValResult{BlindValue(std::move(sub_obj.value())), sub_res.value().next_pos};
     }
@@ -316,7 +442,8 @@ struct MapValResult {
       auto arr_slice = read_len_slice(body, p, 2);
       if (!arr_slice) return Error{arr_slice.error()};
       BlindArray arr;
-      auto arr_res = decode_array_body_blind(arr, arr_slice.value().slice, child_schema, depth + 1);
+      auto arr_res =
+          decode_array_body_blind(arr, arr_slice.value().slice, child_schema, depth + 1, state);
       if (!arr_res) return Error{arr_res.error()};
       return MapValResult{BlindValue(std::move(arr)), arr_slice.value().next_pos};
     }
@@ -324,7 +451,8 @@ struct MapValResult {
       auto map_slice = read_len_slice(body, p, 3);
       if (!map_slice) return Error{map_slice.error()};
       BlindObject mp;
-      auto map_res = decode_map_body_blind(mp, map_slice.value().slice, child_schema, depth + 1);
+      auto map_res =
+          decode_map_body_blind(mp, map_slice.value().slice, child_schema, depth + 1, state);
       if (!map_res) return Error{map_res.error()};
       return MapValResult{BlindValue(std::move(mp)), map_slice.value().next_pos};
     }
@@ -371,16 +499,20 @@ struct MapValResult {
     BlindArray& dst,
     std::span<const uint8_t> body,
     const std::shared_ptr<const BlindSchema>& child_schema,
-    int depth) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf: array nesting depth exceeds MAX_CONTAINER_DEPTH"};
+    int depth,
+    DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf: array nesting depth exceeds max_depth"};
   }
   const auto hdr = parse_array_header(body);
   if (!hdr.ok) {
     return Error{"omnibuf: invalid WireArray header"};
   }
+  if (!state.charge_elements(hdr.count)) {
+    return Error{"omnibuf: WireArray exceeds max_total_elements"};
+  }
   size_t p = hdr.pos;
-  dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
+  dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
 
   if (hdr.elem_wt == WireExtended) {
     if (hdr.count > 0) {
@@ -393,7 +525,7 @@ struct MapValResult {
   }
 
   for (size_t i = 0; i < hdr.count; ++i) {
-    auto elem_res = decode_map_val_blind(body, p, hdr.elem_wt, child_schema, depth);
+    auto elem_res = decode_map_val_blind(body, p, hdr.elem_wt, child_schema, depth, state);
     if (!elem_res) return Error{elem_res.error()};
     dst.push_back(std::move(elem_res.value().val));
     p = elem_res.value().next_pos;
@@ -408,19 +540,24 @@ struct MapValResult {
     BlindObject& dst,
     std::span<const uint8_t> body,
     const std::shared_ptr<const BlindSchema>& child_schema,
-    int depth) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf: map nesting depth exceeds MAX_CONTAINER_DEPTH"};
+    int depth,
+    DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf: map nesting depth exceeds max_depth"};
   }
   const auto hdr = parse_map_header(body);
   if (!hdr.ok) {
     return Error{"omnibuf: invalid WireMap header"};
   }
+  if (!state.charge_elements(hdr.count)) {
+    return Error{"omnibuf: WireMap exceeds max_total_elements"};
+  }
   size_t p = hdr.pos;
   for (size_t i = 0; i < hdr.count; ++i) {
     auto k_res = decode_map_key_blind(body, p, hdr.key_wt);
     if (!k_res) return Error{k_res.error()};
-    auto v_res = decode_map_val_blind(body, k_res.value().next_pos, hdr.val_wt, child_schema, depth);
+    auto v_res = decode_map_val_blind(
+        body, k_res.value().next_pos, hdr.val_wt, child_schema, depth, state);
     if (!v_res) return Error{v_res.error()};
     dst[std::move(k_res.value().key)] = std::move(v_res.value().val);
     p = v_res.value().next_pos;
@@ -434,9 +571,13 @@ struct MapValResult {
 [[nodiscard]] inline Result<BlindObject> decode_blind_with_schema(
     std::span<const uint8_t> data,
     const std::shared_ptr<const BlindSchema>& inherited,
-    int depth) {
-  if (depth > MAX_CONTAINER_DEPTH) {
-    return Error{"omnibuf: message nesting depth exceeds MAX_CONTAINER_DEPTH"};
+    int depth,
+    DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf: message nesting depth exceeds max_depth"};
+  }
+  if (data.size() > state.opts.max_message_bytes) {
+    return Error{"omnibuf: message exceeds max_message_bytes"};
   }
   BlindObject out;
   if (data.empty()) {
@@ -460,7 +601,7 @@ struct MapValResult {
       }
       auto f0_body = read_len_slice(data, scan, 0);
       if (!f0_body) return Error{f0_body.error()};
-      auto meta = decode_schema_meta(f0_body.value().slice, depth + 1);
+      auto meta = decode_schema_meta(f0_body.value().slice, depth + 1, state);
       if (!meta) return Error{meta.error()};
       local_schema = merge_schema_meta(local_schema, meta.value());
       scan = f0_body.value().next_pos;
@@ -480,7 +621,7 @@ struct MapValResult {
   }
 
   std::map<uint32_t, std::vector<uint8_t>> sub_packets;
-  std::unordered_map<uint32_t, uint32_t> shapes;
+  std::unordered_map<uint32_t, std::shared_ptr<const BlindShape>> shapes;
   std::unordered_map<std::string, uint32_t> owners;
 
   size_t pos = 0;
@@ -510,12 +651,17 @@ struct MapValResult {
     }
     owners[name] = field_num;
 
-    auto shape_res = blind_field_shape(data, pos, wt);
+    auto shape_res = blind_field_shape(data, pos, wt, depth, state);
     if (!shape_res) return Error{shape_res.error()};
-    if (auto it = shapes.find(field_num); it != shapes.end() && it->second != shape_res.value()) {
-      return Error{"omnibuf: field changes wire shape within one message"};
+    auto shape_ptr = std::move(shape_res.value());
+    if (auto it = shapes.find(field_num); it != shapes.end()) {
+      auto [u, compat] = unify_blind_shapes(it->second, shape_ptr);
+      if (!compat) {
+        return Error{"omnibuf: field changes wire shape within one message"};
+      }
+      shape_ptr = std::move(u);
     }
-    shapes[field_num] = shape_res.value();
+    shapes[field_num] = std::move(shape_ptr);
 
     const auto child_schema = BlindSchema::child_of(active_schema, field_num);
 
@@ -560,6 +706,8 @@ struct MapValResult {
         auto sub_res = read_len_slice(data, pos, 0);
         if (!sub_res) return Error{sub_res.error()};
         const auto sp = sub_res.value().slice;
+        auto vr = validate_message_bytes(sp, depth + 1, state);
+        if (!vr) return Error{vr.error()};
         auto& buf = sub_packets[field_num];
         buf.insert(buf.end(), sp.begin(), sp.end());
         pos = sub_res.value().next_pos;
@@ -571,12 +719,14 @@ struct MapValResult {
         auto it = out.find(name);
         if (it == out.end() || !std::holds_alternative<BlindArray>(it->second.v)) {
           BlindArray arr;
-          auto a_res = decode_array_body_blind(arr, arr_slice.value().slice, child_schema, depth + 1);
+          auto a_res =
+              decode_array_body_blind(arr, arr_slice.value().slice, child_schema, depth + 1, state);
           if (!a_res) return Error{a_res.error()};
           out[name] = BlindValue(std::move(arr));
         } else {
           auto& arr = std::get<BlindArray>(it->second.v);
-          auto a_res = decode_array_body_blind(arr, arr_slice.value().slice, child_schema, depth + 1);
+          auto a_res =
+              decode_array_body_blind(arr, arr_slice.value().slice, child_schema, depth + 1, state);
           if (!a_res) return Error{a_res.error()};
         }
         pos = arr_slice.value().next_pos;
@@ -588,12 +738,14 @@ struct MapValResult {
         auto it = out.find(name);
         if (it == out.end() || !std::holds_alternative<BlindObject>(it->second.v)) {
           BlindObject mp;
-          auto m_res = decode_map_body_blind(mp, map_slice.value().slice, child_schema, depth + 1);
+          auto m_res =
+              decode_map_body_blind(mp, map_slice.value().slice, child_schema, depth + 1, state);
           if (!m_res) return Error{m_res.error()};
           out[name] = BlindValue(std::move(mp));
         } else {
           auto& mp = std::get<BlindObject>(it->second.v);
-          auto m_res = decode_map_body_blind(mp, map_slice.value().slice, child_schema, depth + 1);
+          auto m_res =
+              decode_map_body_blind(mp, map_slice.value().slice, child_schema, depth + 1, state);
           if (!m_res) return Error{m_res.error()};
         }
         pos = map_slice.value().next_pos;
@@ -642,7 +794,7 @@ struct MapValResult {
       name = "field_" + int_to_dec(field_num);
     }
     const auto child_schema = BlindSchema::child_of(active_schema, field_num);
-    auto sub_obj = decode_blind_with_schema(packet, child_schema, depth + 1);
+    auto sub_obj = decode_blind_with_schema(packet, child_schema, depth + 1, state);
     if (!sub_obj) return Error{sub_obj.error()};
     out[name] = BlindValue(std::move(sub_obj.value()));
   }
@@ -711,6 +863,10 @@ inline void append_blind_value_json(std::string& out,
             out += "null";
             return;
           }
+          if (x == 0 && std::signbit(x)) {
+            out += "-0";
+            return;
+          }
           char buf[64];
           auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), x);
           (void)ec;
@@ -745,30 +901,31 @@ inline void append_blind_value_json(std::string& out,
 }  // namespace detail
 
 // Decodes any OmniBuf packet without a compile-time schema.
-[[nodiscard]] inline Result<BlindObject> decode_blind(std::span<const uint8_t> packet) {
-  return detail::decode_blind_with_schema(packet, nullptr, 0);
+[[nodiscard]] inline Result<BlindObject> decode_blind(std::span<const uint8_t> packet,
+                                                      DecodeOptions opts = {}) {
+  DecodeState state{opts, 0};
+  return detail::decode_blind_with_schema(packet, nullptr, 0, state);
 }
 
 // Serializes a BlindObject to canonical RFC 8259 JSON with sorted keys, exact 64-bit integers,
 // shortest round-trip IEEE-754 float/double representation, and Base64 for bytes.
-// When fallback_on_non_finite is true, returns "{}" if NaN or Inf is encountered.
-[[nodiscard]] inline std::string stringify_blind_json(const BlindObject& obj,
-                                                      bool fallback_on_non_finite = true) {
+// Rejects non-finite IEEE-754 floats (NaN or Inf), which have no valid RFC 8259 representation.
+[[nodiscard]] inline Result<std::string> stringify_blind_json(const BlindObject& obj) {
   std::string out;
   out.reserve(256);
   bool has_non_finite = false;
   detail::append_blind_value_json(out, BlindValue(obj), has_non_finite);
-  if (has_non_finite && fallback_on_non_finite) {
-    return "{}";
+  if (has_non_finite) {
+    return Error{"omnibuf: non-finite float cannot be serialized to RFC 8259 JSON"};
   }
   return out;
 }
 
 [[nodiscard]] inline Result<std::string> decode_blind_json(std::span<const uint8_t> packet,
-                                                           bool fallback_on_non_finite = true) {
-  auto res = decode_blind(packet);
+                                                           DecodeOptions opts = {}) {
+  auto res = decode_blind(packet, opts);
   if (!res) return Error{res.error()};
-  return stringify_blind_json(res.value(), fallback_on_non_finite);
+  return stringify_blind_json(res.value());
 }
 
 }  // namespace omnibuf

@@ -7,11 +7,14 @@
 #include <cstdint>
 #include <map>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
+#include "omnibuf/utf8.hpp"
 #include "omnibuf/varint.hpp"
 
 namespace omnibuf {
@@ -24,6 +27,11 @@ concept IntOrUint = std::integral<T> && !std::same_as<T, bool>;
 }  // namespace detail
 
 inline void encode_string_arr(std::vector<uint8_t>& dst, std::span<const std::string> items) {
+  for (const auto& s : items) {
+    if (!is_valid_utf8(s)) [[unlikely]] {
+      throw std::invalid_argument("omnibuf: invalid UTF-8 in WireString");
+    }
+  }
   const size_t len_pos = dst.size();
   dst.push_back(0);
   dst.push_back(0);
@@ -92,6 +100,9 @@ template <detail::IntOrUint T>
 inline void encode_fixed32_arr(std::vector<uint8_t>& dst,
                                std::span<const T> items,
                                uint8_t elem_wt = WireFixed32) {
+  if (items.size() > SIZE_MAX / 4) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = dst.size();
   dst.push_back(0);
   dst.push_back(0);
@@ -107,6 +118,9 @@ template <detail::IntOrUint T>
 inline void encode_fixed64_arr(std::vector<uint8_t>& dst,
                                std::span<const T> items,
                                uint8_t elem_wt = WireFixed64) {
+  if (items.size() > SIZE_MAX / 8) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = dst.size();
   dst.push_back(0);
   dst.push_back(0);
@@ -119,6 +133,9 @@ inline void encode_fixed64_arr(std::vector<uint8_t>& dst,
 }
 
 inline void encode_float32_arr(std::vector<uint8_t>& dst, std::span<const float> items) {
+  if (items.size() > SIZE_MAX / 4) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = dst.size();
   dst.push_back(0);
   dst.push_back(0);
@@ -131,6 +148,9 @@ inline void encode_float32_arr(std::vector<uint8_t>& dst, std::span<const float>
 }
 
 inline void encode_float64_arr(std::vector<uint8_t>& dst, std::span<const double> items) {
+  if (items.size() > SIZE_MAX / 8) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = dst.size();
   dst.push_back(0);
   dst.push_back(0);
@@ -145,6 +165,11 @@ inline void encode_float64_arr(std::vector<uint8_t>& dst, std::span<const double
 // std::map<std::string, uint64_t> is already ordered lexicographically.
 inline void encode_map_string_uint(std::vector<uint8_t>& dst,
                                    const std::map<std::string, uint64_t>& m) {
+  for (const auto& [k, _] : m) {
+    if (!is_valid_utf8(k)) [[unlikely]] {
+      throw std::invalid_argument("omnibuf: invalid UTF-8 in WireString");
+    }
+  }
   const size_t len_pos = dst.size();
   dst.push_back(0);
   dst.push_back(0);
@@ -162,6 +187,11 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
 inline void encode_map_string_uint(std::vector<uint8_t>& dst,
                                    const std::unordered_map<std::string, uint64_t>& m,
                                    bool deterministic = true) {
+  for (const auto& [k, _] : m) {
+    if (!is_valid_utf8(k)) [[unlikely]] {
+      throw std::invalid_argument("omnibuf: invalid UTF-8 in WireString");
+    }
+  }
   const size_t len_pos = dst.size();
   dst.push_back(0);
   dst.push_back(0);
@@ -191,15 +221,26 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
 }
 
 // FastWriter overloads for register-resident generated and struct encoding.
-inline void encode_string_arr(FastWriter& w, std::span<const std::string> items) {
+[[nodiscard]] inline const char* try_encode_string_arr(FastWriter& w,
+                                                       std::span<const std::string> items) {
   const size_t len_pos = w.reserve_len_2b();
   w.write_byte(WireString);
   w.write_varint(items.size());
   for (const auto& s : items) {
+    if (!is_valid_utf8(s)) [[unlikely]] {
+      return "omnibuf: invalid UTF-8 in WireString";
+    }
     w.write_varint(s.size());
     w.write_bytes(s.data(), s.size());
   }
   w.backpatch_len(len_pos);
+  return nullptr;
+}
+
+inline void encode_string_arr(FastWriter& w, std::span<const std::string> items) {
+  if (const char* err = try_encode_string_arr(w, items)) [[unlikely]] {
+    throw std::invalid_argument(err);
+  }
 }
 
 inline void encode_bytes_arr(FastWriter& w, std::span<const std::vector<uint8_t>> items) {
@@ -250,6 +291,9 @@ template <detail::IntOrUint T>
 inline void encode_fixed32_arr(FastWriter& w,
                                std::span<const T> items,
                                uint8_t elem_wt = WireFixed32) {
+  if (items.size() > SIZE_MAX / 4) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = w.reserve_len_2b();
   w.write_byte(elem_wt);
   w.write_varint(items.size());
@@ -264,6 +308,9 @@ template <detail::IntOrUint T>
 inline void encode_fixed64_arr(FastWriter& w,
                                std::span<const T> items,
                                uint8_t elem_wt = WireFixed64) {
+  if (items.size() > SIZE_MAX / 8) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = w.reserve_len_2b();
   w.write_byte(elem_wt);
   w.write_varint(items.size());
@@ -275,6 +322,9 @@ inline void encode_fixed64_arr(FastWriter& w,
 }
 
 inline void encode_float32_arr(FastWriter& w, std::span<const float> items) {
+  if (items.size() > SIZE_MAX / 4) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = w.reserve_len_2b();
   w.write_byte(WireFloat32);
   w.write_varint(items.size());
@@ -286,6 +336,9 @@ inline void encode_float32_arr(FastWriter& w, std::span<const float> items) {
 }
 
 inline void encode_float64_arr(FastWriter& w, std::span<const double> items) {
+  if (items.size() > SIZE_MAX / 8) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
   const size_t len_pos = w.reserve_len_2b();
   w.write_byte(WireFloat64);
   w.write_varint(items.size());
@@ -296,17 +349,94 @@ inline void encode_float64_arr(FastWriter& w, std::span<const double> items) {
   w.backpatch_len(len_pos);
 }
 
-inline void encode_map_string_uint(FastWriter& w, const std::map<std::string, uint64_t>& m) {
+template <uint8_t WT, typename T>
+[[nodiscard]] inline const char* try_encode_container_scalar(FastWriter& w, const T& val) {
+  if constexpr (WT == WireUint) {
+    w.write_varint(static_cast<uint64_t>(val));
+    return nullptr;
+  } else if constexpr (WT == WireSint) {
+    w.write_varint(encode_zigzag(static_cast<int64_t>(val)));
+    return nullptr;
+  } else if constexpr (WT == WireBoolFalse) {
+    w.write_byte(val ? uint8_t{1} : uint8_t{0});
+    return nullptr;
+  } else if constexpr (WT == WireFixed32 || WT == WireSfixed32) {
+    w.write_u32_raw(static_cast<uint32_t>(val));
+    return nullptr;
+  } else if constexpr (WT == WireFloat32) {
+    w.write_u32_raw(float32_to_bits(val));
+    return nullptr;
+  } else if constexpr (WT == WireFixed64 || WT == WireSfixed64) {
+    w.write_u64_raw(static_cast<uint64_t>(val));
+    return nullptr;
+  } else if constexpr (WT == WireFloat64) {
+    w.write_u64_raw(float64_to_bits(val));
+    return nullptr;
+  } else if constexpr (WT == WireString) {
+    if (!is_valid_utf8(val)) [[unlikely]] {
+      return "omnibuf: invalid UTF-8 in WireString";
+    }
+    w.write_varint(val.size());
+    w.write_bytes(val.data(), val.size());
+    return nullptr;
+  } else if constexpr (WT == WireBytes) {
+    w.write_varint(val.size());
+    w.write_bytes(val.data(), val.size());
+    return nullptr;
+  } else {
+    return "omnibuf: unsupported scalar container wire type";
+  }
+}
+
+template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
+[[nodiscard]] inline const char* try_encode_scalar_map(FastWriter& w, const MapT& m) {
   const size_t len_pos = w.reserve_len_2b();
-  w.write_byte(WireString);
-  w.write_byte(WireUint);
+  w.write_byte(KeyWT);
+  w.write_byte(ValWT);
   w.write_varint(m.size());
   for (const auto& [k, v] : m) {
-    w.write_varint(k.size());
-    w.write_bytes(k.data(), k.size());
-    w.write_varint(v);
+    if (const char* err = try_encode_container_scalar<KeyWT>(w, k)) [[unlikely]] {
+      return err;
+    }
+    if (const char* err = try_encode_container_scalar<ValWT>(w, v)) [[unlikely]] {
+      return err;
+    }
   }
   w.backpatch_len(len_pos);
+  return nullptr;
+}
+
+template <uint8_t KeyWT, typename MapT, typename SubEncodeFn>
+[[nodiscard]] inline const char* try_encode_submsg_map(FastWriter& w,
+                                                       const MapT& m,
+                                                       SubEncodeFn&& encode_sub) {
+  const size_t len_pos = w.reserve_len_2b();
+  w.write_byte(KeyWT);
+  w.write_byte(WireSubMsg);
+  w.write_varint(m.size());
+  for (const auto& [k, v] : m) {
+    if (const char* err = try_encode_container_scalar<KeyWT>(w, k)) [[unlikely]] {
+      return err;
+    }
+    const size_t sub_len_pos = w.reserve_len_2b();
+    if (const char* err = encode_sub(w, v)) [[unlikely]] {
+      return err;
+    }
+    w.backpatch_len(sub_len_pos);
+  }
+  w.backpatch_len(len_pos);
+  return nullptr;
+}
+
+template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
+inline void encode_scalar_map(FastWriter& w, const MapT& m) {
+  if (const char* err = try_encode_scalar_map<KeyWT, ValWT>(w, m)) [[unlikely]] {
+    throw std::invalid_argument(err);
+  }
+}
+
+inline void encode_map_string_uint(FastWriter& w, const std::map<std::string, uint64_t>& m) {
+  encode_scalar_map<WireString, WireUint>(w, m);
 }
 
 // Single-pass forward streaming Encoder with inline stack fast-path and dynamic overflow growth.
@@ -321,13 +451,21 @@ class Encoder {
     depth_ = 0;
   }
 
+  [[nodiscard]] size_t depth() const noexcept { return depth_; }
   [[nodiscard]] std::span<const uint8_t> bytes() const noexcept { return buf_; }
   [[nodiscard]] const std::vector<uint8_t>& vector() const noexcept { return buf_; }
-  [[nodiscard]] std::vector<uint8_t> finish() && noexcept {
-    depth_ = 0;
+  [[nodiscard]] std::vector<uint8_t> finish() && {
+    if (depth_ != 0) [[unlikely]] {
+      throw std::logic_error("omnibuf: Encoder::finish called with unclosed container");
+    }
     return std::move(buf_);
   }
-  [[nodiscard]] std::vector<uint8_t> finish_copy() const { return buf_; }
+  [[nodiscard]] std::vector<uint8_t> finish_copy() const {
+    if (depth_ != 0) [[unlikely]] {
+      throw std::logic_error("omnibuf: Encoder::finish_copy called with unclosed container");
+    }
+    return buf_;
+  }
 
   void write_raw(std::span<const uint8_t> raw) {
     buf_.insert(buf_.end(), raw.begin(), raw.end());
@@ -385,10 +523,20 @@ class Encoder {
     append_u64_le(buf_, float64_to_bits(v));
   }
 
-  void write_string(uint32_t field_num, std::string_view s) {
+  [[nodiscard]] bool try_write_string(uint32_t field_num, std::string_view s) {
+    if (!is_valid_utf8(s)) [[unlikely]] {
+      return false;
+    }
     write_tag(field_num, WireString);
     append_varint(buf_, s.size());
     buf_.insert(buf_.end(), s.begin(), s.end());
+    return true;
+  }
+
+  void write_string(uint32_t field_num, std::string_view s) {
+    if (!try_write_string(field_num, s)) [[unlikely]] {
+      throw std::invalid_argument("omnibuf: invalid UTF-8 in WireString");
+    }
   }
 
   void write_bytes(uint32_t field_num, std::span<const uint8_t> b) {
@@ -483,6 +631,10 @@ class Encoder {
   }
 
   void increment_parent_count() {
+    if (depth_ == 0) [[unlikely]] {
+      throw std::logic_error(
+          "omnibuf: Encoder::begin_submsg_elem called without active array container");
+    }
     const size_t parent = depth_ - 1;
     if (parent < kInlineStackSize) {
       ++count_stack_[parent];
@@ -492,6 +644,9 @@ class Encoder {
   }
 
   Frame pop_frame() {
+    if (depth_ == 0) [[unlikely]] {
+      throw std::logic_error("omnibuf: Encoder container stack underflow");
+    }
     --depth_;
     if (depth_ < kInlineStackSize) {
       return {len_stack_[depth_], count_stack_[depth_]};

@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -114,9 +115,9 @@ struct TreeNode {
   uint32_t id = 0;
   std::string name{};
   int64_t weight = 0;
-  std::unique_ptr<TreeNode> primary{};
+  omnibuf::Box<TreeNode> primary{};
   std::vector<TreeNode> children{};
-  std::vector<std::unique_ptr<TreeNode>> branches{};
+  std::vector<omnibuf::Box<TreeNode>> branches{};
   std::map<std::string, uint64_t> labels{};
 };
 
@@ -342,13 +343,18 @@ std::string repeat_str(std::string_view part, size_t count) {
 }
 
 std::optional<std::string> check_splice_aliased_prefix(std::span<const uint8_t> packet) {
-  auto append_dirty = [](std::vector<uint8_t>& dst, uint16_t fnum) {
+  auto append_dirty = [](std::vector<uint8_t>& dst, uint32_t fnum) -> const char* {
     omnibuf::append_varint(dst, (static_cast<uint64_t>(fnum) << 4) | omnibuf::WireUint);
     omnibuf::append_varint(dst, uint64_t{1} << 40);
+    return nullptr;
   };
 
-  const std::vector<uint8_t> spliced =
-      omnibuf::splice_fields({}, packet, uint64_t{1} << 1, 2, append_dirty);
+  auto spliced_res =
+      omnibuf::try_splice_fields({}, packet, uint64_t{1} << 1, 2, append_dirty);
+  if (!spliced_res) {
+    return spliced_res.error();
+  }
+  const std::vector<uint8_t>& spliced = spliced_res.value();
 
   for (size_t prefix_len : {size_t{0}, size_t{3}, size_t{32}}) {
     std::vector<uint8_t> prefix(prefix_len, uint8_t{0xa5});
@@ -357,8 +363,6 @@ std::optional<std::string> check_splice_aliased_prefix(std::span<const uint8_t> 
     storage.insert(storage.end(), prefix.begin(), prefix.end());
     storage.insert(storage.end(), packet.begin(), packet.end());
 
-    // Exercise both slice-oriented splice_fields (storage[:prefix_len] / storage[prefix_len:])
-    // and in-place vector splice_fields_into when raw aliases dst's unused capacity.
     const std::span<const uint8_t> aliased_raw(storage.data() + prefix_len, packet.size());
 
     std::vector<uint8_t> want;
@@ -366,22 +370,32 @@ std::optional<std::string> check_splice_aliased_prefix(std::span<const uint8_t> 
     want.insert(want.end(), prefix.begin(), prefix.end());
     want.insert(want.end(), spliced.begin(), spliced.end());
 
-    const auto got = omnibuf::splice_fields(std::span<uint8_t>(storage), prefix_len, aliased_raw,
-                                            uint64_t{1} << 1, 2, append_dirty);
-    if (got != want) {
+    const auto got_res = omnibuf::try_splice_fields(
+        std::span<uint8_t>(storage), prefix_len, aliased_raw, uint64_t{1} << 1, 2, append_dirty);
+    if (!got_res) {
+      return got_res.error();
+    }
+    if (got_res.value() != want) {
       return "opaque splice with aliased prefix changed prefix or output";
     }
     if (!std::equal(packet.begin(), packet.end(), storage.data() + prefix_len)) {
       return "opaque splice with aliased prefix modified source packet";
     }
 
-    const uint8_t* raw_ptr = storage.data() + prefix_len;
-    const size_t pkt_len = packet.size();
-    storage.resize(prefix_len);
-    omnibuf::splice_fields_into(storage, std::span<const uint8_t>(raw_ptr, pkt_len),
-                                uint64_t{1} << 1, 2, append_dirty);
-    if (storage != want) {
-      return "opaque splice_fields_into with aliased prefix changed prefix or output";
+    // Exercise self-aliasing splice_fields_into when raw points inside dst's live buffer.
+    std::vector<uint8_t> self_buf;
+    self_buf.reserve(packet.size() + 256);
+    self_buf.insert(self_buf.end(), packet.begin(), packet.end());
+    const std::span<const uint8_t> self_raw(self_buf.data(), self_buf.size());
+    std::vector<uint8_t> self_want = self_buf;
+    self_want.insert(self_want.end(), spliced.begin(), spliced.end());
+    const auto self_res =
+        omnibuf::try_splice_fields_into(self_buf, self_raw, uint64_t{1} << 1, 2, append_dirty);
+    if (!self_res) {
+      return self_res.error();
+    }
+    if (self_buf != self_want) {
+      return "opaque splice_fields_into with self-aliased raw corrupted output";
     }
   }
   return std::nullopt;
@@ -395,21 +409,31 @@ ipc::ConformanceResponse handle_blind(const ipc::ConformanceRequest& req) {
     return resp;
   }
   if (req.requested_output_format == ipc::kWireFormatJson) {
-    resp.json_payload = omnibuf::stringify_blind_json(blind_res.value(), true);
+    auto js_res = omnibuf::stringify_blind_json(blind_res.value());
+    if (!js_res) {
+      resp.json_payload = "{}";
+    } else {
+      resp.json_payload = std::move(js_res.value());
+    }
   }
   return resp;
 }
 
 ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) {
   ipc::ConformanceResponse resp;
-  if (req.test_opaque_splice || req.test_opaque_splice_shrink) {
-    if (auto err = check_splice_aliased_prefix(req.omnibuf_payload)) {
-      resp.runtime_error = *err;
-      return resp;
-    }
-  }
 
   if (req.message_type == "omnibuf.bench.PeerUpdate") {
+    if (req.test_opaque_splice || req.test_opaque_splice_shrink) {
+      omnibuf::bench::OpaquePeerUpdate probe;
+      probe.unmarshal(req.omnibuf_payload);
+      probe.set_sequence(probe.get_sequence() + uint64_t{1});
+      auto pr = probe.try_marshal();
+      if (!pr) {
+        resp.parse_error = pr.error();
+        return resp;
+      }
+    }
+
     omnibuf::bench::PeerUpdate msg;
     msg.asn = 999999;
     msg.router_id = "stale-router";
@@ -433,15 +457,28 @@ ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) 
       return resp;
     }
 
+    if (req.test_opaque_splice || req.test_opaque_splice_shrink) {
+      if (auto err = check_splice_aliased_prefix(req.omnibuf_payload)) {
+        resp.runtime_error = *err;
+        return resp;
+      }
+    }
+
     omnibuf::bench::OpaquePeerUpdate op;
     op.unmarshal(req.omnibuf_payload);
-    const std::string want_city = msg.location.has_value() ? msg.location->city : "";
+    const omnibuf::bench::Location want_loc =
+        msg.location.value_or(omnibuf::bench::Location{});
+    const auto op_loc = op.get_location();
     if (op.get_asn() != msg.asn || op.get_router_id() != msg.router_id ||
         op.get_active() != msg.active || op.get_uptime_sec() != msg.uptime_sec ||
         op.get_rssi_dbm() != msg.rssi_dbm ||
         omnibuf::float64_to_bits(op.get_cpu_load()) != omnibuf::float64_to_bits(msg.cpu_load) ||
         op.tags_len() != msg.tags.size() || op.prefixes_len() != msg.prefixes.size() ||
-        op.get_location().get_city() != want_city ||
+        op_loc.get_city() != want_loc.city ||
+        omnibuf::float32_to_bits(op_loc.get_latitude()) !=
+            omnibuf::float32_to_bits(want_loc.latitude) ||
+        omnibuf::float32_to_bits(op_loc.get_longitude()) !=
+            omnibuf::float32_to_bits(want_loc.longitude) ||
         op.neighbors_len() != msg.neighbors.size() || op.get_sequence() != msg.sequence) {
       resp.parse_error = "opaque PeerUpdate getter mismatch with decoded struct";
       return resp;
@@ -465,7 +502,12 @@ ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) 
           .longitude = 13.405f,
       });
       op.set_sequence(op.get_sequence() + uint64_t{1});
-      resp.omnibuf_payload = op.marshal_append();
+      auto out = op.try_marshal();
+      if (!out) {
+        resp.serialize_error = out.error();
+        return resp;
+      }
+      resp.omnibuf_payload = std::move(out.value());
       return resp;
     }
 
@@ -487,16 +529,36 @@ ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) 
           .longitude = 2.0f,
       });
       op.set_sequence(2);
-      resp.omnibuf_payload = op.marshal_append();
+      auto out = op.try_marshal();
+      if (!out) {
+        resp.serialize_error = out.error();
+        return resp;
+      }
+      resp.omnibuf_payload = std::move(out.value());
       return resp;
     }
 
-    resp.omnibuf_payload =
-        msg.marshal_omnibuf({.deterministic = true, .self_describing = req.self_describing});
+    auto enc = msg.try_marshal_omnibuf({.deterministic = true, .self_describing = req.self_describing});
+    if (!enc) {
+      resp.serialize_error = enc.error();
+      return resp;
+    }
+    resp.omnibuf_payload = std::move(enc.value());
     return resp;
   }
 
   if (req.message_type == "omnibuf.conformance.TestAllTypes") {
+    if (req.test_opaque_splice || req.test_opaque_splice_shrink) {
+      omnibuf::conformance::OpaqueTestAllTypes probe;
+      probe.unmarshal(req.omnibuf_payload);
+      probe.set_f1_uint32(probe.get_f1_uint32() + 1u);
+      auto pr = probe.try_marshal();
+      if (!pr) {
+        resp.parse_error = pr.error();
+        return resp;
+      }
+    }
+
     omnibuf::conformance::TestAllTypes msg;
     msg.f1_uint32 = 999999;
     msg.f5_bool = true;
@@ -519,6 +581,13 @@ ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) 
     if (!dec) {
       resp.parse_error = dec.error();
       return resp;
+    }
+
+    if (req.test_opaque_splice || req.test_opaque_splice_shrink) {
+      if (auto err = check_splice_aliased_prefix(req.omnibuf_payload)) {
+        resp.runtime_error = *err;
+        return resp;
+      }
     }
 
     omnibuf::conformance::OpaqueTestAllTypes op;
@@ -593,7 +662,12 @@ ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) 
       op.set_f15_fixed32(0xdeadbeefu);
       op.set_f16_fixed64(0xcafebabedeadbeefULL);
       op.set_f20_overflow_str(repeat_str("overflow20-", 20));
-      resp.omnibuf_payload = op.marshal_append();
+      auto out = op.try_marshal();
+      if (!out) {
+        resp.serialize_error = out.error();
+        return resp;
+      }
+      resp.omnibuf_payload = std::move(out.value());
       return resp;
     }
 
@@ -627,31 +701,71 @@ ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) 
       op.set_f15_fixed32(7);
       op.set_f16_fixed64(9);
       op.set_f20_overflow_str("z");
-      resp.omnibuf_payload = op.marshal_append();
+      auto out = op.try_marshal();
+      if (!out) {
+        resp.serialize_error = out.error();
+        return resp;
+      }
+      resp.omnibuf_payload = std::move(out.value());
       return resp;
     }
 
-    resp.omnibuf_payload =
-        msg.marshal_omnibuf({.deterministic = true, .self_describing = req.self_describing});
+    auto enc = msg.try_marshal_omnibuf({.deterministic = true, .self_describing = req.self_describing});
+    if (!enc) {
+      resp.serialize_error = enc.error();
+      return resp;
+    }
+    resp.omnibuf_payload = std::move(enc.value());
     return resp;
   }
 
-  resp.skipped = "plugin tier generated for PeerUpdate and TestAllTypes";
+  if (req.message_type == "omnibuf.conformance.TreeNode") {
+    omnibuf::conformance::TreeNode msg;
+    msg.id = 999;
+    msg.name = "stale";
+    msg.primary = omnibuf::conformance::TreeNode{.id = 444};
+    auto dec = msg.unmarshal_omnibuf(req.omnibuf_payload);
+    if (!dec) {
+      resp.parse_error = dec.error();
+      return resp;
+    }
+    auto enc = msg.try_marshal_omnibuf({.deterministic = true, .self_describing = req.self_describing});
+    if (!enc) {
+      resp.serialize_error = enc.error();
+      return resp;
+    }
+    resp.omnibuf_payload = std::move(enc.value());
+    return resp;
+  }
+
+  if (req.message_type == "omnibuf.conformance.NestedCluster") {
+    omnibuf::conformance::NestedCluster msg;
+    msg.cluster_name = "stale";
+    msg.epoch = 999;
+    auto dec = msg.unmarshal_omnibuf(req.omnibuf_payload);
+    if (!dec) {
+      resp.parse_error = dec.error();
+      return resp;
+    }
+    auto enc = msg.try_marshal_omnibuf({.deterministic = true, .self_describing = req.self_describing});
+    if (!enc) {
+      resp.serialize_error = enc.error();
+      return resp;
+    }
+    resp.omnibuf_payload = std::move(enc.value());
+    return resp;
+  }
+
+  resp.skipped = "unsupported message_type in plugin tier: " + req.message_type;
   return resp;
 }
 
 ipc::ConformanceResponse handle_protobuf_types_tier(const ipc::ConformanceRequest& req,
                                                     const omnibuf::proto::DescriptorPool& pool) {
   ipc::ConformanceResponse resp;
-  if (req.message_type != "omnibuf.bench.PeerUpdate" &&
-      req.message_type != "omnibuf.conformance.TestAllTypes") {
-    resp.skipped = "protobuf types tier exercises pb.PeerUpdate and pb.TestAllTypes";
-    return resp;
-  }
-
   const auto* desc = pool.find_message(req.message_type);
   if (desc == nullptr) {
-    resp.runtime_error = "missing descriptor for " + req.message_type;
+    resp.skipped = "missing descriptor for " + req.message_type;
     return resp;
   }
 
@@ -706,8 +820,7 @@ ipc::ConformanceResponse handle_annotated_struct_tier(const ipc::ConformanceRequ
     annotated::TreeNode stale;
     stale.id = 888;
     stale.name = "stale-node";
-    stale.primary = std::make_unique<annotated::TreeNode>();
-    stale.primary->id = 444;
+    stale.primary = annotated::TreeNode{.id = 444};
     return roundtrip_annotated(req, std::move(stale));
   }
   if (req.message_type == "omnibuf.conformance.NestedCluster") {
@@ -716,12 +829,17 @@ ipc::ConformanceResponse handle_annotated_struct_tier(const ipc::ConformanceRequ
     stale.epoch = 999;
     return roundtrip_annotated(req, std::move(stale));
   }
-  annotated::TestAllTypes stale;
-  stale.f1_uint32 = 555555;
-  stale.f6_string = "stale";
-  stale.f8_sub_msg = std::make_unique<annotated::AllTypesSubMsg>(
-      annotated::AllTypesSubMsg{.id = 123, .label = "stale", .flag = true, .score = -5});
-  return roundtrip_annotated(req, std::move(stale));
+  if (req.message_type == "omnibuf.conformance.TestAllTypes") {
+    annotated::TestAllTypes stale;
+    stale.f1_uint32 = 555555;
+    stale.f6_string = "stale";
+    stale.f8_sub_msg = std::make_unique<annotated::AllTypesSubMsg>(
+        annotated::AllTypesSubMsg{.id = 123, .label = "stale", .flag = true, .score = -5});
+    return roundtrip_annotated(req, std::move(stale));
+  }
+  ipc::ConformanceResponse resp;
+  resp.skipped = "unsupported message_type in annotated struct tier: " + req.message_type;
+  return resp;
 }
 
 enum class ReadStatus {
@@ -738,6 +856,9 @@ ReadStatus read_exact(int fd, uint8_t* dst, size_t len) {
       return (off == 0) ? ReadStatus::CleanEof : ReadStatus::Error;
     }
     if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       return ReadStatus::Error;
     }
     off += static_cast<size_t>(n);
@@ -749,7 +870,13 @@ bool write_exact(int fd, const uint8_t* src, size_t len) {
   size_t off = 0;
   while (off < len) {
     const ssize_t n = ::write(fd, src + off, len - off);
-    if (n <= 0) {
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    if (n == 0) {
       return false;
     }
     off += static_cast<size_t>(n);

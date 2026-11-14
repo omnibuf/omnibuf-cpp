@@ -1,17 +1,21 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "omnibuf/decoder.hpp"
+#include "omnibuf/field0.hpp"
 #include "omnibuf/utf8.hpp"
 #include "omnibuf/varint.hpp"
 
@@ -21,6 +25,7 @@ struct LocatedField {
   std::span<const uint8_t> val_slice;
   uint8_t wire_type = 0;
   bool ok = false;
+  bool packet_valid = false;
 };
 
 // Scans field headers in O(1) time per field using Prefix-Varint length prefixes
@@ -67,6 +72,7 @@ struct LocatedField {
     if (!skip_res.ok) return {};
     pos = skip_res.next_pos;
   }
+  result.packet_valid = true;
   return result;
 }
 
@@ -370,53 +376,326 @@ template <typename VecT, typename DecodeFn>
   }
 }
 
-[[nodiscard]] inline std::pair<uint64_t, bool> lookup_map_string_uint(
+template <typename VecT, typename DecodeFn>
+[[nodiscard]] inline Result<VecT> try_read_arrays(std::span<const uint8_t> packet,
+                                                  uint32_t field_num,
+                                                  DecodeFn&& decode_fn) {
+  VecT dst;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field(packet, pos, field_num, WireArray, 2);
+    if (!res.valid) {
+      return Error{"omnibuf: corrupt packet while reading WireArray"};
+    }
+    if (!res.matched) return dst;
+    pos = res.next_pos;
+    if (!decode_fn(dst, res.body)) {
+      return Error{"omnibuf: invalid WireArray payload"};
+    }
+  }
+}
+
+[[nodiscard]] inline Result<std::optional<uint64_t>> try_read_uint(std::span<const uint8_t> packet,
+                                                                   uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireUint);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<uint64_t>{std::nullopt};
+  const auto [v, n] = decode_varint(loc.val_slice);
+  if (n == 0) return Error{"omnibuf: corrupt WireUint varint"};
+  return std::optional<uint64_t>{v};
+}
+
+[[nodiscard]] inline Result<std::optional<int64_t>> try_read_sint(std::span<const uint8_t> packet,
+                                                                  uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireSint);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<int64_t>{std::nullopt};
+  const auto [v, n] = decode_varint(loc.val_slice);
+  if (n == 0) return Error{"omnibuf: corrupt WireSint varint"};
+  return std::optional<int64_t>{decode_zigzag(v)};
+}
+
+[[nodiscard]] inline Result<std::optional<bool>> try_read_bool(std::span<const uint8_t> packet,
+                                                               uint32_t field_num) {
+  const auto loc = locate_field_mask(
+      packet, field_num, (uint16_t{1} << WireBoolFalse) | (uint16_t{1} << WireBoolTrue));
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<bool>{std::nullopt};
+  return std::optional<bool>{loc.wire_type == WireBoolTrue};
+}
+
+[[nodiscard]] inline Result<std::optional<uint32_t>> try_read_fixed32(
     std::span<const uint8_t> packet,
-    uint32_t field_num,
-    std::string_view target_key) noexcept {
-  uint64_t last_val = 0;
+    uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFixed32);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<uint32_t>{std::nullopt};
+  if (loc.val_slice.size() < 4) return Error{"omnibuf: truncated WireFixed32"};
+  return std::optional<uint32_t>{read_u32_le(loc.val_slice.data())};
+}
+
+[[nodiscard]] inline Result<std::optional<int32_t>> try_read_sfixed32(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireSfixed32);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<int32_t>{std::nullopt};
+  if (loc.val_slice.size() < 4) return Error{"omnibuf: truncated WireSfixed32"};
+  return std::optional<int32_t>{static_cast<int32_t>(read_u32_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<float>> try_read_float32(std::span<const uint8_t> packet,
+                                                                   uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFloat32);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<float>{std::nullopt};
+  if (loc.val_slice.size() < 4) return Error{"omnibuf: truncated WireFloat32"};
+  return std::optional<float>{bits_to_float32(read_u32_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<uint64_t>> try_read_fixed64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFixed64);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<uint64_t>{std::nullopt};
+  if (loc.val_slice.size() < 8) return Error{"omnibuf: truncated WireFixed64"};
+  return std::optional<uint64_t>{read_u64_le(loc.val_slice.data())};
+}
+
+[[nodiscard]] inline Result<std::optional<int64_t>> try_read_sfixed64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireSfixed64);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<int64_t>{std::nullopt};
+  if (loc.val_slice.size() < 8) return Error{"omnibuf: truncated WireSfixed64"};
+  return std::optional<int64_t>{static_cast<int64_t>(read_u64_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<double>> try_read_float64(std::span<const uint8_t> packet,
+                                                                    uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFloat64);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<double>{std::nullopt};
+  if (loc.val_slice.size() < 8) return Error{"omnibuf: truncated WireFloat64"};
+  return std::optional<double>{bits_to_float64(read_u64_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<std::string_view>> try_read_string_view(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireString);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<std::string_view>{std::nullopt};
+  if (loc.val_slice.empty()) return Error{"omnibuf: truncated WireString"};
+  const auto [s_len, sn] = decode_varint(loc.val_slice);
+  if (sn == 0 || s_len > static_cast<uint64_t>(loc.val_slice.size() - sn)) {
+    return Error{"omnibuf: truncated WireString"};
+  }
+  const auto body = loc.val_slice.subspan(sn, static_cast<size_t>(s_len));
+  if (!is_valid_utf8(body)) return Error{"omnibuf: invalid UTF-8 in WireString"};
+  return std::optional<std::string_view>{
+      std::string_view(reinterpret_cast<const char*>(body.data()), body.size())};
+}
+
+[[nodiscard]] inline Result<std::optional<std::span<const uint8_t>>> try_read_bytes_view(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireBytes);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<std::span<const uint8_t>>{std::nullopt};
+  if (loc.val_slice.empty()) return Error{"omnibuf: truncated WireBytes"};
+  const auto [b_len, bn] = decode_varint(loc.val_slice);
+  if (bn == 0 || b_len > static_cast<uint64_t>(loc.val_slice.size() - bn)) {
+    return Error{"omnibuf: truncated WireBytes"};
+  }
+  return std::optional<std::span<const uint8_t>>{
+      loc.val_slice.subspan(bn, static_cast<size_t>(b_len))};
+}
+
+[[nodiscard]] inline Result<std::optional<std::vector<uint8_t>>> try_read_submsg(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  std::vector<uint8_t> merged;
+  bool found = false;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field(packet, pos, field_num, WireSubMsg, 0);
+    if (!res.valid) return Error{"omnibuf: corrupt packet while reading WireSubMsg"};
+    if (!res.matched) {
+      if (!found) return std::optional<std::vector<uint8_t>>{std::nullopt};
+      return std::optional<std::vector<uint8_t>>{std::move(merged)};
+    }
+    auto vr = validate_message_bytes(res.body, 1);
+    if (!vr) return Error{vr.error()};
+    merged.insert(merged.end(), res.body.begin(), res.body.end());
+    found = true;
+    pos = res.next_pos;
+  }
+}
+
+template <uint8_t KeyWT, uint8_t ValWT, typename K, typename V, typename TargetK>
+[[nodiscard]] inline std::pair<V, bool> lookup_scalar_map(std::span<const uint8_t> packet,
+                                                          uint32_t field_num,
+                                                          const TargetK& target_key) {
+  V last_val{};
   bool found = false;
   size_t pos = 0;
   while (true) {
     const auto res = next_container_field(packet, pos, field_num, WireMap, 3);
-    if (!res.valid) return {0, false};
-    if (!res.matched) return {last_val, found};
+    if (!res.valid) return {V{}, false};
+    if (!res.matched) return {std::move(last_val), found};
     pos = res.next_pos;
     const auto hdr = parse_map_header(res.body);
-    if (!hdr.ok || hdr.key_wt != WireString || hdr.val_wt != WireUint) return {0, false};
+    if (!hdr.ok || hdr.key_wt != KeyWT || hdr.val_wt != ValWT) return {V{}, false};
     size_t p = hdr.pos;
     for (size_t i = 0; i < hdr.count; ++i) {
-      auto k_res = read_str_slice(res.body, p);
-      if (!k_res) return {0, false};
-      p = k_res.value().next_pos;
-      const auto [v, vn] = decode_varint(res.body.subspan(p));
-      if (vn == 0) return {0, false};
-      p += vn;
-      const auto ksp = k_res.value().slice;
-      const std::string_view k_sv(reinterpret_cast<const char*>(ksp.data()), ksp.size());
-      if (k_sv == target_key) {
-        last_val = v;
-        found = true;
+      if constexpr (KeyWT == WireString) {
+        const auto k_res = read_str_slice_fast(res.body, p);
+        if (!k_res) return {V{}, false};
+        p = k_res.next_pos;
+        V v{};
+        if (!decode_container_scalar<ValWT, V>(res.body, p, v)) return {V{}, false};
+        const std::string_view k_sv(reinterpret_cast<const char*>(k_res.ptr), k_res.len);
+        if (k_sv == target_key) {
+          last_val = std::move(v);
+          found = true;
+        }
+      } else {
+        K k{};
+        V v{};
+        if (!decode_container_scalar<KeyWT, K>(res.body, p, k)) return {V{}, false};
+        if (!decode_container_scalar<ValWT, V>(res.body, p, v)) return {V{}, false};
+        if (k == target_key) {
+          last_val = std::move(v);
+          found = true;
+        }
       }
     }
-    if (p != res.body.size()) return {0, false};
+    if (p != res.body.size()) return {V{}, false};
   }
 }
 
-[[nodiscard]] inline std::pair<std::map<std::string, uint64_t>, bool> read_map_string_uint(
+template <uint8_t KeyWT, typename K, typename TargetK>
+[[nodiscard]] inline std::pair<std::span<const uint8_t>, bool> lookup_submsg_map_slice(
     std::span<const uint8_t> packet,
-    uint32_t field_num) {
-  std::map<std::string, uint64_t> out;
+    uint32_t field_num,
+    const TargetK& target_key) {
+  std::span<const uint8_t> last_slice{};
   bool found = false;
   size_t pos = 0;
   while (true) {
     const auto res = next_container_field(packet, pos, field_num, WireMap, 3);
     if (!res.valid) return {{}, false};
+    if (!res.matched) return {last_slice, found};
+    pos = res.next_pos;
+    const auto hdr = parse_map_header(res.body);
+    if (!hdr.ok || hdr.key_wt != KeyWT || hdr.val_wt != WireSubMsg) return {{}, false};
+    size_t p = hdr.pos;
+    for (size_t i = 0; i < hdr.count; ++i) {
+      bool key_eq = false;
+      if constexpr (KeyWT == WireString) {
+        const auto k_res = read_str_slice_fast(res.body, p);
+        if (!k_res) return {{}, false};
+        p = k_res.next_pos;
+        key_eq = (std::string_view(reinterpret_cast<const char*>(k_res.ptr), k_res.len) ==
+                  target_key);
+      } else {
+        K k{};
+        if (!decode_container_scalar<KeyWT, K>(res.body, p, k)) return {{}, false};
+        key_eq = (k == target_key);
+      }
+      const auto sub_res = read_len_slice_fast(res.body, p, 0);
+      if (!sub_res) return {{}, false};
+      p = sub_res.next_pos;
+      if (key_eq) {
+        last_slice = sub_res.span();
+        found = true;
+      }
+    }
+    if (p != res.body.size()) return {{}, false};
+  }
+}
+
+template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
+[[nodiscard]] inline std::pair<MapT, bool> read_scalar_map(std::span<const uint8_t> packet,
+                                                           uint32_t field_num) {
+  MapT out;
+  bool found = false;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field(packet, pos, field_num, WireMap, 3);
+    if (!res.valid) return {MapT{}, false};
     if (!res.matched) return {std::move(out), found};
     pos = res.next_pos;
-    if (!decode_map_string_uint_body(out, res.body)) return {{}, false};
+    if (!decode_scalar_map_body<KeyWT, ValWT>(out, res.body)) return {MapT{}, false};
     found = true;
   }
+}
+
+template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
+[[nodiscard]] inline Result<MapT> try_read_scalar_map(std::span<const uint8_t> packet,
+                                                      uint32_t field_num) {
+  MapT out;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field(packet, pos, field_num, WireMap, 3);
+    if (!res.valid) return Error{"omnibuf: corrupt packet while reading WireMap"};
+    if (!res.matched) return out;
+    pos = res.next_pos;
+    if (!decode_scalar_map_body<KeyWT, ValWT>(out, res.body)) {
+      return Error{"omnibuf: invalid WireMap payload"};
+    }
+  }
+}
+
+template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
+[[nodiscard]] inline std::pair<MapT, bool> read_submsg_map(std::span<const uint8_t> packet,
+                                                           uint32_t field_num,
+                                                           SubDecodeFn&& decode_sub) {
+  MapT out;
+  bool found = false;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field(packet, pos, field_num, WireMap, 3);
+    if (!res.valid) return {MapT{}, false};
+    if (!res.matched) return {std::move(out), found};
+    pos = res.next_pos;
+    if (!decode_submsg_map_body<KeyWT>(out, res.body, decode_sub)) return {MapT{}, false};
+    found = true;
+  }
+}
+
+template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
+[[nodiscard]] inline Result<MapT> try_read_submsg_map(std::span<const uint8_t> packet,
+                                                      uint32_t field_num,
+                                                      SubDecodeFn&& decode_sub) {
+  MapT out;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field(packet, pos, field_num, WireMap, 3);
+    if (!res.valid) return Error{"omnibuf: corrupt packet while reading WireMap"};
+    if (!res.matched) return out;
+    pos = res.next_pos;
+    if (!decode_submsg_map_body<KeyWT>(out, res.body, decode_sub)) {
+      return Error{"omnibuf: invalid WireMap submessage payload"};
+    }
+  }
+}
+
+[[nodiscard]] inline std::pair<uint64_t, bool> lookup_map_string_uint(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::string_view target_key) noexcept {
+  return lookup_scalar_map<WireString, WireUint, std::string, uint64_t>(packet, field_num,
+                                                                        target_key);
+}
+
+[[nodiscard]] inline std::pair<std::map<std::string, uint64_t>, bool> read_map_string_uint(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  return read_scalar_map<WireString, WireUint, std::map<std::string, uint64_t>>(packet, field_num);
 }
 
 // Appends raw to dst (preserving any existing prefix in dst), safely detaching if raw aliases dst's buffer.
@@ -444,15 +723,41 @@ inline void copy_packet_append(std::vector<uint8_t>& dst, std::span<const uint8_
   return dst;
 }
 
-// Zero-decode wire splicing: preserves any existing prefix in dst, never mutates raw even if
-// dst's backing buffer overlaps raw, copies unmodified contiguous field spans verbatim, and
-// invokes append_dirty only for fields whose bit is set in dirty_mask.
-template <typename AppendDirtyFn>
-inline void splice_fields_into(std::vector<uint8_t>& dst,
-                               std::span<const uint8_t> raw,
-                               uint64_t dirty_mask,
-                               uint16_t max_field,
-                               AppendDirtyFn&& append_dirty) {
+namespace detail {
+
+template <typename AppendDirtyFn, typename FieldNumT>
+[[nodiscard]] inline const char* invoke_append_dirty(AppendDirtyFn& fn,
+                                                     std::vector<uint8_t>& dst,
+                                                     FieldNumT fnum) {
+  using Ret = decltype(fn(dst, fnum));
+  if constexpr (std::is_void_v<Ret>) {
+    fn(dst, fnum);
+    return nullptr;
+  } else if constexpr (std::is_same_v<Ret, const char*>) {
+    return fn(dst, fnum);
+  } else {
+    auto res = fn(dst, fnum);
+    if (!res) return "omnibuf: failed to encode dirty field";
+    return nullptr;
+  }
+}
+
+}  // namespace detail
+
+// Zero-decode wire splicing supporting arbitrary field counts via multi-word dirty bitsets.
+// When DeepValidate is true (try_splice_fields_into), validates Field #0 and inner container
+// structure on every field in raw. When DeepValidate is false (splice_fields_into), skips
+// untouched containers in O(1) via Prefix-Varint length prefixes while still rejecting
+// top-level truncated tags/lengths and invalid Field #0 blocks.
+namespace detail {
+
+template <bool DeepValidate, typename AppendDirtyFn>
+[[nodiscard]] inline Result<void> splice_fields_into_impl(std::vector<uint8_t>& dst,
+                                                          std::span<const uint8_t> raw,
+                                                          std::span<const uint64_t> dirty_words,
+                                                          uint32_t max_field,
+                                                          AppendDirtyFn&& append_dirty) {
+  const size_t orig_dst_size = dst.size();
   const size_t n = raw.size();
   std::vector<uint8_t> raw_copy;
   if (n > 0 && dst.capacity() > 0) {
@@ -466,14 +771,39 @@ inline void splice_fields_into(std::vector<uint8_t>& dst,
       raw = raw_copy;
     }
   }
-  if (dst.capacity() < dst.size() + n + 32) {
+  if (n <= SIZE_MAX - 32 && dst.size() <= SIZE_MAX - (n + 32) &&
+      dst.capacity() < dst.size() + n + 32) {
     dst.reserve(dst.size() + n + 32);
   }
 
+  std::array<uint64_t, 4> inline_emitted{};
+  std::vector<uint64_t> heap_emitted;
+  std::span<uint64_t> emitted;
+  if (dirty_words.size() <= inline_emitted.size()) {
+    emitted = std::span<uint64_t>(inline_emitted.data(), dirty_words.size());
+  } else {
+    heap_emitted.assign(dirty_words.size(), 0);
+    emitted = std::span<uint64_t>(heap_emitted);
+  }
+
+  auto is_dirty = [&](uint32_t fnum) noexcept -> bool {
+    const size_t w = fnum >> 6;
+    return w < dirty_words.size() && ((dirty_words[w] >> (fnum & 63u)) & 1u) != 0;
+  };
+  auto is_emitted = [&](uint32_t fnum) noexcept -> bool {
+    const size_t w = fnum >> 6;
+    return w < emitted.size() && ((emitted[w] >> (fnum & 63u)) & 1u) != 0;
+  };
+  auto mark_emitted = [&](uint32_t fnum) noexcept {
+    const size_t w = fnum >> 6;
+    if (w < emitted.size()) {
+      emitted[w] |= (uint64_t{1} << (fnum & 63u));
+    }
+  };
+
+  DecodeState val_state{};
   size_t pos = 0;
   size_t clean_start = 0;
-  size_t valid_end = 0;
-  uint64_t emitted = 0;
 
   while (pos < n) {
     const size_t field_start = pos;
@@ -492,53 +822,170 @@ inline void splice_fields_into(std::vector<uint8_t>& dst,
     } else {
       const auto [tag, tn] = decode_varint(raw.subspan(pos));
       if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) {
-        break;
+        dst.resize(orig_dst_size);
+        return Error{"omnibuf: corrupt or truncated tag in splice_fields_into"};
       }
       fnum = static_cast<uint32_t>(tag >> 4);
       wt = static_cast<uint8_t>(tag & 0x0Fu);
       pos += tn;
     }
 
-    if (fnum == 0 && wt != WireSubMsg) {
-      break;
+    if (fnum == 0) {
+      auto f0 = validate_field0(raw, pos, wt, 0, val_state);
+      if (!f0) {
+        dst.resize(orig_dst_size);
+        return Error{f0.error()};
+      }
+      pos = f0.value();
+    } else if constexpr (DeepValidate) {
+      auto vr = validate_value(raw, pos, wt, 0, val_state);
+      if (!vr) {
+        dst.resize(orig_dst_size);
+        return Error{vr.error()};
+      }
+      pos = vr.value();
+    } else {
+      const auto skip_res = skip_value_checked(raw, pos, wt);
+      if (!skip_res.ok) {
+        dst.resize(orig_dst_size);
+        return Error{"omnibuf: corrupt or truncated field payload in splice_fields_into"};
+      }
+      pos = skip_res.next_pos;
     }
-
-    const auto skip_res = skip_value_checked(raw, pos, wt);
-    if (!skip_res.ok) break;
-    pos = skip_res.next_pos;
-
     const size_t field_end = pos;
-    valid_end = field_end;
 
-    const uint64_t bit = (fnum < 64u) ? (uint64_t{1} << fnum) : uint64_t{0};
-    if ((dirty_mask & bit) != 0) {
+    if (is_dirty(fnum)) {
       if (clean_start < field_start) {
         dst.insert(dst.end(), raw.begin() + static_cast<ptrdiff_t>(clean_start),
                    raw.begin() + static_cast<ptrdiff_t>(field_start));
       }
-      if ((emitted & bit) == 0) {
-        append_dirty(dst, static_cast<uint16_t>(fnum));
-        emitted |= bit;
+      if (!is_emitted(fnum)) {
+        if constexpr (std::is_invocable_v<AppendDirtyFn&, std::vector<uint8_t>&, uint32_t>) {
+          if (const char* err = invoke_append_dirty(append_dirty, dst, fnum)) {
+            dst.resize(orig_dst_size);
+            return Error{err};
+          }
+        } else {
+          if (const char* err =
+                  invoke_append_dirty(append_dirty, dst, static_cast<uint16_t>(fnum))) {
+            dst.resize(orig_dst_size);
+            return Error{err};
+          }
+        }
+        mark_emitted(fnum);
       }
       clean_start = field_end;
     } else {
-      emitted |= bit;
+      mark_emitted(fnum);
     }
   }
 
-  if (clean_start < valid_end) {
+  if (clean_start < n) {
     dst.insert(dst.end(), raw.begin() + static_cast<ptrdiff_t>(clean_start),
-               raw.begin() + static_cast<ptrdiff_t>(valid_end));
+               raw.begin() + static_cast<ptrdiff_t>(n));
   }
 
-  const uint64_t rem = dirty_mask & ~emitted;
-  if (rem != 0) {
-    for (uint16_t fnum = 1; fnum <= max_field && fnum < 64u; ++fnum) {
-      if ((rem & (uint64_t{1} << fnum)) != 0) {
-        append_dirty(dst, fnum);
+  for (size_t w = 0; w < dirty_words.size(); ++w) {
+    uint64_t rem = dirty_words[w] & ~emitted[w];
+    if (w == 0) {
+      rem &= ~uint64_t{1};
+    }
+    while (rem != 0) {
+      const int bit_idx = std::countr_zero(rem);
+      const uint32_t fnum = static_cast<uint32_t>((w << 6) + static_cast<size_t>(bit_idx));
+      if (fnum > max_field) {
+        break;
       }
+      if constexpr (std::is_invocable_v<AppendDirtyFn&, std::vector<uint8_t>&, uint32_t>) {
+        if (const char* err = invoke_append_dirty(append_dirty, dst, fnum)) {
+          dst.resize(orig_dst_size);
+          return Error{err};
+        }
+      } else {
+        if (const char* err =
+                invoke_append_dirty(append_dirty, dst, static_cast<uint16_t>(fnum))) {
+          dst.resize(orig_dst_size);
+          return Error{err};
+        }
+      }
+      rem &= (rem - 1u);
     }
   }
+
+  return Result<void>::success();
+}
+
+}  // namespace detail
+
+template <typename AppendDirtyFn>
+[[nodiscard]] inline Result<void> try_splice_fields_into(std::vector<uint8_t>& dst,
+                                                         std::span<const uint8_t> raw,
+                                                         std::span<const uint64_t> dirty_words,
+                                                         uint32_t max_field,
+                                                         AppendDirtyFn&& append_dirty) {
+  return detail::splice_fields_into_impl<true>(dst, raw, dirty_words, max_field,
+                                               std::forward<AppendDirtyFn>(append_dirty));
+}
+
+template <typename AppendDirtyFn>
+[[nodiscard]] inline Result<void> try_splice_fields_into(std::vector<uint8_t>& dst,
+                                                         std::span<const uint8_t> raw,
+                                                         uint64_t dirty_mask,
+                                                         uint16_t max_field,
+                                                         AppendDirtyFn&& append_dirty) {
+  const std::array<uint64_t, 1> words{dirty_mask};
+  return try_splice_fields_into(dst, raw, std::span<const uint64_t>(words), max_field,
+                                std::forward<AppendDirtyFn>(append_dirty));
+}
+
+template <typename AppendDirtyFn>
+inline void splice_fields_into(std::vector<uint8_t>& dst,
+                               std::span<const uint8_t> raw,
+                               std::span<const uint64_t> dirty_words,
+                               uint32_t max_field,
+                               AppendDirtyFn&& append_dirty) {
+  auto res = detail::splice_fields_into_impl<false>(dst, raw, dirty_words, max_field,
+                                                    std::forward<AppendDirtyFn>(append_dirty));
+  if (!res) {
+    throw std::invalid_argument(res.error());
+  }
+}
+
+template <typename AppendDirtyFn>
+inline void splice_fields_into(std::vector<uint8_t>& dst,
+                               std::span<const uint8_t> raw,
+                               uint64_t dirty_mask,
+                               uint16_t max_field,
+                               AppendDirtyFn&& append_dirty) {
+  const std::array<uint64_t, 1> words{dirty_mask};
+  splice_fields_into(dst, raw, std::span<const uint64_t>(words), max_field,
+                     std::forward<AppendDirtyFn>(append_dirty));
+}
+
+template <typename AppendDirtyFn>
+[[nodiscard]] inline Result<std::vector<uint8_t>> try_splice_fields(
+    std::vector<uint8_t> dst,
+    std::span<const uint8_t> raw,
+    std::span<const uint64_t> dirty_words,
+    uint32_t max_field,
+    AppendDirtyFn&& append_dirty) {
+  auto res = try_splice_fields_into(dst, raw, dirty_words, max_field,
+                                    std::forward<AppendDirtyFn>(append_dirty));
+  if (!res) return Error{res.error()};
+  return dst;
+}
+
+template <typename AppendDirtyFn>
+[[nodiscard]] inline Result<std::vector<uint8_t>> try_splice_fields(
+    std::vector<uint8_t> dst,
+    std::span<const uint8_t> raw,
+    uint64_t dirty_mask,
+    uint16_t max_field,
+    AppendDirtyFn&& append_dirty) {
+  auto res = try_splice_fields_into(dst, raw, dirty_mask, max_field,
+                                    std::forward<AppendDirtyFn>(append_dirty));
+  if (!res) return Error{res.error()};
+  return dst;
 }
 
 template <typename AppendDirtyFn>
@@ -552,7 +999,27 @@ template <typename AppendDirtyFn>
 }
 
 // Slice-oriented overload matching Go's SpliceFields(dst[:prefix_len], raw, ...):
-// preserves prefix bytes from dst_backing and never mutates raw inside dst_backing.
+// bounds-checks prefix_len <= dst_backing.size(), preserves prefix bytes from dst_backing,
+// and never mutates raw inside dst_backing.
+template <typename AppendDirtyFn>
+[[nodiscard]] inline Result<std::vector<uint8_t>> try_splice_fields(
+    std::span<uint8_t> dst_backing,
+    size_t prefix_len,
+    std::span<const uint8_t> raw,
+    uint64_t dirty_mask,
+    uint16_t max_field,
+    AppendDirtyFn&& append_dirty) {
+  if (prefix_len > dst_backing.size()) {
+    return Error{"omnibuf: prefix_len exceeds dst_backing size"};
+  }
+  std::vector<uint8_t> out(dst_backing.begin(),
+                           dst_backing.begin() + static_cast<ptrdiff_t>(prefix_len));
+  auto res = try_splice_fields_into(out, raw, dirty_mask, max_field,
+                                    std::forward<AppendDirtyFn>(append_dirty));
+  if (!res) return Error{res.error()};
+  return out;
+}
+
 template <typename AppendDirtyFn>
 [[nodiscard]] inline std::vector<uint8_t> splice_fields(std::span<uint8_t> dst_backing,
                                                         size_t prefix_len,
@@ -560,6 +1027,9 @@ template <typename AppendDirtyFn>
                                                         uint64_t dirty_mask,
                                                         uint16_t max_field,
                                                         AppendDirtyFn&& append_dirty) {
+  if (prefix_len > dst_backing.size()) {
+    throw std::out_of_range("omnibuf: prefix_len exceeds dst_backing size");
+  }
   std::vector<uint8_t> out(dst_backing.begin(),
                            dst_backing.begin() + static_cast<ptrdiff_t>(prefix_len));
   splice_fields_into(out, raw, dirty_mask, max_field, std::forward<AppendDirtyFn>(append_dirty));

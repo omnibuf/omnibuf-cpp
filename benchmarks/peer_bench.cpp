@@ -1,4 +1,6 @@
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
 
 #include <algorithm>
 #include <charconv>
@@ -14,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -80,11 +83,84 @@ using omnibuf::bench::PeerUpdate;
 
 template <typename T>
 inline void do_not_optimize(const T& value) {
+#if defined(__GNUC__) || defined(__clang__)
   asm volatile("" : : "r,m"(value) : "memory");
+#else
+  volatile const T* sink = &value;
+  (void)sink;
+#endif
+}
+
+inline void sink_bytes(const std::vector<uint8_t>& out) {
+  const uint8_t* ptr = out.data();
+  const size_t sz = out.size();
+  do_not_optimize(ptr);
+  do_not_optimize(sz);
 }
 
 inline void clobber_memory() {
+#if defined(__GNUC__) || defined(__clang__)
   asm volatile("" : : : "memory");
+#endif
+}
+
+inline uint64_t mix_u64(uint64_t h, uint64_t v) noexcept {
+  h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  return h;
+}
+
+inline uint64_t mix_str(uint64_t h, std::string_view s) noexcept {
+  h = mix_u64(h, s.size());
+  uint64_t fnv = 14695981039346656037ULL;
+  for (unsigned char c : s) {
+    fnv ^= static_cast<uint64_t>(c);
+    fnv *= 1099511628211ULL;
+  }
+  return mix_u64(h, fnv);
+}
+
+// Folds all 11 PeerUpdate fields (including every nested Location and Neighbor field)
+// into a single 64-bit digest so -O3 cannot dead-code-eliminate unread decoded fields.
+uint64_t compute_peer_checksum(const PeerUpdate& p) noexcept {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  h = mix_u64(h, p.asn);
+  h = mix_str(h, p.router_id);
+  h = mix_u64(h, p.active ? 1ULL : 0ULL);
+  h = mix_u64(h, p.uptime_sec);
+  h = mix_u64(h, static_cast<uint64_t>(static_cast<int64_t>(p.rssi_dbm)));
+  h = mix_u64(h, omnibuf::float64_to_bits(p.cpu_load));
+
+  h = mix_u64(h, p.tags.size());
+  for (const auto& t : p.tags) {
+    h = mix_str(h, t);
+  }
+
+  h = mix_u64(h, p.prefixes.size());
+  for (uint32_t pref : p.prefixes) {
+    h = mix_u64(h, pref);
+  }
+
+  h = mix_u64(h, p.location.has_value() ? 1ULL : 0ULL);
+  if (p.location.has_value()) {
+    const auto& loc = *p.location;
+    h = mix_str(h, loc.region);
+    h = mix_str(h, loc.datacenter);
+    h = mix_str(h, loc.city);
+    h = mix_u64(h, loc.rack);
+    h = mix_u64(h, omnibuf::float32_to_bits(loc.latitude));
+    h = mix_u64(h, omnibuf::float32_to_bits(loc.longitude));
+  }
+
+  h = mix_u64(h, p.neighbors.size());
+  for (const auto& nb : p.neighbors) {
+    h = mix_u64(h, nb.peer_asn);
+    h = mix_str(h, nb.router);
+    h = mix_u64(h, nb.latency_us);
+    h = mix_u64(h, nb.established ? 1ULL : 0ULL);
+  }
+
+  h = mix_u64(h, p.sequence);
+  return h;
 }
 
 PeerUpdate create_sample_peer_update() {
@@ -121,18 +197,35 @@ PeerUpdate create_sample_peer_update() {
   return p;
 }
 
+PeerUpdate create_peer_update_32_neighbors() {
+  PeerUpdate p = create_sample_peer_update();
+  const std::vector<Neighbor> base = p.neighbors;
+  p.neighbors.clear();
+  p.neighbors.reserve(base.size() * 8);
+  for (int rep = 0; rep < 8; ++rep) {
+    for (const auto& nb : base) {
+      p.neighbors.push_back(nb);
+    }
+  }
+  return p;
+}
+
 // ============================================================================
 // Protobuf LEB128 Wire Codec (proto3 canonical encoding for PeerUpdate, 341B)
+// Uses symmetric FastWriter buffer growth and strict UTF-8 string validation.
 // ============================================================================
 
 namespace pb_leb128 {
 
-inline void append_leb128(std::vector<uint8_t>& out, uint64_t v) {
+inline void write_leb128(omnibuf::FastWriter& w, uint64_t v) {
+  w.ensure(10);
+  uint8_t* ptr = w.raw_cur();
   while (v >= 0x80u) {
-    out.push_back(static_cast<uint8_t>((v & 0x7Fu) | 0x80u));
+    *ptr++ = static_cast<uint8_t>((v & 0x7Fu) | 0x80u);
     v >>= 7;
   }
-  out.push_back(static_cast<uint8_t>(v));
+  *ptr++ = static_cast<uint8_t>(v);
+  w.set_raw_cur(ptr);
 }
 
 inline size_t leb128_size(uint64_t v) noexcept {
@@ -152,11 +245,15 @@ inline int32_t unzigzag32(uint32_t v) noexcept {
   return static_cast<int32_t>((v >> 1) ^ (~(v & 1u) + 1u));
 }
 
-inline void append_str_field(std::vector<uint8_t>& out, uint32_t fnum, std::string_view s) {
-  if (s.empty()) return;
-  append_leb128(out, (static_cast<uint64_t>(fnum) << 3) | 2u);
-  append_leb128(out, s.size());
-  out.insert(out.end(), s.begin(), s.end());
+inline bool write_str_field(omnibuf::FastWriter& w, uint32_t fnum, std::string_view s) {
+  if (!omnibuf::is_valid_utf8(s)) [[unlikely]] {
+    return false;
+  }
+  if (s.empty()) return true;
+  write_leb128(w, (static_cast<uint64_t>(fnum) << 3) | 2u);
+  write_leb128(w, s.size());
+  w.write_bytes(s.data(), s.size());
+  return true;
 }
 
 inline size_t location_body_size(const Location& loc) noexcept {
@@ -181,92 +278,107 @@ inline size_t neighbor_body_size(const Neighbor& nb) noexcept {
 
 std::vector<uint8_t> encode_peer_update(const PeerUpdate& msg) {
   std::vector<uint8_t> out;
-  out.reserve(512);
+  omnibuf::FastWriter w(out, 512);
 
   if (msg.asn != 0) {
-    append_leb128(out, (1ULL << 3) | 0u);
-    append_leb128(out, msg.asn);
+    write_leb128(w, (1ULL << 3) | 0u);
+    write_leb128(w, msg.asn);
   }
-  append_str_field(out, 2, msg.router_id);
+  if (!write_str_field(w, 2, msg.router_id)) {
+    throw std::invalid_argument("pb_leb128: invalid UTF-8");
+  }
   if (msg.active) {
-    out.push_back((3u << 3) | 0u);
-    out.push_back(1u);
+    w.write_byte((3u << 3) | 0u);
+    w.write_byte(1u);
   }
   if (msg.uptime_sec != 0) {
-    append_leb128(out, (4ULL << 3) | 0u);
-    append_leb128(out, msg.uptime_sec);
+    write_leb128(w, (4ULL << 3) | 0u);
+    write_leb128(w, msg.uptime_sec);
   }
   if (msg.rssi_dbm != 0) {
-    append_leb128(out, (5ULL << 3) | 0u);
-    append_leb128(out, zigzag32(msg.rssi_dbm));
+    write_leb128(w, (5ULL << 3) | 0u);
+    write_leb128(w, zigzag32(msg.rssi_dbm));
   }
   if (omnibuf::float64_to_bits(msg.cpu_load) != 0) {
-    out.push_back((6u << 3) | 1u);
-    omnibuf::append_u64_le(out, omnibuf::float64_to_bits(msg.cpu_load));
+    w.write_byte((6u << 3) | 1u);
+    w.write_u64_raw(omnibuf::float64_to_bits(msg.cpu_load));
   }
   for (const auto& tag : msg.tags) {
-    append_leb128(out, (7ULL << 3) | 2u);
-    append_leb128(out, tag.size());
-    out.insert(out.end(), tag.begin(), tag.end());
+    if (!omnibuf::is_valid_utf8(tag)) [[unlikely]] {
+      throw std::invalid_argument("pb_leb128: invalid UTF-8");
+    }
+    write_leb128(w, (7ULL << 3) | 2u);
+    write_leb128(w, tag.size());
+    w.write_bytes(tag.data(), tag.size());
   }
   if (!msg.prefixes.empty()) {
     size_t packed_len = 0;
     for (uint32_t p : msg.prefixes) {
       packed_len += leb128_size(p);
     }
-    append_leb128(out, (8ULL << 3) | 2u);
-    append_leb128(out, packed_len);
+    write_leb128(w, (8ULL << 3) | 2u);
+    write_leb128(w, packed_len);
     for (uint32_t p : msg.prefixes) {
-      append_leb128(out, p);
+      write_leb128(w, p);
     }
   }
   if (msg.location.has_value()) {
     const auto& loc = *msg.location;
     const size_t loc_sz = location_body_size(loc);
-    append_leb128(out, (9ULL << 3) | 2u);
-    append_leb128(out, loc_sz);
-    append_str_field(out, 1, loc.region);
-    append_str_field(out, 2, loc.datacenter);
-    append_str_field(out, 3, loc.city);
+    write_leb128(w, (9ULL << 3) | 2u);
+    write_leb128(w, loc_sz);
+    if (!write_str_field(w, 1, loc.region) ||
+        !write_str_field(w, 2, loc.datacenter) ||
+        !write_str_field(w, 3, loc.city)) {
+      throw std::invalid_argument("pb_leb128: invalid UTF-8");
+    }
     if (loc.rack != 0) {
-      append_leb128(out, (4ULL << 3) | 0u);
-      append_leb128(out, loc.rack);
+      write_leb128(w, (4ULL << 3) | 0u);
+      write_leb128(w, loc.rack);
     }
     if (omnibuf::float32_to_bits(loc.latitude) != 0) {
-      out.push_back((5u << 3) | 5u);
-      omnibuf::append_u32_le(out, omnibuf::float32_to_bits(loc.latitude));
+      w.write_byte((5u << 3) | 5u);
+      w.write_u32_raw(omnibuf::float32_to_bits(loc.latitude));
     }
     if (omnibuf::float32_to_bits(loc.longitude) != 0) {
-      out.push_back((6u << 3) | 5u);
-      omnibuf::append_u32_le(out, omnibuf::float32_to_bits(loc.longitude));
+      w.write_byte((6u << 3) | 5u);
+      w.write_u32_raw(omnibuf::float32_to_bits(loc.longitude));
     }
   }
   for (const auto& nb : msg.neighbors) {
     const size_t nb_sz = neighbor_body_size(nb);
-    append_leb128(out, (10ULL << 3) | 2u);
-    append_leb128(out, nb_sz);
+    write_leb128(w, (10ULL << 3) | 2u);
+    write_leb128(w, nb_sz);
     if (nb.peer_asn != 0) {
-      append_leb128(out, (1ULL << 3) | 0u);
-      append_leb128(out, nb.peer_asn);
+      write_leb128(w, (1ULL << 3) | 0u);
+      write_leb128(w, nb.peer_asn);
     }
-    append_str_field(out, 2, nb.router);
+    if (!write_str_field(w, 2, nb.router)) {
+      throw std::invalid_argument("pb_leb128: invalid UTF-8");
+    }
     if (nb.latency_us != 0) {
-      append_leb128(out, (3ULL << 3) | 0u);
-      append_leb128(out, nb.latency_us);
+      write_leb128(w, (3ULL << 3) | 0u);
+      write_leb128(w, nb.latency_us);
     }
     if (nb.established) {
-      out.push_back((4u << 3) | 0u);
-      out.push_back(1u);
+      w.write_byte((4u << 3) | 0u);
+      w.write_byte(1u);
     }
   }
   if (msg.sequence != 0) {
-    append_leb128(out, (11ULL << 3) | 0u);
-    append_leb128(out, msg.sequence);
+    write_leb128(w, (11ULL << 3) | 0u);
+    write_leb128(w, msg.sequence);
   }
+
+  w.finish();
   return out;
 }
 
 inline bool read_leb128(std::span<const uint8_t> b, size_t& pos, uint64_t& out) noexcept {
+  if (pos < b.size() && (b[pos] & 0x80u) == 0) [[likely]] {
+    out = b[pos++];
+    return true;
+  }
   uint64_t result = 0;
   uint32_t shift = 0;
   while (pos < b.size()) {
@@ -481,97 +593,158 @@ bool decode_peer_update(std::span<const uint8_t> b, PeerUpdate& out) {
 
 // ============================================================================
 // Self-Contained C++20 RFC 8259 JSON Codec for PeerUpdate
+// Uses symmetric FastWriter(out, 512) buffer growth and UTF-8 validation.
 // ============================================================================
 
 namespace json_codec {
 
-inline void append_u64(std::string& out, uint64_t v) {
-  char buf[24];
-  const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-  if (ec == std::errc{}) out.append(buf, static_cast<size_t>(ptr - buf));
+inline void write_lit(omnibuf::FastWriter& w, std::string_view lit) {
+  w.write_bytes(lit.data(), lit.size());
 }
 
-inline void append_i32(std::string& out, int32_t v) {
-  char buf[16];
-  const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-  if (ec == std::errc{}) out.append(buf, static_cast<size_t>(ptr - buf));
+inline void write_u64(omnibuf::FastWriter& w, uint64_t v) {
+  w.ensure(24);
+  char* cur = reinterpret_cast<char*>(w.raw_cur());
+  const auto [ptr, ec] = std::to_chars(cur, cur + 24, v);
+  if (ec == std::errc{}) {
+    w.set_raw_cur(reinterpret_cast<uint8_t*>(ptr));
+  }
 }
 
-inline void append_f32(std::string& out, float v) {
-  char buf[32];
-  const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-  if (ec == std::errc{}) out.append(buf, static_cast<size_t>(ptr - buf));
+inline void write_i32(omnibuf::FastWriter& w, int32_t v) {
+  w.ensure(16);
+  char* cur = reinterpret_cast<char*>(w.raw_cur());
+  const auto [ptr, ec] = std::to_chars(cur, cur + 16, v);
+  if (ec == std::errc{}) {
+    w.set_raw_cur(reinterpret_cast<uint8_t*>(ptr));
+  }
 }
 
-inline void append_f64(std::string& out, double v) {
-  char buf[32];
-  const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-  if (ec == std::errc{}) out.append(buf, static_cast<size_t>(ptr - buf));
+inline void write_f32(omnibuf::FastWriter& w, float v) {
+  w.ensure(32);
+  char* cur = reinterpret_cast<char*>(w.raw_cur());
+  const auto [ptr, ec] = std::to_chars(cur, cur + 32, v);
+  if (ec == std::errc{}) {
+    w.set_raw_cur(reinterpret_cast<uint8_t*>(ptr));
+  }
 }
 
-inline void append_str(std::string& out, std::string_view s) {
-  omnibuf::detail::append_json_escaped_string(out, s);
+inline void write_f64(omnibuf::FastWriter& w, double v) {
+  w.ensure(32);
+  char* cur = reinterpret_cast<char*>(w.raw_cur());
+  const auto [ptr, ec] = std::to_chars(cur, cur + 32, v);
+  if (ec == std::errc{}) {
+    w.set_raw_cur(reinterpret_cast<uint8_t*>(ptr));
+  }
 }
 
-std::string encode_peer_update(const PeerUpdate& p) {
-  std::string out;
-  out.reserve(896);
-  out += "{\"asn\":";
-  append_u64(out, p.asn);
-  out += ",\"router_id\":";
-  append_str(out, p.router_id);
-  out += ",\"active\":";
-  out += (p.active ? "true" : "false");
-  out += ",\"uptime_sec\":";
-  append_u64(out, p.uptime_sec);
-  out += ",\"rssi_dbm\":";
-  append_i32(out, p.rssi_dbm);
-  out += ",\"cpu_load\":";
-  append_f64(out, p.cpu_load);
-  out += ",\"tags\":[";
+inline void write_json_str(omnibuf::FastWriter& w, std::string_view s) {
+  if (!omnibuf::is_valid_utf8(s)) [[unlikely]] {
+    throw std::invalid_argument("json_codec: invalid UTF-8");
+  }
+  bool needs_escape = false;
+  for (unsigned char c : s) {
+    if (c < 0x20u || c == '"' || c == '\\') {
+      needs_escape = true;
+      break;
+    }
+  }
+  if (!needs_escape) [[likely]] {
+    w.ensure(s.size() + 2);
+    uint8_t* ptr = w.raw_cur();
+    *ptr++ = '"';
+    if (!s.empty()) {
+      std::memcpy(ptr, s.data(), s.size());
+      ptr += s.size();
+    }
+    *ptr++ = '"';
+    w.set_raw_cur(ptr);
+    return;
+  }
+  static constexpr char kHex[] = "0123456789abcdef";
+  w.write_byte('"');
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': write_lit(w, "\\\""); break;
+      case '\\': write_lit(w, "\\\\"); break;
+      case '\b': write_lit(w, "\\b"); break;
+      case '\f': write_lit(w, "\\f"); break;
+      case '\n': write_lit(w, "\\n"); break;
+      case '\r': write_lit(w, "\\r"); break;
+      case '\t': write_lit(w, "\\t"); break;
+      default:
+        if (c < 0x20u) {
+          char esc[6] = {'\\', 'u', '0', '0', kHex[(c >> 4) & 0x0Fu], kHex[c & 0x0Fu]};
+          w.write_bytes(esc, 6);
+        } else {
+          w.write_byte(c);
+        }
+        break;
+    }
+  }
+  w.write_byte('"');
+}
+
+std::vector<uint8_t> encode_peer_update(const PeerUpdate& p) {
+  std::vector<uint8_t> out;
+  omnibuf::FastWriter w(out, 512);
+  write_lit(w, "{\"asn\":");
+  write_u64(w, p.asn);
+  write_lit(w, ",\"router_id\":");
+  write_json_str(w, p.router_id);
+  write_lit(w, ",\"active\":");
+  write_lit(w, p.active ? "true" : "false");
+  write_lit(w, ",\"uptime_sec\":");
+  write_u64(w, p.uptime_sec);
+  write_lit(w, ",\"rssi_dbm\":");
+  write_i32(w, p.rssi_dbm);
+  write_lit(w, ",\"cpu_load\":");
+  write_f64(w, p.cpu_load);
+  write_lit(w, ",\"tags\":[");
   for (size_t i = 0; i < p.tags.size(); ++i) {
-    if (i > 0) out.push_back(',');
-    append_str(out, p.tags[i]);
+    if (i > 0) w.write_byte(',');
+    write_json_str(w, p.tags[i]);
   }
-  out += "],\"prefixes\":[";
+  write_lit(w, "],\"prefixes\":[");
   for (size_t i = 0; i < p.prefixes.size(); ++i) {
-    if (i > 0) out.push_back(',');
-    append_u64(out, p.prefixes[i]);
+    if (i > 0) w.write_byte(',');
+    write_u64(w, p.prefixes[i]);
   }
-  out.push_back(']');
+  w.write_byte(']');
   if (p.location.has_value()) {
     const auto& loc = *p.location;
-    out += ",\"location\":{\"region\":";
-    append_str(out, loc.region);
-    out += ",\"datacenter\":";
-    append_str(out, loc.datacenter);
-    out += ",\"city\":";
-    append_str(out, loc.city);
-    out += ",\"rack\":";
-    append_u64(out, loc.rack);
-    out += ",\"latitude\":";
-    append_f32(out, loc.latitude);
-    out += ",\"longitude\":";
-    append_f32(out, loc.longitude);
-    out.push_back('}');
+    write_lit(w, ",\"location\":{\"region\":");
+    write_json_str(w, loc.region);
+    write_lit(w, ",\"datacenter\":");
+    write_json_str(w, loc.datacenter);
+    write_lit(w, ",\"city\":");
+    write_json_str(w, loc.city);
+    write_lit(w, ",\"rack\":");
+    write_u64(w, loc.rack);
+    write_lit(w, ",\"latitude\":");
+    write_f32(w, loc.latitude);
+    write_lit(w, ",\"longitude\":");
+    write_f32(w, loc.longitude);
+    w.write_byte('}');
   }
-  out += ",\"neighbors\":[";
+  write_lit(w, ",\"neighbors\":[");
   for (size_t i = 0; i < p.neighbors.size(); ++i) {
-    if (i > 0) out.push_back(',');
+    if (i > 0) w.write_byte(',');
     const auto& nb = p.neighbors[i];
-    out += "{\"peer_asn\":";
-    append_u64(out, nb.peer_asn);
-    out += ",\"router\":";
-    append_str(out, nb.router);
-    out += ",\"latency_us\":";
-    append_u64(out, nb.latency_us);
-    out += ",\"established\":";
-    out += (nb.established ? "true" : "false");
-    out.push_back('}');
+    write_lit(w, "{\"peer_asn\":");
+    write_u64(w, nb.peer_asn);
+    write_lit(w, ",\"router\":");
+    write_json_str(w, nb.router);
+    write_lit(w, ",\"latency_us\":");
+    write_u64(w, nb.latency_us);
+    write_lit(w, ",\"established\":");
+    write_lit(w, nb.established ? "true" : "false");
+    w.write_byte('}');
   }
-  out += "],\"sequence\":";
-  append_u64(out, p.sequence);
-  out.push_back('}');
+  write_lit(w, "],\"sequence\":");
+  write_u64(w, p.sequence);
+  w.write_byte('}');
+  w.finish();
   return out;
 }
 
@@ -584,8 +757,8 @@ class JsonParser {
     skip_ws();
     if (try_consume('}')) return true;
     while (true) {
-      std::string key;
-      if (!parse_string(key) || !consume(':')) return false;
+      std::string_view key;
+      if (!parse_key_view(key) || !consume(':')) return false;
       skip_ws();
       if (key == "asn") {
         uint64_t v = 0;
@@ -681,6 +854,23 @@ class JsonParser {
     return false;
   }
 
+  bool parse_key_view(std::string_view& key) noexcept {
+    skip_ws();
+    if (pos_ >= src_.size() || src_[pos_] != '"') return false;
+    ++pos_;
+    const size_t start = pos_;
+    while (pos_ < src_.size()) {
+      if (src_[pos_] == '"') {
+        key = src_.substr(start, pos_ - start);
+        ++pos_;
+        return true;
+      }
+      if (src_[pos_] == '\\') return false;
+      ++pos_;
+    }
+    return false;
+  }
+
   bool parse_string(std::string& dst) {
     skip_ws();
     if (pos_ >= src_.size() || src_[pos_] != '"') return false;
@@ -689,7 +879,9 @@ class JsonParser {
     while (pos_ < src_.size()) {
       const char c = src_[pos_];
       if (c == '"') {
-        dst.assign(src_.data() + start, pos_ - start);
+        const std::string_view slice(src_.data() + start, pos_ - start);
+        if (!omnibuf::is_valid_utf8(slice)) return false;
+        dst.assign(slice.data(), slice.size());
         ++pos_;
         return true;
       }
@@ -697,7 +889,9 @@ class JsonParser {
         dst.assign(src_.data() + start, pos_ - start);
         while (pos_ < src_.size()) {
           const char ch = src_[pos_++];
-          if (ch == '"') return true;
+          if (ch == '"') {
+            return omnibuf::is_valid_utf8(dst);
+          }
           if (ch == '\\' && pos_ < src_.size()) {
             const char esc = src_[pos_++];
             switch (esc) {
@@ -779,8 +973,8 @@ class JsonParser {
     skip_ws();
     if (try_consume('}')) return true;
     while (true) {
-      std::string k;
-      if (!parse_string(k) || !consume(':')) return false;
+      std::string_view k;
+      if (!parse_key_view(k) || !consume(':')) return false;
       if (k == "region") {
         if (!parse_string(loc.region)) return false;
       } else if (k == "datacenter") {
@@ -809,8 +1003,8 @@ class JsonParser {
     skip_ws();
     if (try_consume('}')) return true;
     while (true) {
-      std::string k;
-      if (!parse_string(k) || !consume(':')) return false;
+      std::string_view k;
+      if (!parse_key_view(k) || !consume(':')) return false;
       if (k == "peer_asn") {
         uint64_t v = 0;
         if (!parse_u64(v)) return false;
@@ -836,7 +1030,8 @@ class JsonParser {
   size_t pos_ = 0;
 };
 
-bool decode_peer_update(std::string_view js, PeerUpdate& out) {
+bool decode_peer_update(std::span<const uint8_t> js_bytes, PeerUpdate& out) {
+  const std::string_view js(reinterpret_cast<const char*>(js_bytes.data()), js_bytes.size());
   JsonParser parser(js);
   return parser.parse_peer(out);
 }
@@ -862,28 +1057,33 @@ struct BenchCategory {
   std::vector<BenchRow> results;
 };
 
+struct BenchConfig {
+  bool smoke = false;
+};
+
 template <typename Fn>
-BenchRow run_bench(std::string name,
+BenchRow run_bench(const BenchConfig& cfg,
+                   std::string name,
                    Fn&& fn,
                    bool highlight = false,
                    bool baseline = false,
                    std::optional<size_t> wire_bytes = std::nullopt) {
   using Clock = std::chrono::steady_clock;
 
-  // Warmup phase (~50ms)
+  const auto warmup_window =
+      cfg.smoke ? std::chrono::milliseconds(2) : std::chrono::milliseconds(50);
+  const double target_window_ns = cfg.smoke ? 5'000'000.0 : 250'000'000.0;
+  const size_t warmup_batch = cfg.smoke ? 32 : 512;
+
   const auto warmup_start = Clock::now();
-  size_t warmup_iters = 0;
   do {
-    for (int i = 0; i < 512; ++i) {
+    for (size_t i = 0; i < warmup_batch; ++i) {
       fn();
       clobber_memory();
     }
-    warmup_iters += 512;
-  } while (Clock::now() - warmup_start < std::chrono::milliseconds(50));
-  (void)warmup_iters;
+  } while (Clock::now() - warmup_start < warmup_window);
 
-  // Calibrate batch size for a ~250ms measurement window
-  size_t iters = 4096;
+  size_t iters = cfg.smoke ? 64 : 1024;
   double elapsed_ns = 0.0;
   while (true) {
     const auto t0 = Clock::now();
@@ -894,7 +1094,7 @@ BenchRow run_bench(std::string name,
     const auto t1 = Clock::now();
     elapsed_ns =
         static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-    if (elapsed_ns >= 250'000'000.0) {
+    if (elapsed_ns >= target_window_ns) {
       break;
     }
     iters *= 2;
@@ -915,20 +1115,64 @@ BenchRow run_bench(std::string name,
   };
 }
 
+std::string detect_platform() {
+#if defined(__APPLE__)
+  return "darwin";
+#elif defined(__linux__)
+  return "linux";
+#elif defined(_WIN32)
+  return "windows";
+#else
+  return "posix";
+#endif
+}
+
+std::string detect_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+  return "amd64";
+#else
+  return "unknown";
+#endif
+}
+
 std::string detect_cpu_model() {
+#ifdef __APPLE__
   char buf[256] = {};
   size_t len = sizeof(buf);
   if (::sysctlbyname("machdep.cpu.brand_string", buf, &len, nullptr, 0) == 0 && len > 0) {
     return std::string(buf);
   }
   return "Apple Silicon";
+#elif defined(__linux__)
+  std::ifstream cpuinfo("/proc/cpuinfo");
+  std::string line;
+  while (std::getline(cpuinfo, line)) {
+    if (line.rfind("model name", 0) == 0) {
+      const size_t colon = line.find(':');
+      if (colon != std::string::npos && colon + 2 < line.size()) {
+        return line.substr(colon + 2);
+      }
+    }
+  }
+  return "Linux CPU";
+#else
+  return "CPU";
+#endif
 }
 
 std::string detect_runtime() {
-#ifdef __clang_version__
+#if defined(__apple_build_version__) && defined(__clang_version__)
   std::string ver = __clang_version__;
   const size_t space = ver.find(' ');
   return "Apple Clang " + (space == std::string::npos ? ver : ver.substr(0, space)) + " (C++20)";
+#elif defined(__clang_version__)
+  std::string ver = __clang_version__;
+  const size_t space = ver.find(' ');
+  return "Clang " + (space == std::string::npos ? ver : ver.substr(0, space)) + " (C++20)";
+#elif defined(__GNUC__)
+  return "GCC " + std::to_string(__GNUC__) + "." + std::to_string(__GNUC_MINOR__) + " (C++20)";
 #else
   return "C++20";
 #endif
@@ -952,14 +1196,16 @@ void finalize_and_print_category(BenchCategory& cat) {
 }
 
 std::string serialize_benchmarks_json(const std::string& runtime,
+                                      const std::string& platform,
+                                      const std::string& arch,
                                       const std::string& cpu,
                                       const std::vector<BenchCategory>& categories) {
   std::ostringstream out;
   out << "{\n";
   out << "  \"language\": \"cpp\",\n";
   out << "  \"runtime\": \"" << runtime << "\",\n";
-  out << "  \"platform\": \"darwin\",\n";
-  out << "  \"arch\": \"arm64\",\n";
+  out << "  \"platform\": \"" << platform << "\",\n";
+  out << "  \"arch\": \"" << arch << "\",\n";
   out << "  \"cpu\": \"" << cpu << "\",\n";
   out << "  \"workload\": \"PeerUpdate\",\n";
   out << "  \"categories\": [\n";
@@ -998,7 +1244,19 @@ std::string serialize_benchmarks_json(const std::string& runtime,
 }  // namespace
 
 int main(int argc, char** argv) {
+  BenchConfig cfg;
+  std::optional<std::filesystem::path> explicit_out_path;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view arg(argv[i]);
+    if (arg == "--smoke") {
+      cfg.smoke = true;
+    } else {
+      explicit_out_path = std::filesystem::path(arg);
+    }
+  }
+
   const PeerUpdate sample = create_sample_peer_update();
+  const uint64_t expected_sample_checksum = compute_peer_checksum(sample);
 
   const std::vector<uint8_t> omnibuf_gen_bytes = sample.marshal_omnibuf();
   const auto omnibuf_struct_res = omnibuf::marshal(sample);
@@ -1008,9 +1266,9 @@ int main(int argc, char** argv) {
   }
   const std::vector<uint8_t>& omnibuf_struct_bytes = omnibuf_struct_res.value();
   const std::vector<uint8_t> protobuf_bytes = pb_leb128::encode_peer_update(sample);
-  const std::string json_str = json_codec::encode_peer_update(sample);
+  const std::vector<uint8_t> json_bytes = json_codec::encode_peer_update(sample);
 
-  // Strict wire-size and round-trip invariants before timing
+  // Strict wire-size and full 11-field checksum invariants before timing
   if (omnibuf_gen_bytes.size() != 366 || omnibuf_struct_bytes.size() != 366 ||
       omnibuf_gen_bytes != omnibuf_struct_bytes) {
     std::fprintf(stderr, "omnibuf_bench: expected 366B OmniBuf packet, got %zu / %zu\n",
@@ -1025,31 +1283,174 @@ int main(int argc, char** argv) {
 
   {
     PeerUpdate d1, d2, d3, d4;
-    if (!d1.unmarshal_omnibuf(omnibuf_gen_bytes).ok() || d1 != sample) {
-      std::fprintf(stderr, "omnibuf_bench: generated round-trip mismatch\n");
+    if (!d1.unmarshal_omnibuf(omnibuf_gen_bytes).ok() || d1 != sample ||
+        compute_peer_checksum(d1) != expected_sample_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: generated round-trip or checksum mismatch\n");
       return EXIT_FAILURE;
     }
-    if (!omnibuf::unmarshal(omnibuf_struct_bytes, d2).ok() || d2 != sample) {
-      std::fprintf(stderr, "omnibuf_bench: struct round-trip mismatch\n");
+    if (!omnibuf::unmarshal(omnibuf_struct_bytes, d2).ok() || d2 != sample ||
+        compute_peer_checksum(d2) != expected_sample_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: struct round-trip or checksum mismatch\n");
       return EXIT_FAILURE;
     }
-    if (!pb_leb128::decode_peer_update(protobuf_bytes, d3) || d3 != sample) {
-      std::fprintf(stderr, "omnibuf_bench: protobuf round-trip mismatch\n");
+    if (!pb_leb128::decode_peer_update(protobuf_bytes, d3) || d3 != sample ||
+        compute_peer_checksum(d3) != expected_sample_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: protobuf round-trip or checksum mismatch\n");
       return EXIT_FAILURE;
     }
-    if (!json_codec::decode_peer_update(json_str, d4) || d4 != sample) {
-      std::fprintf(stderr, "omnibuf_bench: json round-trip mismatch\n");
+    if (!json_codec::decode_peer_update(json_bytes, d4) || d4 != sample ||
+        compute_peer_checksum(d4) != expected_sample_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: json round-trip or checksum mismatch\n");
+      return EXIT_FAILURE;
+    }
+  }
+
+  // Upfront mutation verification for mutate_sequence (city == "Frankfurt", sequence + 1)
+  PeerUpdate expected_mutated = sample;
+  expected_mutated.sequence += 1ULL;
+  const uint64_t expected_mutated_checksum = compute_peer_checksum(expected_mutated);
+  {
+    OpaquePeerUpdate view(omnibuf_gen_bytes);
+    if (view.get_location().get_city_view() != "Frankfurt") return EXIT_FAILURE;
+    view.set_sequence(view.get_sequence() + 1ULL);
+    const auto m_omni = view.marshal();
+    PeerUpdate dm1;
+    if (!dm1.unmarshal_omnibuf(m_omni).ok() ||
+        compute_peer_checksum(dm1) != expected_mutated_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: mutate_sequence OmniBuf verification failed\n");
+      return EXIT_FAILURE;
+    }
+
+    PeerUpdate mp;
+    if (!pb_leb128::decode_peer_update(protobuf_bytes, mp) || !mp.location ||
+        mp.location->city != "Frankfurt") {
+      return EXIT_FAILURE;
+    }
+    mp.sequence += 1ULL;
+    const auto m_pb = pb_leb128::encode_peer_update(mp);
+    PeerUpdate dm2;
+    if (!pb_leb128::decode_peer_update(m_pb, dm2) ||
+        compute_peer_checksum(dm2) != expected_mutated_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: mutate_sequence Protobuf verification failed\n");
+      return EXIT_FAILURE;
+    }
+
+    PeerUpdate mj;
+    if (!json_codec::decode_peer_update(json_bytes, mj) || !mj.location ||
+        mj.location->city != "Frankfurt") {
+      return EXIT_FAILURE;
+    }
+    mj.sequence += 1ULL;
+    const auto m_js = json_codec::encode_peer_update(mj);
+    PeerUpdate dm3;
+    if (!json_codec::decode_peer_update(m_js, dm3) ||
+        compute_peer_checksum(dm3) != expected_mutated_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: mutate_sequence JSON verification failed\n");
+      return EXIT_FAILURE;
+    }
+  }
+
+  // Stress workload 5: Large Embedded Message Encode (>16 KiB container length header shifts)
+  PeerUpdate shifted_sample = sample;
+  shifted_sample.location->datacenter = std::string(20480, 'd');
+  shifted_sample.neighbors[0].router = std::string(18432, 'n');
+  const uint64_t expected_shifted_checksum = compute_peer_checksum(shifted_sample);
+
+  const std::vector<uint8_t> shifted_omni_gen = shifted_sample.marshal_omnibuf();
+  const auto shifted_omni_struct_res = omnibuf::marshal(shifted_sample);
+  if (!shifted_omni_struct_res || shifted_omni_struct_res.value() != shifted_omni_gen) {
+    std::fprintf(stderr, "omnibuf_bench: shifted OmniBuf encode mismatch\n");
+    return EXIT_FAILURE;
+  }
+  const std::vector<uint8_t> shifted_pb = pb_leb128::encode_peer_update(shifted_sample);
+  const std::vector<uint8_t> shifted_json = json_codec::encode_peer_update(shifted_sample);
+  {
+    PeerUpdate s1, s2, s3, s4;
+    if (!s1.unmarshal_omnibuf(shifted_omni_gen).ok() ||
+        compute_peer_checksum(s1) != expected_shifted_checksum ||
+        !omnibuf::unmarshal(shifted_omni_struct_res.value(), s2).ok() ||
+        compute_peer_checksum(s2) != expected_shifted_checksum ||
+        !pb_leb128::decode_peer_update(shifted_pb, s3) ||
+        compute_peer_checksum(s3) != expected_shifted_checksum ||
+        !json_codec::decode_peer_update(shifted_json, s4) ||
+        compute_peer_checksum(s4) != expected_shifted_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: shifted round-trip checksum mismatch\n");
+      return EXIT_FAILURE;
+    }
+  }
+
+  // Stress workload 6: Embedded Message Growth (32 trailing neighbors, location grows to >16 KiB)
+  const PeerUpdate routing_32 = create_peer_update_32_neighbors();
+  const std::string grown_dc(20480, 'd');
+  const std::vector<uint8_t> routing_32_omni = routing_32.marshal_omnibuf();
+  const std::vector<uint8_t> routing_32_pb = pb_leb128::encode_peer_update(routing_32);
+  const std::vector<uint8_t> routing_32_json = json_codec::encode_peer_update(routing_32);
+
+  PeerUpdate expected_grown_32 = routing_32;
+  expected_grown_32.location->datacenter = grown_dc;
+  const uint64_t expected_grown_checksum = compute_peer_checksum(expected_grown_32);
+
+  size_t grown_omni_wire_bytes = 0;
+  size_t grown_pb_wire_bytes = 0;
+  size_t grown_json_wire_bytes = 0;
+  {
+    OpaquePeerUpdate view(routing_32_omni);
+    const auto loc_view = view.get_location();
+    view.set_location(Location{
+        .region = loc_view.get_region(),
+        .datacenter = grown_dc,
+        .city = loc_view.get_city(),
+        .rack = loc_view.get_rack(),
+        .latitude = loc_view.get_latitude(),
+        .longitude = loc_view.get_longitude(),
+    });
+    const auto g_omni = view.marshal();
+    grown_omni_wire_bytes = g_omni.size();
+    PeerUpdate gd1;
+    if (!gd1.unmarshal_omnibuf(g_omni).ok() ||
+        compute_peer_checksum(gd1) != expected_grown_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: mutate_embedded_grow OmniBuf verification failed\n");
+      return EXIT_FAILURE;
+    }
+
+    PeerUpdate gp;
+    if (!pb_leb128::decode_peer_update(routing_32_pb, gp) || !gp.location) {
+      return EXIT_FAILURE;
+    }
+    gp.location->datacenter = grown_dc;
+    const auto g_pb = pb_leb128::encode_peer_update(gp);
+    grown_pb_wire_bytes = g_pb.size();
+    PeerUpdate gd2;
+    if (!pb_leb128::decode_peer_update(g_pb, gd2) ||
+        compute_peer_checksum(gd2) != expected_grown_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: mutate_embedded_grow Protobuf verification failed\n");
+      return EXIT_FAILURE;
+    }
+
+    PeerUpdate gj;
+    if (!json_codec::decode_peer_update(routing_32_json, gj) || !gj.location) {
+      return EXIT_FAILURE;
+    }
+    gj.location->datacenter = grown_dc;
+    const auto g_js = json_codec::encode_peer_update(gj);
+    grown_json_wire_bytes = g_js.size();
+    PeerUpdate gd3;
+    if (!json_codec::decode_peer_update(g_js, gd3) ||
+        compute_peer_checksum(gd3) != expected_grown_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: mutate_embedded_grow JSON verification failed\n");
       return EXIT_FAILURE;
     }
   }
 
   const std::string runtime = detect_runtime();
+  const std::string platform = detect_platform();
+  const std::string arch = detect_arch();
   const std::string cpu = detect_cpu_model();
   std::printf("============================================================================\n");
-  std::printf("OmniBuf-CPP Benchmark Suite (%s / darwin-arm64 / %s)\n", runtime.c_str(),
-              cpu.c_str());
+  std::printf("OmniBuf-CPP Benchmark Suite (%s / %s-%s / %s)\n", runtime.c_str(), platform.c_str(),
+              arch.c_str(), cpu.c_str());
   std::printf("Workload: SamplePeerUpdate (OmniBuf = %zuB, Protobuf = %zuB, JSON = %zuB)\n",
-              omnibuf_gen_bytes.size(), protobuf_bytes.size(), json_str.size());
+              omnibuf_gen_bytes.size(), protobuf_bytes.size(), json_bytes.size());
   std::printf("============================================================================\n");
 
   std::vector<BenchCategory> categories;
@@ -1057,199 +1458,350 @@ int main(int argc, char** argv) {
   // 1. Encode
   BenchCategory encode_cat{
       .id = "encode",
-      .title = "Full Message Encode Speed (PeerUpdate)",
+      .title = "Full Message Encode Speed",
       .results = {
           run_bench(
+              cfg,
               "OmniBuf (Generated)",
               [&] {
                 do_not_optimize(sample);
                 auto out = sample.marshal_omnibuf();
-                do_not_optimize(out);
+                sink_bytes(out);
               },
               true, true, omnibuf_gen_bytes.size()),
           run_bench(
+              cfg,
               "OmniBuf (C++ Struct)",
               [&] {
                 do_not_optimize(sample);
                 auto out = omnibuf::marshal(sample);
-                do_not_optimize(out);
+                if (!out) std::abort();
+                sink_bytes(out.value());
               },
               true, false, omnibuf_struct_bytes.size()),
           run_bench(
+              cfg,
               "Protobuf (LEB128 Wire)",
               [&] {
                 do_not_optimize(sample);
                 auto out = pb_leb128::encode_peer_update(sample);
-                do_not_optimize(out);
+                sink_bytes(out);
               },
               false, false, protobuf_bytes.size()),
           run_bench(
+              cfg,
               "JSON",
               [&] {
                 do_not_optimize(sample);
                 auto out = json_codec::encode_peer_update(sample);
-                do_not_optimize(out);
+                sink_bytes(out);
               },
-              false, false, json_str.size()),
+              false, false, json_bytes.size()),
       },
   };
   finalize_and_print_category(encode_cat);
   categories.push_back(std::move(encode_cat));
 
-  // 2. Decode
+  // 2. Decode (all 11 fields hashed and verified via compute_peer_checksum)
   BenchCategory decode_cat{
       .id = "decode",
-      .title = "Full Message Decode Speed (PeerUpdate)",
+      .title = "Full Message Decode Speed",
       .results = {
           run_bench(
+              cfg,
               "OmniBuf (Generated)",
               [&] {
                 std::span<const uint8_t> sp(omnibuf_gen_bytes);
                 do_not_optimize(sp);
                 PeerUpdate msg;
-                auto res = msg.unmarshal_omnibuf(sp);
-                do_not_optimize(res);
-                do_not_optimize(msg);
+                if (!msg.unmarshal_omnibuf(sp).ok()) std::abort();
+                const uint64_t cs = compute_peer_checksum(msg);
+                if (cs != expected_sample_checksum) std::abort();
+                do_not_optimize(cs);
               },
               true, true),
           run_bench(
+              cfg,
               "OmniBuf (C++ Struct)",
               [&] {
                 std::span<const uint8_t> sp(omnibuf_struct_bytes);
                 do_not_optimize(sp);
                 PeerUpdate msg;
-                auto res = omnibuf::unmarshal(sp, msg);
-                do_not_optimize(res);
-                do_not_optimize(msg);
+                if (!omnibuf::unmarshal(sp, msg).ok()) std::abort();
+                const uint64_t cs = compute_peer_checksum(msg);
+                if (cs != expected_sample_checksum) std::abort();
+                do_not_optimize(cs);
               },
               true, false),
           run_bench(
-              "Protobuf (LEB128 Wire)",
-              [&] {
-                std::span<const uint8_t> sp(protobuf_bytes);
-                do_not_optimize(sp);
-                PeerUpdate msg;
-                bool ok = pb_leb128::decode_peer_update(sp, msg);
-                do_not_optimize(ok);
-                do_not_optimize(msg);
-              }),
-          run_bench(
-              "JSON",
-              [&] {
-                std::string_view sv(json_str);
-                do_not_optimize(sv);
-                PeerUpdate msg;
-                bool ok = json_codec::decode_peer_update(sv, msg);
-                do_not_optimize(ok);
-                do_not_optimize(msg);
-              }),
-      },
-  };
-  finalize_and_print_category(decode_cat);
-  categories.push_back(std::move(decode_cat));
-
-  // 3. Lookup nested city (peer.location.city)
-  BenchCategory lookup_cat{
-      .id = "lookup_city",
-      .title = "Read a Single Nested Field (peer.location.city)",
-      .results = {
-          run_bench(
-              "OmniBuf (Generated)",
-              [&] {
-                std::span<const uint8_t> sp(omnibuf_gen_bytes);
-                do_not_optimize(sp);
-                OpaquePeerUpdate view(sp);
-                std::string_view city = view.get_location().get_city_view();
-                if (city.size() != 9) std::abort();
-                do_not_optimize(city);
-              },
-              true, true),
-          run_bench(
-              "Protobuf (LEB128 Wire)",
-              [&] {
-                std::span<const uint8_t> sp(protobuf_bytes);
-                do_not_optimize(sp);
-                PeerUpdate msg;
-                if (!pb_leb128::decode_peer_update(sp, msg) || !msg.location.has_value()) {
-                  std::abort();
-                }
-                do_not_optimize(msg.location->city);
-              }),
-          run_bench(
-              "JSON",
-              [&] {
-                std::string_view sv(json_str);
-                do_not_optimize(sv);
-                PeerUpdate msg;
-                if (!json_codec::decode_peer_update(sv, msg) || !msg.location.has_value()) {
-                  std::abort();
-                }
-                do_not_optimize(msg.location->city);
-              }),
-      },
-  };
-  finalize_and_print_category(lookup_cat);
-  categories.push_back(std::move(lookup_cat));
-
-  // 4. Selective single-field mutation (peer.sequence)
-  BenchCategory mutate_cat{
-      .id = "mutate_sequence",
-      .title = "Selective Single-Field Mutation (peer.sequence)",
-      .results = {
-          run_bench(
-              "OmniBuf (Generated)",
-              [&] {
-                std::span<const uint8_t> sp(omnibuf_gen_bytes);
-                do_not_optimize(sp);
-                OpaquePeerUpdate view(sp);
-                view.set_sequence(9876543211ULL);
-                auto out = view.marshal();
-                do_not_optimize(out);
-              },
-              true, true),
-          run_bench(
+              cfg,
               "Protobuf (LEB128 Wire)",
               [&] {
                 std::span<const uint8_t> sp(protobuf_bytes);
                 do_not_optimize(sp);
                 PeerUpdate msg;
                 if (!pb_leb128::decode_peer_update(sp, msg)) std::abort();
-                msg.sequence = 9876543211ULL;
-                auto out = pb_leb128::encode_peer_update(msg);
-                do_not_optimize(out);
+                const uint64_t cs = compute_peer_checksum(msg);
+                if (cs != expected_sample_checksum) std::abort();
+                do_not_optimize(cs);
               }),
           run_bench(
+              cfg,
               "JSON",
               [&] {
-                std::string_view sv(json_str);
-                do_not_optimize(sv);
+                std::span<const uint8_t> sp(json_bytes);
+                do_not_optimize(sp);
                 PeerUpdate msg;
-                if (!json_codec::decode_peer_update(sv, msg)) std::abort();
-                msg.sequence = 9876543211ULL;
+                if (!json_codec::decode_peer_update(sp, msg)) std::abort();
+                const uint64_t cs = compute_peer_checksum(msg);
+                if (cs != expected_sample_checksum) std::abort();
+                do_not_optimize(cs);
+              }),
+      },
+  };
+  finalize_and_print_category(decode_cat);
+  categories.push_back(std::move(decode_cat));
+
+  // 3. Lookup nested city (peer.location.city == "Frankfurt")
+  BenchCategory lookup_cat{
+      .id = "lookup_city",
+      .title = "Read a Single Nested Field",
+      .results = {
+          run_bench(
+              cfg,
+              "OmniBuf (Generated)",
+              [&] {
+                std::span<const uint8_t> sp(omnibuf_gen_bytes);
+                do_not_optimize(sp);
+                OpaquePeerUpdate view(sp);
+                std::string_view city = view.get_location().get_city_view();
+                if (city != "Frankfurt") std::abort();
+                const char* p = city.data();
+                const size_t n = city.size();
+                do_not_optimize(p);
+                do_not_optimize(n);
+              },
+              true, true),
+          run_bench(
+              cfg,
+              "Protobuf (LEB128 Wire)",
+              [&] {
+                std::span<const uint8_t> sp(protobuf_bytes);
+                do_not_optimize(sp);
+                PeerUpdate msg;
+                if (!pb_leb128::decode_peer_update(sp, msg) || !msg.location.has_value() ||
+                    msg.location->city != "Frankfurt") {
+                  std::abort();
+                }
+                const char* p = msg.location->city.data();
+                const size_t n = msg.location->city.size();
+                do_not_optimize(p);
+                do_not_optimize(n);
+              }),
+          run_bench(
+              cfg,
+              "JSON",
+              [&] {
+                std::span<const uint8_t> sp(json_bytes);
+                do_not_optimize(sp);
+                PeerUpdate msg;
+                if (!json_codec::decode_peer_update(sp, msg) || !msg.location.has_value() ||
+                    msg.location->city != "Frankfurt") {
+                  std::abort();
+                }
+                const char* p = msg.location->city.data();
+                const size_t n = msg.location->city.size();
+                do_not_optimize(p);
+                do_not_optimize(n);
+              }),
+      },
+  };
+  finalize_and_print_category(lookup_cat);
+  categories.push_back(std::move(lookup_cat));
+
+  // 4. Selective single-field mutation (check city == "Frankfurt", increment sequence + 1)
+  BenchCategory mutate_cat{
+      .id = "mutate_sequence",
+      .title = "Selective Single-Field Mutation",
+      .results = {
+          run_bench(
+              cfg,
+              "OmniBuf (Generated)",
+              [&] {
+                std::span<const uint8_t> sp(omnibuf_gen_bytes);
+                do_not_optimize(sp);
+                OpaquePeerUpdate view(sp);
+                if (view.get_location().get_city_view() != "Frankfurt") std::abort();
+                view.set_sequence(view.get_sequence() + 1ULL);
+                auto out = view.marshal();
+                sink_bytes(out);
+              },
+              true, true),
+          run_bench(
+              cfg,
+              "Protobuf (LEB128 Wire)",
+              [&] {
+                std::span<const uint8_t> sp(protobuf_bytes);
+                do_not_optimize(sp);
+                PeerUpdate msg;
+                if (!pb_leb128::decode_peer_update(sp, msg) || !msg.location.has_value() ||
+                    msg.location->city != "Frankfurt") {
+                  std::abort();
+                }
+                msg.sequence += 1ULL;
+                auto out = pb_leb128::encode_peer_update(msg);
+                sink_bytes(out);
+              }),
+          run_bench(
+              cfg,
+              "JSON",
+              [&] {
+                std::span<const uint8_t> sp(json_bytes);
+                do_not_optimize(sp);
+                PeerUpdate msg;
+                if (!json_codec::decode_peer_update(sp, msg) || !msg.location.has_value() ||
+                    msg.location->city != "Frankfurt") {
+                  std::abort();
+                }
+                msg.sequence += 1ULL;
                 auto out = json_codec::encode_peer_update(msg);
-                do_not_optimize(out);
+                sink_bytes(out);
               }),
       },
   };
   finalize_and_print_category(mutate_cat);
   categories.push_back(std::move(mutate_cat));
 
+  // 5. Large Embedded Message Encode (>16 KiB sub-message and array 2B -> 4B length shifts)
+  BenchCategory shift_encode_cat{
+      .id = "encode_nested_shift",
+      .title = "Large Embedded Message Encode",
+      .results = {
+          run_bench(
+              cfg,
+              "OmniBuf (Generated)",
+              [&] {
+                do_not_optimize(shifted_sample);
+                auto out = shifted_sample.marshal_omnibuf();
+                sink_bytes(out);
+              },
+              true, true, shifted_omni_gen.size()),
+          run_bench(
+              cfg,
+              "OmniBuf (C++ Struct)",
+              [&] {
+                do_not_optimize(shifted_sample);
+                auto out = omnibuf::marshal(shifted_sample);
+                if (!out) std::abort();
+                sink_bytes(out.value());
+              },
+              true, false, shifted_omni_gen.size()),
+          run_bench(
+              cfg,
+              "Protobuf (LEB128 Wire)",
+              [&] {
+                do_not_optimize(shifted_sample);
+                auto out = pb_leb128::encode_peer_update(shifted_sample);
+                sink_bytes(out);
+              },
+              false, false, shifted_pb.size()),
+          run_bench(
+              cfg,
+              "JSON",
+              [&] {
+                do_not_optimize(shifted_sample);
+                auto out = json_codec::encode_peer_update(shifted_sample);
+                sink_bytes(out);
+              },
+              false, false, shifted_json.size()),
+      },
+  };
+  finalize_and_print_category(shift_encode_cat);
+  categories.push_back(std::move(shift_encode_cat));
+
+  // 6. Embedded Message Growth (peer.location grows to >16 KiB ahead of 32 trailing neighbors)
+  BenchCategory grow_mutate_cat{
+      .id = "mutate_embedded_grow",
+      .title = "Embedded Message Growth",
+      .results = {
+          run_bench(
+              cfg,
+              "OmniBuf (Generated)",
+              [&] {
+                std::span<const uint8_t> sp(routing_32_omni);
+                do_not_optimize(sp);
+                OpaquePeerUpdate view(sp);
+                const auto loc_view = view.get_location();
+                view.set_location(Location{
+                    .region = loc_view.get_region(),
+                    .datacenter = grown_dc,
+                    .city = loc_view.get_city(),
+                    .rack = loc_view.get_rack(),
+                    .latitude = loc_view.get_latitude(),
+                    .longitude = loc_view.get_longitude(),
+                });
+                auto out = view.marshal();
+                sink_bytes(out);
+              },
+              true, true, grown_omni_wire_bytes),
+          run_bench(
+              cfg,
+              "Protobuf (LEB128 Wire)",
+              [&] {
+                std::span<const uint8_t> sp(routing_32_pb);
+                do_not_optimize(sp);
+                PeerUpdate msg;
+                if (!pb_leb128::decode_peer_update(sp, msg) || !msg.location.has_value()) {
+                  std::abort();
+                }
+                msg.location->datacenter = grown_dc;
+                auto out = pb_leb128::encode_peer_update(msg);
+                sink_bytes(out);
+              },
+              false, false, grown_pb_wire_bytes),
+          run_bench(
+              cfg,
+              "JSON",
+              [&] {
+                std::span<const uint8_t> sp(routing_32_json);
+                do_not_optimize(sp);
+                PeerUpdate msg;
+                if (!json_codec::decode_peer_update(sp, msg) || !msg.location.has_value()) {
+                  std::abort();
+                }
+                msg.location->datacenter = grown_dc;
+                auto out = json_codec::encode_peer_update(msg);
+                sink_bytes(out);
+              },
+              false, false, grown_json_wire_bytes),
+      },
+  };
+  finalize_and_print_category(grow_mutate_cat);
+  categories.push_back(std::move(grow_mutate_cat));
+
+  if (cfg.smoke && !explicit_out_path.has_value()) {
+    std::printf("\nSmoke verification passed across all 6 categories (JSON file unchanged).\n");
+    return EXIT_SUCCESS;
+  }
+
   std::filesystem::path out_path = "testdata/benchmarks.json";
-  if (argc > 1 && argv[1] != nullptr) {
-    out_path = argv[1];
+  if (explicit_out_path.has_value()) {
+    out_path = *explicit_out_path;
   } else {
 #ifdef OMNIBUF_BENCH_JSON_PATH
     out_path = OMNIBUF_BENCH_JSON_PATH;
 #endif
   }
 
-  std::filesystem::create_directories(out_path.parent_path());
+  if (out_path.has_parent_path()) {
+    std::filesystem::create_directories(out_path.parent_path());
+  }
   std::ofstream out_file(out_path, std::ios::binary);
   if (!out_file) {
     std::fprintf(stderr, "omnibuf_bench: failed to write %s\n", out_path.string().c_str());
     return EXIT_FAILURE;
   }
-  out_file << serialize_benchmarks_json(runtime, cpu, categories);
+  out_file << serialize_benchmarks_json(runtime, platform, arch, cpu, categories);
   out_file.close();
 
   std::printf("\nWrote structured benchmark results to %s\n", out_path.string().c_str());

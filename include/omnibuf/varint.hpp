@@ -5,7 +5,19 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <stdexcept>
 #include <vector>
+
+#if defined(_MSC_VER)
+#define OMNIBUF_NOINLINE __declspec(noinline)
+#define OMNIBUF_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define OMNIBUF_NOINLINE [[gnu::noinline]]
+#define OMNIBUF_RESTRICT __restrict__
+#else
+#define OMNIBUF_NOINLINE
+#define OMNIBUF_RESTRICT
+#endif
 
 namespace omnibuf {
 
@@ -109,12 +121,18 @@ inline void write_u64_le(uint8_t* dst, uint64_t v) noexcept {
 
 inline void append_u32_le(std::vector<uint8_t>& dst, uint32_t v) {
   const size_t pos = dst.size();
+  if (pos > SIZE_MAX - 4) [[unlikely]] {
+    throw std::length_error("omnibuf: buffer size overflow");
+  }
   dst.resize(pos + 4);
   write_u32_le(dst.data() + pos, v);
 }
 
 inline void append_u64_le(std::vector<uint8_t>& dst, uint64_t v) {
   const size_t pos = dst.size();
+  if (pos > SIZE_MAX - 8) [[unlikely]] {
+    throw std::length_error("omnibuf: buffer size overflow");
+  }
   dst.resize(pos + 8);
   write_u64_le(dst.data() + pos, v);
 }
@@ -214,6 +232,9 @@ inline void append_tag(std::vector<uint8_t>& dst, uint32_t field_num, uint8_t wi
 // Backpatches a reserved 2-byte Prefix-Varint length slot at dst[len_pos..len_pos+2].
 // Expands in-place to 4 bytes or 9 bytes when payload exceeds 16,383 bytes.
 inline void backpatch_container_len(std::vector<uint8_t>& dst, size_t len_pos) {
+  if (len_pos > dst.size() || dst.size() - len_pos < 2) [[unlikely]] {
+    throw std::logic_error("omnibuf: invalid container length slot");
+  }
   const uint64_t sub_len = static_cast<uint64_t>(dst.size() - (len_pos + 2));
   if (sub_len <= 16383u) {
     const uint16_t u = static_cast<uint16_t>((sub_len << 2) | 2u);
@@ -222,12 +243,18 @@ inline void backpatch_container_len(std::vector<uint8_t>& dst, size_t len_pos) {
   }
   if (sub_len <= 536870911u) {
     const size_t old_size = dst.size();
+    if (old_size > SIZE_MAX - 2) [[unlikely]] {
+      throw std::length_error("omnibuf: buffer size overflow");
+    }
     dst.resize(old_size + 2);
     std::memmove(dst.data() + len_pos + 4, dst.data() + len_pos + 2, old_size - (len_pos + 2));
     write_u32_le(dst.data() + len_pos, static_cast<uint32_t>((sub_len << 3) | 4u));
     return;
   }
   const size_t old_size = dst.size();
+  if (old_size > SIZE_MAX - 7) [[unlikely]] {
+    throw std::length_error("omnibuf: buffer size overflow");
+  }
   dst.resize(old_size + 7);
   std::memmove(dst.data() + len_pos + 9, dst.data() + len_pos + 2, old_size - (len_pos + 2));
   dst[len_pos] = 0x00;
@@ -236,12 +263,18 @@ inline void backpatch_container_len(std::vector<uint8_t>& dst, size_t len_pos) {
 
 // Backpatches a reserved 1-byte Prefix-Varint slot at dst[pos], shifting payload right if value > 127.
 inline void patch_reserved_varint(std::vector<uint8_t>& dst, size_t pos, uint64_t value) {
+  if (pos >= dst.size()) [[unlikely]] {
+    throw std::logic_error("omnibuf: invalid reserved varint slot");
+  }
   if (value <= 127u) {
     dst[pos] = static_cast<uint8_t>((value << 1) | 1u);
     return;
   }
   const size_t width = varint_size(value);
   const size_t old_size = dst.size();
+  if (old_size > SIZE_MAX - (width - 1)) [[unlikely]] {
+    throw std::length_error("omnibuf: buffer size overflow");
+  }
   dst.resize(old_size + (width - 1));
   std::memmove(dst.data() + pos + width, dst.data() + pos + 1, old_size - (pos + 1));
   if (width == 2) {
@@ -255,13 +288,16 @@ inline void patch_reserved_varint(std::vector<uint8_t>& dst, size_t pos, uint64_
 }
 
 // Strict-aliasing-friendly cursor writer over std::vector<uint8_t>.
-// Maintains a __restrict byte pointer and capacity limit in local registers so the compiler
+// Maintains a restricted byte pointer and capacity limit in local registers so the compiler
 // does not reload std::vector pointers or struct string/vector lengths on every byte written.
 class FastWriter {
  public:
   explicit FastWriter(std::vector<uint8_t>& vec, size_t initial_headroom = 512)
       : vec_(&vec), pos_(vec.size()), limit_(vec.size()) {
     if (initial_headroom > 0) {
+      if (initial_headroom > SIZE_MAX - pos_) [[unlikely]] {
+        throw std::length_error("omnibuf: buffer size overflow");
+      }
       const size_t target = pos_ + initial_headroom;
       vec.resize(target);
       limit_ = target;
@@ -271,10 +307,14 @@ class FastWriter {
 
   [[nodiscard]] size_t size() const noexcept { return pos_; }
 
+  [[nodiscard]] uint8_t* raw_cur() noexcept { return data_ + pos_; }
+
+  void set_raw_cur(uint8_t* p) noexcept { pos_ = static_cast<size_t>(p - data_); }
+
   void finish() noexcept { vec_->resize(pos_); }
 
   void ensure(size_t extra) {
-    if (pos_ + extra > limit_) [[unlikely]] {
+    if (extra > limit_ - pos_) [[unlikely]] {
       grow(extra);
     }
   }
@@ -334,6 +374,9 @@ class FastWriter {
   }
 
   void backpatch_len(size_t len_pos) {
+    if (len_pos > pos_ || pos_ - len_pos < 2) [[unlikely]] {
+      throw std::logic_error("omnibuf: invalid container length slot");
+    }
     const uint64_t sub_len = static_cast<uint64_t>(pos_ - (len_pos + 2));
     if (sub_len <= 16383u) [[likely]] {
       write_u16_le(data_ + len_pos, static_cast<uint16_t>((sub_len << 2) | 2u));
@@ -343,16 +386,20 @@ class FastWriter {
   }
 
  private:
-  [[gnu::noinline]] void grow(size_t extra) {
+  OMNIBUF_NOINLINE void grow(size_t extra) {
+    if (extra > SIZE_MAX - pos_) [[unlikely]] {
+      throw std::length_error("omnibuf: buffer size overflow");
+    }
     const size_t needed = pos_ + extra;
-    const size_t doubled = (limit_ <= (SIZE_MAX / 2)) ? (limit_ * 2) : needed;
-    const size_t next = (doubled > needed + 256) ? doubled : (needed + 256);
+    const size_t padded = (needed <= SIZE_MAX - 256) ? (needed + 256) : needed;
+    const size_t doubled = (limit_ <= (SIZE_MAX / 2)) ? (limit_ * 2) : padded;
+    const size_t next = (doubled > padded) ? doubled : padded;
     vec_->resize(next);
     data_ = vec_->data();
     limit_ = next;
   }
 
-  [[gnu::noinline]] void write_varint_multi(uint64_t v) {
+  OMNIBUF_NOINLINE void write_varint_multi(uint64_t v) {
     if (v <= 16383u) {
       ensure(2);
       write_u16_le(data_ + pos_, static_cast<uint16_t>((v << 2) | 2u));
@@ -371,7 +418,7 @@ class FastWriter {
     pos_ += 9;
   }
 
-  [[gnu::noinline]] void backpatch_len_slow(size_t len_pos, uint64_t sub_len) {
+  OMNIBUF_NOINLINE void backpatch_len_slow(size_t len_pos, uint64_t sub_len) {
     const size_t extra = (sub_len <= 536870911u) ? 2 : 7;
     ensure(extra);
     std::memmove(data_ + len_pos + 2 + extra, data_ + len_pos + 2, pos_ - (len_pos + 2));
@@ -385,7 +432,7 @@ class FastWriter {
   }
 
   std::vector<uint8_t>* vec_ = nullptr;
-  uint8_t* __restrict data_ = nullptr;
+  uint8_t* OMNIBUF_RESTRICT data_ = nullptr;
   size_t pos_ = 0;
   size_t limit_ = 0;
 };

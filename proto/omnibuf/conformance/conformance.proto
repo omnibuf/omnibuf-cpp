@@ -70,3 +70,38 @@ message TestAllTypes {
   fixed64 f16_fixed64 = 16;
   string f20_overflow_str = 20;
 }
+
+// TreeNode exercises self-referential singular and repeated sub-messages.
+message TreeNode {
+  uint32 id = 1;
+  string name = 2;
+  sint64 weight = 3;
+  TreeNode primary = 4;
+  repeated TreeNode children = 5;
+  repeated TreeNode branches = 6;
+  map<string, uint64> labels = 7;
+}
+
+message NestedNIC {
+  uint32 if_index = 1;
+  string mac = 2;
+  repeated uint32 ips = 3;
+}
+
+message NestedServer {
+  uint32 server_id = 1;
+  string hostname = 2;
+  repeated NestedNIC nics = 3;
+}
+
+message NestedRack {
+  uint32 rack_id = 1;
+  string zone = 2;
+  repeated NestedServer servers = 3;
+}
+
+message NestedCluster {
+  string cluster_name = 1;
+  repeated NestedRack racks = 2;
+  uint64 epoch = 3;
+}
