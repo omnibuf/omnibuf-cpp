@@ -11,8 +11,13 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 option(
+  OMNIBUF_BUILD_PLUGIN
+  "Build protoc-gen-omnibuf-cpp plugin binary"
+  ${PROJECT_IS_TOP_LEVEL}
+)
+option(
   OMNIBUF_BUILD_TESTS
-  "Build OmniBuf plugin, conformance adapter, unit tests, and benchmarks"
+  "Build OmniBuf conformance adapter, unit tests, and benchmarks"
   ${PROJECT_IS_TOP_LEVEL}
 )
 option(
@@ -74,10 +79,14 @@ if(OMNIBUF_INSTALL)
   )
 endif()
 
-if(OMNIBUF_BUILD_TESTS)
-  set(OMNIBUF_WARN_FLAGS -Wall -Wextra -Wpedantic -Werror)
+if(OMNIBUF_BUILD_PLUGIN OR OMNIBUF_BUILD_TESTS)
+  if(MSVC)
+    set(OMNIBUF_WARN_FLAGS /W4)
+  else()
+    set(OMNIBUF_WARN_FLAGS -Wall -Wextra -Wpedantic -Werror)
+  endif()
   set(OMNIBUF_SAN_FLAGS "")
-  if(OMNIBUF_ENABLE_SANITIZERS)
+  if(OMNIBUF_ENABLE_SANITIZERS AND NOT MSVC)
     list(APPEND OMNIBUF_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
   endif()
 
@@ -85,16 +94,18 @@ if(OMNIBUF_BUILD_TESTS)
     target_compile_features(${target_name} PRIVATE cxx_std_20)
     set_target_properties(${target_name} PROPERTIES CXX_EXTENSIONS OFF)
     target_compile_options(${target_name} PRIVATE ${OMNIBUF_WARN_FLAGS} ${OMNIBUF_SAN_FLAGS})
-    if(OMNIBUF_ENABLE_SANITIZERS)
+    if(OMNIBUF_ENABLE_SANITIZERS AND NOT MSVC)
       target_link_options(${target_name} PRIVATE ${OMNIBUF_SAN_FLAGS})
     endif()
   endfunction()
 
-  # protoc-gen-omnibuf-cpp plugin binary (invoked by buf generate)
+  # protoc-gen-omnibuf-cpp plugin binary (invoked by buf generate or protoc)
   add_executable(protoc-gen-omnibuf-cpp tools/protoc_gen_omnibuf_cpp.cpp)
   target_link_libraries(protoc-gen-omnibuf-cpp PRIVATE omnibuf)
   omnibuf_configure_internal_target(protoc-gen-omnibuf-cpp)
+endif()
 
+if(OMNIBUF_BUILD_TESTS)
   # Buf schema compilation and C++20 code generation
   find_program(BUF_EXECUTABLE NAMES buf REQUIRED)
 

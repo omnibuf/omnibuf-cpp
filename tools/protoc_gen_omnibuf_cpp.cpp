@@ -1,4 +1,9 @@
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -2576,6 +2581,18 @@ GeneratedFile generate_header_for_file(const FileDescriptorProto& file,
 std::vector<uint8_t> read_all_stdin() {
   std::vector<uint8_t> buf;
   uint8_t chunk[16384];
+#ifdef _WIN32
+  (void)_setmode(_fileno(stdin), _O_BINARY);
+  while (true) {
+    const size_t n = std::fread(chunk, 1, sizeof(chunk), stdin);
+    if (n > 0) {
+      buf.insert(buf.end(), chunk, chunk + n);
+    }
+    if (n < sizeof(chunk)) {
+      break;
+    }
+  }
+#else
   while (true) {
     const ssize_t n = ::read(STDIN_FILENO, chunk, sizeof(chunk));
     if (n < 0) {
@@ -2585,10 +2602,17 @@ std::vector<uint8_t> read_all_stdin() {
     if (n == 0) break;
     buf.insert(buf.end(), chunk, chunk + n);
   }
+#endif
   return buf;
 }
 
 bool write_all_stdout(std::span<const uint8_t> data) {
+#ifdef _WIN32
+  (void)_setmode(_fileno(stdout), _O_BINARY);
+  const size_t n = std::fwrite(data.data(), 1, data.size(), stdout);
+  if (n != data.size()) return false;
+  return std::fflush(stdout) == 0;
+#else
   size_t written = 0;
   while (written < data.size()) {
     const ssize_t n = ::write(STDOUT_FILENO, data.data() + written, data.size() - written);
@@ -2600,6 +2624,7 @@ bool write_all_stdout(std::span<const uint8_t> data) {
     written += static_cast<size_t>(n);
   }
   return true;
+#endif
 }
 
 }  // namespace

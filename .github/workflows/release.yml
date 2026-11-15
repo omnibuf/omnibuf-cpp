@@ -64,7 +64,7 @@ jobs:
       - name: Build protoc-gen-omnibuf-cpp (Release)
         shell: bash
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DOMNIBUF_BUILD_TESTS=OFF -DOMNIBUF_BUILD_PLUGIN=ON
           cmake --build build --config Release --target protoc-gen-omnibuf-cpp -j
 
       - name: Package archive
