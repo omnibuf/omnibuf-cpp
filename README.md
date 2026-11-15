@@ -1,10 +1,12 @@
 # OmniBuf for C++20
 
 [![CI](https://github.com/omnibuf/omnibuf-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/omnibuf/omnibuf-cpp/actions/workflows/ci.yml)
+[![Wire Spec: v0.1](https://img.shields.io/badge/spec-v0.1-111111?style=flat&labelColor=111111&color=FF4F18)](https://omnibuf.com/spec)
+[![Website](https://img.shields.io/badge/website-omnibuf.com-111111?style=flat&labelColor=111111&color=D4FF33)](https://omnibuf.com/cpp)
 
 **[Website](https://omnibuf.com)** · **[How It Works](https://omnibuf.com/how-it-works)** · **[Go Implementation](https://github.com/omnibuf/omnibuf-go)** · **[TypeScript Implementation](https://github.com/omnibuf/omnibuf-es)** · **[Wire Format Specification](https://omnibuf.com/spec)**
 
-Self-contained C++20 header library (`include/omnibuf/`) and `protoc-gen-omnibuf-cpp` code generator for the **OmniBuf** binary wire format. Zero external C++ library dependencies.
+Self-contained C++20 header library (`include/omnibuf/`) and `protoc-gen-omnibuf-cpp` code generator implementing **[OmniBuf Wire Specification v0.1](https://omnibuf.com/spec)**. Zero external C++ library dependencies.
 
 1. **Single-instruction Prefix-Varint integers:** `std::countr_zero` decodes variable-length integers in one unaligned load and shift.
 2. **Single-pass forward serialization:** Nested sub-messages, typed arrays, and maps reserve a 2-byte Prefix-Varint length slot and backpatch in place after writing payload bytes. Payloads exceeding 16,383 bytes expand cleanly to 4-byte or 9-byte headers.
