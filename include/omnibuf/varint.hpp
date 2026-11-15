@@ -344,8 +344,11 @@ class FastWriter {
 
   void write_bytes(const void* src, size_t len) {
     if (len == 0) return;
-    ensure(len);
-    std::memcpy(data_ + pos_, src, len);
+    if (len > limit_ - pos_) [[unlikely]] {
+      write_bytes_slow(src, len);
+      return;
+    }
+    std::memmove(data_ + pos_, src, len);
     pos_ += len;
   }
 
@@ -397,6 +400,25 @@ class FastWriter {
     vec_->resize(next);
     data_ = vec_->data();
     limit_ = next;
+  }
+
+  OMNIBUF_NOINLINE void write_bytes_slow(const void* src, size_t len) {
+    // Preserve aliased input before grow reallocates the backing vector.
+    const auto source = reinterpret_cast<uintptr_t>(src);
+    const auto start = reinterpret_cast<uintptr_t>(data_);
+    if (source >= start && source - start < limit_) {
+      const size_t offset = source - start;
+      if (len > limit_ - offset) {
+        throw std::out_of_range("omnibuf: aliased source exceeds buffer");
+      }
+      grow(len);
+      std::memmove(data_ + pos_, data_ + offset, len);
+      pos_ += len;
+      return;
+    }
+    grow(len);
+    std::memcpy(data_ + pos_, src, len);
+    pos_ += len;
   }
 
   OMNIBUF_NOINLINE void write_varint_multi(uint64_t v) {

@@ -215,15 +215,26 @@ Measured by `./build/omnibuf_bench` (`just bench`, `-O3 -DNDEBUG`, Apple Clang 2
 
 | Category | OmniBuf Generated | OmniBuf C++ Struct | Protobuf LEB128 | JSON |
 | :--- | ---: | ---: | ---: | ---: |
-| **Full Message Encode Speed** | **281 ns/op** (366 B) | 348 ns/op (366 B) | 306 ns/op (341 B) | 670 ns/op (803 B) |
-| **Full Message Decode Speed** | **654 ns/op** | 877 ns/op | 791 ns/op | 1,701 ns/op |
-| **Read a Single Nested Field** | **120 ns/op** | - | 591 ns/op | 1,495 ns/op |
-| **Selective Single-Field Mutation** | **436 ns/op** | - | 960 ns/op | 2,375 ns/op |
-| **Large Embedded Message Encode** | 5,240 ns/op (39,256 B) | 5,327 ns/op (39,256 B) | **4,203 ns/op** (39,227 B) | 53,581 ns/op (39,681 B) |
-| **Embedded Message Growth** | **3,640 ns/op** | - | 5,967 ns/op | 36,900 ns/op |
+| **Full Message Encode Speed** | **281 ns/op** (366 B) | 340 ns/op (366 B) | 284 ns/op (341 B) | 671 ns/op (803 B) |
+| **Full Message Decode Speed** | **657 ns/op** | 743 ns/op | 789 ns/op | 1,686 ns/op |
+| **Read a Single Nested Field** | **121 ns/op** | - | 591 ns/op | 1,485 ns/op |
+| **Selective Single-Field Mutation** | **427 ns/op** | - | 885 ns/op | 2,194 ns/op |
+| **Large Embedded Message Encode** | 5,242 ns/op (39,256 B) | 5,298 ns/op (39,256 B) | **4,140 ns/op** (39,227 B) | 53,706 ns/op (39,681 B) |
+| **Embedded Message Growth** | **3,581 ns/op** | - | 5,907 ns/op | 37,049 ns/op |
 
 ---
 
 ## License
 
 Released under the [MIT License](./LICENSE).
+
+## Buffer ownership
+
+Opaque readers returning `std::span` or `std::string_view` borrow the input
+packet. Keep its storage alive and unchanged while using those views. Prefer
+`read_string` for an owning string copy.
+
+`FastWriter` borrows its backing vector exclusively until writing is finished.
+Do not resize or otherwise modify that vector through another reference during
+writing. `write_bytes` supports input from the same backing vector and preserves
+it across growth. Raw cursor pointers become invalid when the writer grows.

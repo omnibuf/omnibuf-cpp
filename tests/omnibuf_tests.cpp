@@ -804,7 +804,23 @@ void test_recursive_struct_unordered_map_and_descriptors() {
 
 }  // namespace
 
+void test_fast_writer_aliasing() {
+  for (size_t headroom : {size_t{0}, size_t{64}}) {
+    std::vector<uint8_t> bytes{1, 2, 3, 4};
+    omnibuf::FastWriter writer(bytes, headroom);
+    writer.write_bytes(bytes.data(), 4);
+    writer.finish();
+    CHECK(bytes == (std::vector<uint8_t>{1, 2, 3, 4, 1, 2, 3, 4}));
+  }
+  std::vector<uint8_t> bytes{1, 2, 3, 4};
+  omnibuf::FastWriter writer(bytes, 0);
+  writer.write_bytes(bytes.data() + 1, 2);
+  writer.finish();
+  CHECK(bytes == (std::vector<uint8_t>{1, 2, 3, 4, 2, 3}));
+}
+
 int main() {
+  RUN_TEST(test_fast_writer_aliasing);
   RUN_TEST(test_prefix_varint_and_zigzag);
   RUN_TEST(test_strict_utf8);
   RUN_TEST(test_encoder_overflow_and_depth_limit);
