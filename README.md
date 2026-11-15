@@ -36,7 +36,7 @@ include(FetchContent)
 FetchContent_Declare(
   omnibuf
   GIT_REPOSITORY https://github.com/omnibuf/omnibuf-cpp.git
-  GIT_TAG        main
+  GIT_TAG        v0.1.0
 )
 FetchContent_MakeAvailable(omnibuf)
 
