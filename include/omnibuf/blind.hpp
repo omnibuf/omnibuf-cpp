@@ -620,7 +620,12 @@ struct MapValResult {
     active_schema = std::move(node);
   }
 
-  std::map<uint32_t, std::vector<uint8_t>> sub_packets;
+  struct SubMsgSlices {
+    std::span<const uint8_t> first{};
+    std::vector<uint8_t> merged{};
+    size_t count = 0;
+  };
+  std::map<uint32_t, SubMsgSlices> sub_packets;
   std::unordered_map<uint32_t, std::shared_ptr<const BlindShape>> shapes;
   std::unordered_map<std::string, uint32_t> owners;
 
@@ -706,10 +711,33 @@ struct MapValResult {
         auto sub_res = read_len_slice(data, pos, 0);
         if (!sub_res) return Error{sub_res.error()};
         const auto sp = sub_res.value().slice;
-        auto vr = validate_message_bytes(sp, depth + 1, state);
-        if (!vr) return Error{vr.error()};
-        auto& buf = sub_packets[field_num];
-        buf.insert(buf.end(), sp.begin(), sp.end());
+        if (sp.size() > state.opts.max_message_bytes) {
+          return Error{"omnibuf: submessage exceeds max_message_bytes"};
+        }
+        auto& entry = sub_packets[field_num];
+        if (entry.count == 0) {
+          entry.first = sp;
+          entry.count = 1;
+        } else {
+          // Validate individual slices before concatenation so a truncated tag/value
+          // at the end of an earlier slice cannot fuse with the next slice, without
+          // charging state.total_elements twice (the merged bytes are decoded right below).
+          DecodeState seg_state{state.opts, 0};
+          if (entry.count == 1) {
+            auto vr0 = validate_message_bytes(entry.first, depth + 1, seg_state);
+            if (!vr0) return Error{vr0.error()};
+            entry.merged.reserve(entry.first.size() + sp.size());
+            entry.merged.insert(entry.merged.end(), entry.first.begin(), entry.first.end());
+          }
+          DecodeState sp_state{state.opts, 0};
+          auto vr1 = validate_message_bytes(sp, depth + 1, sp_state);
+          if (!vr1) return Error{vr1.error()};
+          if (sp.size() > state.opts.max_message_bytes - entry.merged.size()) {
+            return Error{"omnibuf: merged submessage exceeds max_message_bytes"};
+          }
+          entry.merged.insert(entry.merged.end(), sp.begin(), sp.end());
+          ++entry.count;
+        }
         pos = sub_res.value().next_pos;
         break;
       }
@@ -788,13 +816,15 @@ struct MapValResult {
     }
   }
 
-  for (const auto& [field_num, packet] : sub_packets) {
+  for (const auto& [field_num, entry] : sub_packets) {
     std::string name = active_schema ? active_schema->field_name(field_num) : std::string{};
     if (name.empty()) {
       name = "field_" + int_to_dec(field_num);
     }
     const auto child_schema = BlindSchema::child_of(active_schema, field_num);
-    auto sub_obj = decode_blind_with_schema(packet, child_schema, depth + 1, state);
+    const std::span<const uint8_t> sub_span =
+        (entry.count == 1) ? entry.first : std::span<const uint8_t>(entry.merged);
+    auto sub_obj = decode_blind_with_schema(sub_span, child_schema, depth + 1, state);
     if (!sub_obj) return Error{sub_obj.error()};
     out[name] = BlindValue(std::move(sub_obj.value()));
   }
@@ -844,7 +874,10 @@ inline void append_json_escaped_string(std::string& out, std::string_view s) {
 
 inline void append_blind_value_json(std::string& out,
                                     const BlindValue& val,
-                                    bool& has_non_finite) {
+                                    bool& has_non_finite,
+                                    bool& depth_exceeded,
+                                    int depth = 0) {
+  if (depth_exceeded) return;
   std::visit(
       [&](const auto& x) {
         using T = std::decay_t<decltype(x)>;
@@ -876,13 +909,22 @@ inline void append_blind_value_json(std::string& out,
         } else if constexpr (std::is_same_v<T, BlindBytes>) {
           append_json_escaped_string(out, base64_encode(x.data));
         } else if constexpr (std::is_same_v<T, BlindArray>) {
+          if (depth > MAX_CONTAINER_DEPTH) {
+            depth_exceeded = true;
+            return;
+          }
           out.push_back('[');
           for (size_t i = 0; i < x.size(); ++i) {
             if (i > 0) out.push_back(',');
-            append_blind_value_json(out, x[i], has_non_finite);
+            append_blind_value_json(out, x[i], has_non_finite, depth_exceeded, depth + 1);
+            if (depth_exceeded) return;
           }
           out.push_back(']');
         } else if constexpr (std::is_same_v<T, BlindObject>) {
+          if (depth > MAX_CONTAINER_DEPTH) {
+            depth_exceeded = true;
+            return;
+          }
           out.push_back('{');
           bool first = true;
           for (const auto& [k, v] : x) {
@@ -890,12 +932,20 @@ inline void append_blind_value_json(std::string& out,
             first = false;
             append_json_escaped_string(out, k);
             out.push_back(':');
-            append_blind_value_json(out, v, has_non_finite);
+            append_blind_value_json(out, v, has_non_finite, depth_exceeded, depth + 1);
+            if (depth_exceeded) return;
           }
           out.push_back('}');
         }
       },
       val.v);
+}
+
+inline void append_blind_value_json(std::string& out,
+                                    const BlindValue& val,
+                                    bool& has_non_finite) {
+  bool depth_exceeded = false;
+  append_blind_value_json(out, val, has_non_finite, depth_exceeded, 0);
 }
 
 }  // namespace detail
@@ -914,7 +964,11 @@ inline void append_blind_value_json(std::string& out,
   std::string out;
   out.reserve(256);
   bool has_non_finite = false;
-  detail::append_blind_value_json(out, BlindValue(obj), has_non_finite);
+  bool depth_exceeded = false;
+  detail::append_blind_value_json(out, BlindValue(obj), has_non_finite, depth_exceeded, 0);
+  if (depth_exceeded) {
+    return Error{"omnibuf: BlindValue nesting depth exceeds MAX_CONTAINER_DEPTH"};
+  }
   if (has_non_finite) {
     return Error{"omnibuf: non-finite float cannot be serialized to RFC 8259 JSON"};
   }

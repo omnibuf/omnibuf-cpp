@@ -287,13 +287,13 @@ inline void patch_reserved_varint(std::vector<uint8_t>& dst, size_t pos, uint64_
   }
 }
 
-// Strict-aliasing-friendly cursor writer over std::vector<uint8_t>.
-// Maintains a restricted byte pointer and capacity limit in local registers so the compiler
-// does not reload std::vector pointers or struct string/vector lengths on every byte written.
+// Cursor writer over std::vector<uint8_t> with RAII exception rollback.
+// Maintains a byte pointer and capacity limit in local registers and restores
+// vec to its initial size if destroyed before finish() is called.
 class FastWriter {
  public:
   explicit FastWriter(std::vector<uint8_t>& vec, size_t initial_headroom = 512)
-      : vec_(&vec), pos_(vec.size()), limit_(vec.size()) {
+      : vec_(&vec), initial_size_(vec.size()), pos_(vec.size()), limit_(vec.size()) {
     if (initial_headroom > 0) {
       if (initial_headroom > SIZE_MAX - pos_) [[unlikely]] {
         throw std::length_error("omnibuf: buffer size overflow");
@@ -305,13 +305,37 @@ class FastWriter {
     data_ = vec.data();
   }
 
+  FastWriter(const FastWriter&) = delete;
+  FastWriter& operator=(const FastWriter&) = delete;
+
+  ~FastWriter() noexcept {
+    if (!finished_ && vec_ != nullptr) {
+      vec_->resize(initial_size_);
+    }
+  }
+
   [[nodiscard]] size_t size() const noexcept { return pos_; }
 
   [[nodiscard]] uint8_t* raw_cur() noexcept { return data_ + pos_; }
 
   void set_raw_cur(uint8_t* p) noexcept { pos_ = static_cast<size_t>(p - data_); }
 
-  void finish() noexcept { vec_->resize(pos_); }
+  void finish() noexcept {
+    if (!finished_) {
+      vec_->resize(pos_);
+      finished_ = true;
+    }
+  }
+
+  void rollback() noexcept {
+    if (!finished_ && vec_ != nullptr) {
+      pos_ = initial_size_;
+      vec_->resize(initial_size_);
+      limit_ = initial_size_;
+      data_ = vec_->data();
+      finished_ = true;
+    }
+  }
 
   void ensure(size_t extra) {
     if (extra > limit_ - pos_) [[unlikely]] {
@@ -376,6 +400,18 @@ class FastWriter {
     return p;
   }
 
+  [[nodiscard]] size_t reserve_len_4b() {
+    ensure(4);
+    const size_t p = pos_;
+    write_u32_le(data_ + p, 0);
+    pos_ += 4;
+    return p;
+  }
+
+  [[nodiscard]] size_t reserve_len_hint(size_t body_hint) {
+    return (body_hint > 16383u) ? reserve_len_4b() : reserve_len_2b();
+  }
+
   void backpatch_len(size_t len_pos) {
     if (len_pos > pos_ || pos_ - len_pos < 2) [[unlikely]] {
       throw std::logic_error("omnibuf: invalid container length slot");
@@ -386,6 +422,26 @@ class FastWriter {
       return;
     }
     backpatch_len_slow(len_pos, sub_len);
+  }
+
+  void backpatch_len_4b(size_t len_pos) {
+    if (len_pos > pos_ || pos_ - len_pos < 4) [[unlikely]] {
+      throw std::logic_error("omnibuf: invalid 4-byte container length slot");
+    }
+    const uint64_t sub_len = static_cast<uint64_t>(pos_ - (len_pos + 4));
+    if (sub_len > 16383u && sub_len <= 536870911u) [[likely]] {
+      write_u32_le(data_ + len_pos, static_cast<uint32_t>((sub_len << 3) | 4u));
+      return;
+    }
+    backpatch_len_4b_slow(len_pos, sub_len);
+  }
+
+  void backpatch_len_hint(size_t len_pos, bool reserved_4b) {
+    if (!reserved_4b) [[likely]] {
+      backpatch_len(len_pos);
+      return;
+    }
+    backpatch_len_4b(len_pos);
   }
 
  private:
@@ -453,10 +509,26 @@ class FastWriter {
     }
   }
 
+  OMNIBUF_NOINLINE void backpatch_len_4b_slow(size_t len_pos, uint64_t sub_len) {
+    if (sub_len <= 16383u) {
+      write_u16_le(data_ + len_pos, static_cast<uint16_t>((sub_len << 2) | 2u));
+      std::memmove(data_ + len_pos + 2, data_ + len_pos + 4, static_cast<size_t>(sub_len));
+      pos_ -= 2;
+      return;
+    }
+    ensure(5);
+    std::memmove(data_ + len_pos + 9, data_ + len_pos + 4, pos_ - (len_pos + 4));
+    pos_ += 5;
+    data_[len_pos] = 0x00;
+    write_u64_le(data_ + len_pos + 1, sub_len);
+  }
+
   std::vector<uint8_t>* vec_ = nullptr;
-  uint8_t* OMNIBUF_RESTRICT data_ = nullptr;
+  uint8_t* data_ = nullptr;
+  size_t initial_size_ = 0;
   size_t pos_ = 0;
   size_t limit_ = 0;
+  bool finished_ = false;
 };
 
 }  // namespace omnibuf

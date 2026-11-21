@@ -1,10 +1,12 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -28,14 +30,79 @@ struct LocatedField {
   bool packet_valid = false;
 };
 
+struct OneofBranchSpec {
+  uint32_t field_num = 0;
+  uint16_t exp_mask = 0;
+};
+
+struct OpaqueFieldDirSpec {
+  uint16_t exp_mask = 0;
+  int16_t oneof_group = -1;
+  bool is_bool = false;
+};
+
+// Arena owned lazily by an Opaque root to retain merged multi-segment submessages
+// and materialized dirty submessage buffers across chained view expressions.
+struct OpaqueArena {
+  struct Slot {
+    const void* owner = nullptr;
+    uint32_t key = 0;
+    std::shared_ptr<const std::vector<uint8_t>> buf{};
+  };
+  std::vector<Slot> slots{};
+  std::vector<std::shared_ptr<const std::vector<uint8_t>>> retired{};
+
+  [[nodiscard]] const std::shared_ptr<const std::vector<uint8_t>>* find(
+      const void* owner,
+      uint32_t key) const noexcept {
+    for (const auto& s : slots) {
+      if (s.owner == owner && s.key == key && s.buf != nullptr) return &s.buf;
+    }
+    return nullptr;
+  }
+
+  const std::shared_ptr<const std::vector<uint8_t>>& store(const void* owner,
+                                                           uint32_t key,
+                                                           std::vector<uint8_t>&& data) {
+    auto sp = std::make_shared<const std::vector<uint8_t>>(std::move(data));
+    for (auto& s : slots) {
+      if (s.owner == owner && s.key == key) {
+        if (s.buf != nullptr) retired.push_back(std::move(s.buf));
+        s.buf = std::move(sp);
+        return s.buf;
+      }
+    }
+    slots.push_back(Slot{owner, key, std::move(sp)});
+    return slots.back().buf;
+  }
+
+  void invalidate(const void* owner, uint32_t key) {
+    for (auto& s : slots) {
+      if (s.owner == owner && s.key == key) {
+        if (s.buf != nullptr) retired.push_back(std::move(s.buf));
+        s.buf.reset();
+        return;
+      }
+    }
+  }
+
+  const std::shared_ptr<const std::vector<uint8_t>>& retain_ephemeral(
+      std::vector<uint8_t>&& data) {
+    retired.push_back(std::make_shared<const std::vector<uint8_t>>(std::move(data)));
+    return retired.back();
+  }
+};
+
 // Scans field headers in O(1) time per field using Prefix-Varint length prefixes
 // without parsing inside containers, returning the last matching occurrence ("last write wins").
 [[nodiscard]] inline LocatedField locate_field_mask(std::span<const uint8_t> packet,
                                                     uint32_t target_field,
-                                                    uint16_t exp_mask) noexcept {
+                                                    uint16_t exp_mask) {
+  if (target_field == 0) return {};
   size_t pos = 0;
   const size_t n = packet.size();
   LocatedField result{};
+  DecodeState f0_state{};
 
   while (pos < n) {
     uint32_t fnum = 0;
@@ -59,8 +126,11 @@ struct LocatedField {
       pos += tn;
     }
 
-    if (fnum == 0 && wt != WireSubMsg) {
-      return {};
+    if (fnum == 0) {
+      auto f0 = validate_field0(packet, pos, wt, 0, f0_state);
+      if (!f0) return {};
+      pos = f0.value();
+      continue;
     }
     if (fnum == target_field && (exp_mask & (uint16_t{1} << wt)) != 0) {
       result.val_slice = packet.subspan(pos);
@@ -76,24 +146,16 @@ struct LocatedField {
   return result;
 }
 
-[[nodiscard]] inline LocatedField locate_field(std::span<const uint8_t> packet,
-                                               uint32_t target_field) noexcept {
-  return locate_field_mask(packet, target_field, 0xFFFFu);
-}
-
-struct NextContainerResult {
-  std::span<const uint8_t> body;
-  size_t next_pos = 0;
-  bool matched = false;
-  bool valid = false;
-};
-
-[[nodiscard]] inline NextContainerResult next_container_field(std::span<const uint8_t> packet,
-                                                              size_t pos,
-                                                              uint32_t target_field,
-                                                              uint8_t exp_wt,
-                                                              uint64_t min_len) noexcept {
+[[nodiscard]] inline LocatedField locate_oneof_field(
+    std::span<const uint8_t> packet,
+    uint32_t target_field,
+    std::span<const OneofBranchSpec> group) {
+  if (target_field == 0) return {};
+  size_t pos = 0;
   const size_t n = packet.size();
+  LocatedField result{};
+  DecodeState f0_state{};
+
   while (pos < n) {
     uint32_t fnum = 0;
     uint8_t wt = 0;
@@ -116,8 +178,84 @@ struct NextContainerResult {
       pos += tn;
     }
 
-    if (fnum == 0 && wt != WireSubMsg) {
-      return {};
+    if (fnum == 0) {
+      auto f0 = validate_field0(packet, pos, wt, 0, f0_state);
+      if (!f0) return {};
+      pos = f0.value();
+      continue;
+    }
+
+    const uint16_t wt_bit = static_cast<uint16_t>(uint16_t{1} << wt);
+    for (const auto& br : group) {
+      if (br.field_num == fnum && (br.exp_mask & wt_bit) != 0) {
+        if (fnum == target_field) {
+          result.val_slice = packet.subspan(pos);
+          result.wire_type = wt;
+          result.ok = true;
+        } else {
+          result.val_slice = {};
+          result.wire_type = 0;
+          result.ok = false;
+        }
+        break;
+      }
+    }
+
+    const auto skip_res = skip_value_checked(packet, pos, wt);
+    if (!skip_res.ok) return {};
+    pos = skip_res.next_pos;
+  }
+  result.packet_valid = true;
+  return result;
+}
+
+[[nodiscard]] inline LocatedField locate_field(std::span<const uint8_t> packet,
+                                               uint32_t target_field) {
+  return locate_field_mask(packet, target_field, 0xFFFFu);
+}
+
+struct NextContainerResult {
+  std::span<const uint8_t> body;
+  size_t next_pos = 0;
+  bool matched = false;
+  bool valid = false;
+};
+
+[[nodiscard]] inline NextContainerResult next_container_field(std::span<const uint8_t> packet,
+                                                              size_t pos,
+                                                              uint32_t target_field,
+                                                              uint8_t exp_wt,
+                                                              uint64_t min_len) {
+  if (target_field == 0) return {};
+  const size_t n = packet.size();
+  DecodeState f0_state{};
+  while (pos < n) {
+    uint32_t fnum = 0;
+    uint8_t wt = 0;
+    const uint8_t b0 = packet[pos];
+    if ((b0 & 1u) != 0) {
+      fnum = static_cast<uint32_t>(b0 >> 5);
+      wt = static_cast<uint8_t>((b0 >> 1) & 0x0Fu);
+      ++pos;
+    } else if ((b0 & 2u) != 0) {
+      if (pos + 2 > n) return {};
+      const uint16_t u = static_cast<uint16_t>(read_u16_le(packet.data() + pos) >> 2);
+      fnum = static_cast<uint32_t>(u >> 4);
+      wt = static_cast<uint8_t>(u & 0x0Fu);
+      pos += 2;
+    } else {
+      const auto [tag, tn] = decode_varint(packet.subspan(pos));
+      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) return {};
+      fnum = static_cast<uint32_t>(tag >> 4);
+      wt = static_cast<uint8_t>(tag & 0x0Fu);
+      pos += tn;
+    }
+
+    if (fnum == 0) {
+      auto f0 = validate_field0(packet, pos, wt, 0, f0_state);
+      if (!f0) return {};
+      pos = f0.value();
+      continue;
     }
     if (fnum == target_field && wt == exp_wt) {
       const auto [b_len, bn] = decode_varint(packet.subspan(pos));
@@ -136,9 +274,84 @@ struct NextContainerResult {
   return {{}, n, false, true};
 }
 
+// Unvalidated O(1) container field hopper for fast infallible Opaque::get_* paths.
+[[nodiscard]] inline NextContainerResult next_container_field_fast(std::span<const uint8_t> packet,
+                                                                   size_t pos,
+                                                                   uint32_t target_field,
+                                                                   uint8_t exp_wt,
+                                                                   uint64_t min_len) noexcept {
+  if (target_field == 0) return {};
+  const size_t n = packet.size();
+  while (pos < n) {
+    uint32_t fnum = 0;
+    uint8_t wt = 0;
+    const uint8_t b0 = packet[pos];
+    if ((b0 & 1u) != 0) [[likely]] {
+      fnum = static_cast<uint32_t>(b0 >> 5);
+      wt = static_cast<uint8_t>((b0 >> 1) & 0x0Fu);
+      ++pos;
+    } else if ((b0 & 2u) != 0) {
+      if (pos + 2 > n) return {};
+      const uint16_t u = static_cast<uint16_t>(read_u16_le(packet.data() + pos) >> 2);
+      fnum = static_cast<uint32_t>(u >> 4);
+      wt = static_cast<uint8_t>(u & 0x0Fu);
+      pos += 2;
+    } else {
+      const auto [tag, tn] = decode_varint(packet.subspan(pos));
+      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) return {};
+      fnum = static_cast<uint32_t>(tag >> 4);
+      wt = static_cast<uint8_t>(tag & 0x0Fu);
+      pos += tn;
+    }
+
+    if (fnum == 0 && wt != WireSubMsg) return {};
+    if (fnum == target_field && wt == exp_wt) {
+      const auto sl = read_len_slice_fast(packet, pos, min_len);
+      if (!sl) return {};
+      return {sl.span(), sl.next_pos, true, true};
+    }
+
+    const auto skip_res = fast_skip_value(packet, pos, wt);
+    if (!skip_res.ok) return {};
+    pos = skip_res.next_pos;
+  }
+  return {{}, n, false, true};
+}
+
+// Direct offset readers used by Opaque's lazy field-offset directory.
+[[nodiscard]] inline uint64_t read_uint_at(std::span<const uint8_t> packet, size_t pos) noexcept {
+  if (pos < packet.size() && (packet[pos] & 1u) != 0) [[likely]] {
+    return static_cast<uint64_t>(packet[pos] >> 1);
+  }
+  const auto [v, n] = decode_varint(packet.subspan(pos));
+  return n > 0 ? v : 0;
+}
+
+[[nodiscard]] inline int64_t read_sint_at(std::span<const uint8_t> packet, size_t pos) noexcept {
+  if (pos < packet.size() && (packet[pos] & 1u) != 0) [[likely]] {
+    return decode_zigzag(static_cast<uint64_t>(packet[pos] >> 1));
+  }
+  const auto [v, n] = decode_varint(packet.subspan(pos));
+  return n > 0 ? decode_zigzag(v) : 0;
+}
+
+[[nodiscard]] inline std::string_view read_string_view_at(std::span<const uint8_t> packet,
+                                                          size_t pos) noexcept {
+  const auto sr = read_str_slice_fast(packet, pos);
+  if (!sr) return {};
+  return std::string_view(reinterpret_cast<const char*>(sr.ptr), sr.len);
+}
+
+[[nodiscard]] inline std::span<const uint8_t> read_bytes_view_at(std::span<const uint8_t> packet,
+                                                                 size_t pos) noexcept {
+  const auto br = read_len_slice_fast(packet, pos, 0);
+  if (!br) return {};
+  return br.span();
+}
+
 // Lazy zero-decode scalar, string, bytes, submsg, array, and map readers.
 [[nodiscard]] inline std::pair<uint64_t, bool> read_uint(std::span<const uint8_t> packet,
-                                                         uint32_t field_num) noexcept {
+                                                         uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireUint);
   if (!loc.ok) return {0, false};
   const auto [v, n] = decode_varint(loc.val_slice);
@@ -146,7 +359,7 @@ struct NextContainerResult {
 }
 
 [[nodiscard]] inline std::pair<int64_t, bool> read_sint(std::span<const uint8_t> packet,
-                                                        uint32_t field_num) noexcept {
+                                                        uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireSint);
   if (!loc.ok) return {0, false};
   const auto [v, n] = decode_varint(loc.val_slice);
@@ -155,7 +368,7 @@ struct NextContainerResult {
 }
 
 [[nodiscard]] inline std::pair<bool, bool> read_bool(std::span<const uint8_t> packet,
-                                                     uint32_t field_num) noexcept {
+                                                     uint32_t field_num) {
   const auto loc = locate_field_mask(
       packet, field_num, (uint16_t{1} << WireBoolFalse) | (uint16_t{1} << WireBoolTrue));
   if (!loc.ok) return {false, false};
@@ -163,42 +376,42 @@ struct NextContainerResult {
 }
 
 [[nodiscard]] inline std::pair<uint32_t, bool> read_fixed32(std::span<const uint8_t> packet,
-                                                            uint32_t field_num) noexcept {
+                                                            uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFixed32);
   if (!loc.ok || loc.val_slice.size() < 4) return {0, false};
   return {read_u32_le(loc.val_slice.data()), true};
 }
 
 [[nodiscard]] inline std::pair<int32_t, bool> read_sfixed32(std::span<const uint8_t> packet,
-                                                            uint32_t field_num) noexcept {
+                                                            uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireSfixed32);
   if (!loc.ok || loc.val_slice.size() < 4) return {0, false};
   return {static_cast<int32_t>(read_u32_le(loc.val_slice.data())), true};
 }
 
 [[nodiscard]] inline std::pair<float, bool> read_float32(std::span<const uint8_t> packet,
-                                                         uint32_t field_num) noexcept {
+                                                         uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFloat32);
   if (!loc.ok || loc.val_slice.size() < 4) return {0.0f, false};
   return {bits_to_float32(read_u32_le(loc.val_slice.data())), true};
 }
 
 [[nodiscard]] inline std::pair<uint64_t, bool> read_fixed64(std::span<const uint8_t> packet,
-                                                            uint32_t field_num) noexcept {
+                                                            uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFixed64);
   if (!loc.ok || loc.val_slice.size() < 8) return {0, false};
   return {read_u64_le(loc.val_slice.data()), true};
 }
 
 [[nodiscard]] inline std::pair<int64_t, bool> read_sfixed64(std::span<const uint8_t> packet,
-                                                            uint32_t field_num) noexcept {
+                                                            uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireSfixed64);
   if (!loc.ok || loc.val_slice.size() < 8) return {0, false};
   return {static_cast<int64_t>(read_u64_le(loc.val_slice.data())), true};
 }
 
 [[nodiscard]] inline std::pair<double, bool> read_float64(std::span<const uint8_t> packet,
-                                                          uint32_t field_num) noexcept {
+                                                          uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireFloat64);
   if (!loc.ok || loc.val_slice.size() < 8) return {0.0, false};
   return {bits_to_float64(read_u64_le(loc.val_slice.data())), true};
@@ -206,7 +419,7 @@ struct NextContainerResult {
 
 [[nodiscard]] inline std::pair<std::string_view, bool> read_string_view(
     std::span<const uint8_t> packet,
-    uint32_t field_num) noexcept {
+    uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireString);
   if (!loc.ok || loc.val_slice.empty()) return {{}, false};
   const auto [s_len, sn] = decode_varint(loc.val_slice);
@@ -225,7 +438,7 @@ struct NextContainerResult {
 
 [[nodiscard]] inline std::pair<std::span<const uint8_t>, bool> read_bytes_view(
     std::span<const uint8_t> packet,
-    uint32_t field_num) noexcept {
+    uint32_t field_num) {
   const auto loc = locate_field_mask(packet, field_num, uint16_t{1} << WireBytes);
   if (!loc.ok || loc.val_slice.empty()) return {{}, false};
   const auto [b_len, bn] = decode_varint(loc.val_slice);
@@ -249,7 +462,7 @@ struct NextContainerResult {
   bool found = false;
   size_t pos = 0;
   while (true) {
-    const auto res = next_container_field(packet, pos, field_num, WireSubMsg, 0);
+    const auto res = next_container_field_fast(packet, pos, field_num, WireSubMsg, 0);
     if (!res.valid) return {{}, false};
     if (!res.matched) return {std::move(merged), found};
     merged.insert(merged.end(), res.body.begin(), res.body.end());
@@ -258,18 +471,282 @@ struct NextContainerResult {
   }
 }
 
+struct OneofSubmsgResult {
+  std::span<const uint8_t> single{};
+  std::vector<uint8_t> merged{};
+  size_t count = 0;
+  bool valid = false;
+};
+
+[[nodiscard]] inline OneofSubmsgResult read_submsg_zero_copy(std::span<const uint8_t> packet,
+                                                             uint32_t field_num,
+                                                             bool deep_validate) {
+  if (field_num == 0) return {};
+  OneofSubmsgResult out{};
+  size_t pos = 0;
+  while (true) {
+    const auto res = deep_validate ? next_container_field(packet, pos, field_num, WireSubMsg, 0)
+                                   : next_container_field_fast(packet, pos, field_num, WireSubMsg, 0);
+    if (!res.valid) return {};
+    if (!res.matched) {
+      out.valid = true;
+      return out;
+    }
+    if (deep_validate) {
+      auto vr = validate_message_bytes(res.body, 1);
+      if (!vr) return {};
+    }
+    if (out.count == 0) {
+      out.single = res.body;
+      out.count = 1;
+    } else {
+      if (out.count == 1) {
+        out.merged.assign(out.single.begin(), out.single.end());
+        out.single = {};
+      }
+      out.merged.insert(out.merged.end(), res.body.begin(), res.body.end());
+      ++out.count;
+    }
+    pos = res.next_pos;
+  }
+}
+
+[[nodiscard]] inline std::pair<std::span<const uint8_t>, bool> locate_last_submsg_slice(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) noexcept {
+  std::span<const uint8_t> last{};
+  bool found = false;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field_fast(packet, pos, field_num, WireSubMsg, 0);
+    if (!res.valid) return {{}, false};
+    if (!res.matched) return {last, found};
+    last = res.body;
+    found = true;
+    pos = res.next_pos;
+  }
+}
+
+[[nodiscard]] inline Result<std::optional<std::span<const uint8_t>>> try_locate_last_submsg_slice(
+    std::span<const uint8_t> packet,
+    uint32_t field_num) {
+  std::span<const uint8_t> last{};
+  bool found = false;
+  size_t pos = 0;
+  while (true) {
+    const auto res = next_container_field(packet, pos, field_num, WireSubMsg, 0);
+    if (!res.valid) return Error{"omnibuf: corrupt packet while reading WireSubMsg"};
+    if (!res.matched) {
+      if (!found) return std::optional<std::span<const uint8_t>>{std::nullopt};
+      return std::optional<std::span<const uint8_t>>{last};
+    }
+    auto vr = validate_message_bytes(res.body, 1);
+    if (!vr) return Error{vr.error()};
+    last = res.body;
+    found = true;
+    pos = res.next_pos;
+  }
+}
+
+[[nodiscard]] inline std::pair<std::span<const uint8_t>, bool> locate_last_oneof_submsg_slice(
+    std::span<const uint8_t> packet,
+    uint32_t target_field,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, target_field, group);
+  if (!loc.ok || loc.wire_type != WireSubMsg) return {{}, false};
+  const auto sl = read_len_slice_fast(loc.val_slice, 0, 0);
+  if (!sl) return {{}, false};
+  return {sl.span(), true};
+}
+
+[[nodiscard]] inline Result<std::optional<std::span<const uint8_t>>>
+try_locate_last_oneof_submsg_slice(std::span<const uint8_t> packet,
+                                   uint32_t target_field,
+                                   std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, target_field, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok || loc.wire_type != WireSubMsg) {
+    return std::optional<std::span<const uint8_t>>{std::nullopt};
+  }
+  const auto sl = read_len_slice_fast(loc.val_slice, 0, 0);
+  if (!sl) return Error{sl.err};
+  auto vr = validate_message_bytes(sl.span(), 1);
+  if (!vr) return Error{vr.error()};
+  return std::optional<std::span<const uint8_t>>{sl.span()};
+}
+
+template <typename MapOrdFn>
+[[nodiscard]] inline uint8_t build_opaque_offset_dir(
+    std::span<const uint8_t> packet,
+    std::span<const OpaqueFieldDirSpec> specs,
+    std::span<uint64_t> present_words,
+    std::span<uint32_t> offsets,
+    MapOrdFn&& map_fnum_to_ord) {
+  for (uint64_t& w : present_words) {
+    w = 0;
+  }
+  const size_t n = packet.size();
+  if (n > UINT32_MAX) return 4u;
+  size_t pos = 0;
+  DecodeState f0_state{};
+
+  while (pos < n) {
+    uint32_t fnum = 0;
+    uint8_t wt = 0;
+    const uint8_t b0 = packet[pos];
+    if ((b0 & 1u) != 0) [[likely]] {
+      fnum = static_cast<uint32_t>(b0 >> 5);
+      wt = static_cast<uint8_t>((b0 >> 1) & 0x0Fu);
+      ++pos;
+    } else if ((b0 & 2u) != 0) {
+      if (pos + 2 > n) return 3u;
+      const uint16_t u = static_cast<uint16_t>(read_u16_le(packet.data() + pos) >> 2);
+      fnum = static_cast<uint32_t>(u >> 4);
+      wt = static_cast<uint8_t>(u & 0x0Fu);
+      pos += 2;
+    } else {
+      const auto [tag, tn] = decode_varint(packet.subspan(pos));
+      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) return 3u;
+      fnum = static_cast<uint32_t>(tag >> 4);
+      wt = static_cast<uint8_t>(tag & 0x0Fu);
+      pos += tn;
+    }
+
+    if (fnum == 0) {
+      auto f0 = validate_field0(packet, pos, wt, 0, f0_state);
+      if (!f0) return 3u;
+      pos = f0.value();
+      continue;
+    }
+
+    const auto skip_res = skip_value_checked(packet, pos, wt);
+    if (!skip_res.ok) return 3u;
+
+    const int ord_i = map_fnum_to_ord(fnum);
+    if (ord_i >= 0) {
+      const size_t ord = static_cast<size_t>(ord_i);
+      if (ord < specs.size()) {
+        const auto& sp = specs[ord];
+        if ((sp.exp_mask & static_cast<uint16_t>(uint16_t{1} << wt)) != 0) {
+          if (sp.oneof_group >= 0) {
+            for (size_t sib = 0; sib < specs.size(); ++sib) {
+              if (specs[sib].oneof_group == sp.oneof_group) {
+                present_words[sib >> 6] &= ~(uint64_t{1} << (sib & 63u));
+              }
+            }
+          }
+          present_words[ord >> 6] |= (uint64_t{1} << (ord & 63u));
+          offsets[ord] = sp.is_bool ? ((wt == WireBoolTrue) ? 1u : 0u)
+                                    : static_cast<uint32_t>(pos);
+        }
+      }
+    }
+    pos = skip_res.next_pos;
+  }
+  return 2u;
+}
+
+[[nodiscard]] inline OneofSubmsgResult read_oneof_submsg(
+    std::span<const uint8_t> packet,
+    uint32_t target_field,
+    std::span<const OneofBranchSpec> group,
+    bool deep_validate) {
+  if (target_field == 0) return {};
+  size_t pos = 0;
+  const size_t n = packet.size();
+  OneofSubmsgResult res{};
+  DecodeState f0_state{};
+
+  while (pos < n) {
+    uint32_t fnum = 0;
+    uint8_t wt = 0;
+    const uint8_t b0 = packet[pos];
+    if ((b0 & 1u) != 0) {
+      fnum = static_cast<uint32_t>(b0 >> 5);
+      wt = static_cast<uint8_t>((b0 >> 1) & 0x0Fu);
+      ++pos;
+    } else if ((b0 & 2u) != 0) {
+      if (pos + 2 > n) return {};
+      const uint16_t u = static_cast<uint16_t>(read_u16_le(packet.data() + pos) >> 2);
+      fnum = static_cast<uint32_t>(u >> 4);
+      wt = static_cast<uint8_t>(u & 0x0Fu);
+      pos += 2;
+    } else {
+      const auto [tag, tn] = decode_varint(packet.subspan(pos));
+      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) return {};
+      fnum = static_cast<uint32_t>(tag >> 4);
+      wt = static_cast<uint8_t>(tag & 0x0Fu);
+      pos += tn;
+    }
+
+    if (fnum == 0) {
+      if (deep_validate) {
+        auto f0 = validate_field0(packet, pos, wt, 0, f0_state);
+        if (!f0) return {};
+        pos = f0.value();
+      } else {
+        if (wt != WireSubMsg) return {};
+        const auto sk = fast_skip_value(packet, pos, wt);
+        if (!sk.ok) return {};
+        pos = sk.next_pos;
+      }
+      continue;
+    }
+
+    if (fnum == target_field && wt == WireSubMsg) {
+      const auto sl = read_len_slice_fast(packet, pos, 0);
+      if (!sl) return {};
+      if (deep_validate) {
+        auto vr = validate_message_bytes(sl.span(), 1);
+        if (!vr) return {};
+      }
+      if (res.count == 0) {
+        res.single = sl.span();
+        res.count = 1;
+      } else {
+        if (res.count == 1) {
+          res.merged.assign(res.single.begin(), res.single.end());
+          res.single = {};
+        }
+        res.merged.insert(res.merged.end(), sl.ptr, sl.ptr + sl.len);
+        ++res.count;
+      }
+      pos = sl.next_pos;
+      continue;
+    }
+
+    const uint16_t wt_bit = static_cast<uint16_t>(uint16_t{1} << wt);
+    for (const auto& br : group) {
+      if (br.field_num == fnum && fnum != target_field && (br.exp_mask & wt_bit) != 0) {
+        res.single = {};
+        res.merged.clear();
+        res.count = 0;
+        break;
+      }
+    }
+
+    const auto skip_res =
+        deep_validate ? skip_value_checked(packet, pos, wt) : fast_skip_value(packet, pos, wt);
+    if (!skip_res.ok) return {};
+    pos = skip_res.next_pos;
+  }
+  res.valid = true;
+  return res;
+}
+
 [[nodiscard]] inline size_t counted_arr_len(std::span<const uint8_t> packet,
                                             uint32_t field_num,
                                             uint8_t elem_wt) noexcept {
   size_t total = 0;
   size_t pos = 0;
   while (true) {
-    const auto res = next_container_field(packet, pos, field_num, WireArray, 2);
+    const auto res = next_container_field_fast(packet, pos, field_num, WireArray, 2);
     if (!res.valid) return 0;
     if (!res.matched) return total;
     pos = res.next_pos;
     const auto hdr = parse_array_header(res.body);
     if (!hdr.ok || hdr.elem_wt != elem_wt) return 0;
+    if (hdr.count > SIZE_MAX - total) return 0;
     total += hdr.count;
   }
 }
@@ -292,12 +769,12 @@ struct NextContainerResult {
   size_t total = 0;
   size_t pos = 0;
   while (true) {
-    const auto res = next_container_field(packet, pos, field_num, WireArray, 2);
+    const auto res = next_container_field_fast(packet, pos, field_num, WireArray, 2);
     if (!res.valid) return 0;
     if (!res.matched) return total;
     pos = res.next_pos;
     const auto [c, ok] = count_submsg_arr_elems(res.body);
-    if (!ok) return 0;
+    if (!ok || c > SIZE_MAX - total) return 0;
     total += c;
   }
 }
@@ -514,6 +991,237 @@ template <typename VecT, typename DecodeFn>
       loc.val_slice.subspan(bn, static_cast<size_t>(b_len))};
 }
 
+[[nodiscard]] inline std::pair<uint64_t, bool> read_oneof_uint(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok) return {0, false};
+  const auto [v, n] = decode_varint(loc.val_slice);
+  return {v, n > 0};
+}
+
+[[nodiscard]] inline std::pair<int64_t, bool> read_oneof_sint(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok) return {0, false};
+  const auto [v, n] = decode_varint(loc.val_slice);
+  if (n == 0) return {0, false};
+  return {decode_zigzag(v), true};
+}
+
+[[nodiscard]] inline std::pair<bool, bool> read_oneof_bool(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok) return {false, false};
+  return {loc.wire_type == WireBoolTrue, true};
+}
+
+[[nodiscard]] inline std::pair<uint32_t, bool> read_oneof_fixed32(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.size() < 4) return {0, false};
+  return {read_u32_le(loc.val_slice.data()), true};
+}
+
+[[nodiscard]] inline std::pair<int32_t, bool> read_oneof_sfixed32(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.size() < 4) return {0, false};
+  return {static_cast<int32_t>(read_u32_le(loc.val_slice.data())), true};
+}
+
+[[nodiscard]] inline std::pair<float, bool> read_oneof_float32(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.size() < 4) return {0.0f, false};
+  return {bits_to_float32(read_u32_le(loc.val_slice.data())), true};
+}
+
+[[nodiscard]] inline std::pair<uint64_t, bool> read_oneof_fixed64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.size() < 8) return {0, false};
+  return {read_u64_le(loc.val_slice.data()), true};
+}
+
+[[nodiscard]] inline std::pair<int64_t, bool> read_oneof_sfixed64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.size() < 8) return {0, false};
+  return {static_cast<int64_t>(read_u64_le(loc.val_slice.data())), true};
+}
+
+[[nodiscard]] inline std::pair<double, bool> read_oneof_float64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.size() < 8) return {0.0, false};
+  return {bits_to_float64(read_u64_le(loc.val_slice.data())), true};
+}
+
+[[nodiscard]] inline std::pair<std::string_view, bool> read_oneof_string_view(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.empty()) return {{}, false};
+  const auto sr = read_str_slice_fast(loc.val_slice, 0);
+  if (!sr) return {{}, false};
+  return {std::string_view(reinterpret_cast<const char*>(sr.ptr), sr.len), true};
+}
+
+[[nodiscard]] inline std::pair<std::span<const uint8_t>, bool> read_oneof_bytes_view(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.ok || loc.val_slice.empty()) return {{}, false};
+  const auto br = read_len_slice_fast(loc.val_slice, 0, 0);
+  if (!br) return {{}, false};
+  return {br.span(), true};
+}
+
+[[nodiscard]] inline Result<std::optional<uint64_t>> try_read_oneof_uint(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<uint64_t>{std::nullopt};
+  const auto [v, n] = decode_varint(loc.val_slice);
+  if (n == 0) return Error{"omnibuf: corrupt WireUint varint"};
+  return std::optional<uint64_t>{v};
+}
+
+[[nodiscard]] inline Result<std::optional<int64_t>> try_read_oneof_sint(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<int64_t>{std::nullopt};
+  const auto [v, n] = decode_varint(loc.val_slice);
+  if (n == 0) return Error{"omnibuf: corrupt WireSint varint"};
+  return std::optional<int64_t>{decode_zigzag(v)};
+}
+
+[[nodiscard]] inline Result<std::optional<bool>> try_read_oneof_bool(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<bool>{std::nullopt};
+  return std::optional<bool>{loc.wire_type == WireBoolTrue};
+}
+
+[[nodiscard]] inline Result<std::optional<uint32_t>> try_read_oneof_fixed32(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<uint32_t>{std::nullopt};
+  if (loc.val_slice.size() < 4) return Error{"omnibuf: truncated WireFixed32"};
+  return std::optional<uint32_t>{read_u32_le(loc.val_slice.data())};
+}
+
+[[nodiscard]] inline Result<std::optional<int32_t>> try_read_oneof_sfixed32(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<int32_t>{std::nullopt};
+  if (loc.val_slice.size() < 4) return Error{"omnibuf: truncated WireSfixed32"};
+  return std::optional<int32_t>{static_cast<int32_t>(read_u32_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<float>> try_read_oneof_float32(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<float>{std::nullopt};
+  if (loc.val_slice.size() < 4) return Error{"omnibuf: truncated WireFloat32"};
+  return std::optional<float>{bits_to_float32(read_u32_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<uint64_t>> try_read_oneof_fixed64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<uint64_t>{std::nullopt};
+  if (loc.val_slice.size() < 8) return Error{"omnibuf: truncated WireFixed64"};
+  return std::optional<uint64_t>{read_u64_le(loc.val_slice.data())};
+}
+
+[[nodiscard]] inline Result<std::optional<int64_t>> try_read_oneof_sfixed64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<int64_t>{std::nullopt};
+  if (loc.val_slice.size() < 8) return Error{"omnibuf: truncated WireSfixed64"};
+  return std::optional<int64_t>{static_cast<int64_t>(read_u64_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<double>> try_read_oneof_float64(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<double>{std::nullopt};
+  if (loc.val_slice.size() < 8) return Error{"omnibuf: truncated WireFloat64"};
+  return std::optional<double>{bits_to_float64(read_u64_le(loc.val_slice.data()))};
+}
+
+[[nodiscard]] inline Result<std::optional<std::string_view>> try_read_oneof_string_view(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<std::string_view>{std::nullopt};
+  const auto sr = read_str_slice_fast(loc.val_slice, 0);
+  if (!sr) return Error{sr.err};
+  return std::optional<std::string_view>{
+      std::string_view(reinterpret_cast<const char*>(sr.ptr), sr.len)};
+}
+
+[[nodiscard]] inline Result<std::optional<std::span<const uint8_t>>> try_read_oneof_bytes_view(
+    std::span<const uint8_t> packet,
+    uint32_t field_num,
+    std::span<const OneofBranchSpec> group) {
+  const auto loc = locate_oneof_field(packet, field_num, group);
+  if (!loc.packet_valid) return Error{"omnibuf: corrupt packet"};
+  if (!loc.ok) return std::optional<std::span<const uint8_t>>{std::nullopt};
+  const auto br = read_len_slice_fast(loc.val_slice, 0, 0);
+  if (!br) return Error{br.err};
+  return std::optional<std::span<const uint8_t>>{br.span()};
+}
+
 [[nodiscard]] inline Result<std::optional<std::vector<uint8_t>>> try_read_submsg(
     std::span<const uint8_t> packet,
     uint32_t field_num) {
@@ -687,7 +1395,7 @@ template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
 [[nodiscard]] inline std::pair<uint64_t, bool> lookup_map_string_uint(
     std::span<const uint8_t> packet,
     uint32_t field_num,
-    std::string_view target_key) noexcept {
+    std::string_view target_key) {
   return lookup_scalar_map<WireString, WireUint, std::string, uint64_t>(packet, field_num,
                                                                         target_key);
 }
@@ -771,9 +1479,9 @@ template <bool DeepValidate, typename AppendDirtyFn>
       raw = raw_copy;
     }
   }
-  if (n <= SIZE_MAX - 32 && dst.size() <= SIZE_MAX - (n + 32) &&
-      dst.capacity() < dst.size() + n + 32) {
-    dst.reserve(dst.size() + n + 32);
+  if (n <= SIZE_MAX - 160 && dst.size() <= SIZE_MAX - (n + 160) &&
+      dst.capacity() < dst.size() + n + 160) {
+    dst.reserve(dst.size() + n + 160);
   }
 
   std::array<uint64_t, 4> inline_emitted{};
@@ -907,6 +1615,171 @@ template <bool DeepValidate, typename AppendDirtyFn>
           dst.resize(orig_dst_size);
           return Error{err};
         }
+      }
+      rem &= (rem - 1u);
+    }
+  }
+
+  return Result<void>::success();
+}
+
+// Ordinal-indexed zero-decode wire splicer used by generated Opaque<T> classes so dirty_
+// scales with dense field count (num_fields) rather than sparse maximum tag numbers.
+template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
+[[nodiscard]] inline Result<void> splice_fields_ordinal_into_impl(
+    std::vector<uint8_t>& dst,
+    std::span<const uint8_t> raw,
+    std::span<const uint64_t> dirty_words,
+    size_t num_fields,
+    MapOrdFn&& map_fnum_to_ord,
+    AppendOrdFn&& append_dirty_ord) {
+  const size_t orig_dst_size = dst.size();
+  const size_t n = raw.size();
+  std::vector<uint8_t> raw_copy;
+  if (n > 0 && dst.capacity() > 0) {
+    const uintptr_t dst_start = reinterpret_cast<uintptr_t>(dst.data());
+    const uintptr_t dst_end = dst_start + dst.capacity();
+    const uintptr_t raw_start = reinterpret_cast<uintptr_t>(raw.data());
+    const uintptr_t raw_end = raw_start + n;
+    if (dst_start < raw_end && raw_start < dst_end) {
+      raw_copy.assign(raw.begin(), raw.end());
+      raw = raw_copy;
+    }
+  }
+  if (n <= SIZE_MAX - 160 && dst.size() <= SIZE_MAX - (n + 160) &&
+      dst.capacity() < dst.size() + n + 160) {
+    dst.reserve(dst.size() + n + 160);
+  }
+
+  std::array<uint64_t, 4> inline_emitted{};
+  std::vector<uint64_t> heap_emitted;
+  std::span<uint64_t> emitted;
+  if (dirty_words.size() <= inline_emitted.size()) {
+    emitted = std::span<uint64_t>(inline_emitted.data(), dirty_words.size());
+  } else {
+    heap_emitted.assign(dirty_words.size(), 0);
+    emitted = std::span<uint64_t>(heap_emitted);
+  }
+
+  auto is_dirty_ord = [&](size_t ord) noexcept -> bool {
+    const size_t w = ord >> 6;
+    return w < dirty_words.size() && ((dirty_words[w] >> (ord & 63u)) & 1u) != 0;
+  };
+  auto is_emitted_ord = [&](size_t ord) noexcept -> bool {
+    const size_t w = ord >> 6;
+    return w < emitted.size() && ((emitted[w] >> (ord & 63u)) & 1u) != 0;
+  };
+  auto mark_emitted_ord = [&](size_t ord) noexcept {
+    const size_t w = ord >> 6;
+    if (w < emitted.size()) {
+      emitted[w] |= (uint64_t{1} << (ord & 63u));
+    }
+  };
+
+  DecodeState val_state{};
+  size_t pos = 0;
+  size_t clean_start = 0;
+
+  while (pos < n) {
+    const size_t field_start = pos;
+    uint32_t fnum = 0;
+    uint8_t wt = 0;
+    const uint8_t b0 = raw[pos];
+    if ((b0 & 1u) != 0) [[likely]] {
+      fnum = static_cast<uint32_t>(b0 >> 5);
+      wt = static_cast<uint8_t>((b0 >> 1) & 0x0Fu);
+      ++pos;
+    } else if ((b0 & 2u) != 0 && pos + 2 <= n) {
+      const uint16_t u = static_cast<uint16_t>(read_u16_le(raw.data() + pos) >> 2);
+      fnum = static_cast<uint32_t>(u >> 4);
+      wt = static_cast<uint8_t>(u & 0x0Fu);
+      pos += 2;
+    } else {
+      const auto [tag, tn] = decode_varint(raw.subspan(pos));
+      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) {
+        dst.resize(orig_dst_size);
+        return Error{"omnibuf: corrupt or truncated tag in splice_fields_into"};
+      }
+      fnum = static_cast<uint32_t>(tag >> 4);
+      wt = static_cast<uint8_t>(tag & 0x0Fu);
+      pos += tn;
+    }
+
+    if (fnum == 0) {
+      if constexpr (DeepValidate) {
+        auto f0 = validate_field0(raw, pos, wt, 0, val_state);
+        if (!f0) {
+          dst.resize(orig_dst_size);
+          return Error{f0.error()};
+        }
+        pos = f0.value();
+      } else {
+        if (wt != WireSubMsg) {
+          dst.resize(orig_dst_size);
+          return Error{"omnibuf: invalid Field #0 wire type"};
+        }
+        const auto sk = fast_skip_value(raw, pos, wt);
+        if (!sk.ok) {
+          dst.resize(orig_dst_size);
+          return Error{"omnibuf: truncated Field #0"};
+        }
+        pos = sk.next_pos;
+      }
+    } else if constexpr (DeepValidate) {
+      auto vr = validate_value(raw, pos, wt, 0, val_state);
+      if (!vr) {
+        dst.resize(orig_dst_size);
+        return Error{vr.error()};
+      }
+      pos = vr.value();
+    } else {
+      const auto skip_res = fast_skip_value(raw, pos, wt);
+      if (!skip_res.ok) {
+        dst.resize(orig_dst_size);
+        return Error{"omnibuf: corrupt or truncated field payload in splice_fields_into"};
+      }
+      pos = skip_res.next_pos;
+    }
+    const size_t field_end = pos;
+
+    const int ord_i = map_fnum_to_ord(fnum);
+    if (ord_i >= 0) {
+      const size_t ord = static_cast<size_t>(ord_i);
+      if (is_dirty_ord(ord)) {
+        if (clean_start < field_start) {
+          dst.insert(dst.end(), raw.begin() + static_cast<ptrdiff_t>(clean_start),
+                     raw.begin() + static_cast<ptrdiff_t>(field_start));
+        }
+        if (!is_emitted_ord(ord)) {
+          if (const char* err = invoke_append_dirty(append_dirty_ord, dst, ord)) {
+            dst.resize(orig_dst_size);
+            return Error{err};
+          }
+          mark_emitted_ord(ord);
+        }
+        clean_start = field_end;
+      } else {
+        mark_emitted_ord(ord);
+      }
+    }
+  }
+
+  if (clean_start < n) {
+    dst.insert(dst.end(), raw.begin() + static_cast<ptrdiff_t>(clean_start),
+               raw.begin() + static_cast<ptrdiff_t>(n));
+  }
+
+  for (size_t w = 0; w < dirty_words.size(); ++w) {
+    uint64_t rem = dirty_words[w] & ~emitted[w];
+    while (rem != 0) {
+      const int bit_idx = std::countr_zero(rem);
+      const size_t ord = (w << 6) + static_cast<size_t>(bit_idx);
+      if (ord >= num_fields) {
+        break;
+      }
+      if (const char* err = invoke_append_dirty(append_dirty_ord, dst, ord)) {
+        dst.resize(orig_dst_size);
+        return Error{err};
       }
       rem &= (rem - 1u);
     }

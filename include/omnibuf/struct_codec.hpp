@@ -146,9 +146,9 @@ consteval uint8_t scalar_wire_type() {
   } else if constexpr (Override == WireOverride::Sint) {
     return WireSint;
   } else if constexpr (Override == WireOverride::Fixed32) {
-    return std::is_signed_v<T> ? WireSfixed32 : WireFixed32;
+    return IsSignedScalarV<T> ? WireSfixed32 : WireFixed32;
   } else if constexpr (Override == WireOverride::Fixed64) {
-    return std::is_signed_v<T> ? WireSfixed64 : WireFixed64;
+    return IsSignedScalarV<T> ? WireSfixed64 : WireFixed64;
   } else if constexpr (Override == WireOverride::Sfixed32) {
     return WireSfixed32;
   } else if constexpr (Override == WireOverride::Sfixed64) {
@@ -168,7 +168,7 @@ consteval uint8_t scalar_wire_type() {
   } else if constexpr (std::integral<T> && std::is_signed_v<T>) {
     return WireSint;
   } else if constexpr (std::is_enum_v<T>) {
-    return std::is_unsigned_v<std::underlying_type_t<T>> ? WireUint : WireSint;
+    return WireSint;
   } else {
     static_assert(sizeof(T) == 0, "Unsupported scalar type for OmniBuf struct codec");
     return 0;
@@ -345,9 +345,112 @@ inline std::shared_ptr<SchemaMeta> build_struct_value_schema_meta(const T& msg, 
 }
 
 template <RegisteredStruct T>
+[[nodiscard]] inline size_t struct_wire_size_hint(const T& msg, int hint_depth = 0) noexcept;
+
+template <WireOverride Override, WireOverride KeyOverride, typename ValT>
+[[nodiscard]] inline size_t elem_wire_size_hint(const ValT& val, int hint_depth) noexcept {
+  if (hint_depth >= 2) return 0;
+  if constexpr (RegisteredStruct<ValT>) {
+    const size_t sub = struct_wire_size_hint(val, hint_depth);
+    return (sub > 16383u ? 4u : 2u) + sub;
+  } else if constexpr (IsUniquePtr<ValT>::value || IsBox<ValT>::value) {
+    if (!val) return 2;
+    const size_t sub = struct_wire_size_hint(*val, hint_depth);
+    return (sub > 16383u ? 4u : 2u) + sub;
+  } else if constexpr (IsStdVector<ValT>::value && !std::is_same_v<ValT, std::vector<uint8_t>>) {
+    size_t body = 1 + varint_size(val.size());
+    for (const auto& e : val) {
+      body += elem_wire_size_hint<Override, KeyOverride>(e, hint_depth + 1);
+    }
+    return (body > 16383u ? 4u : 2u) + body;
+  } else if constexpr (IsAnyMapV<ValT>) {
+    return 4 + val.size() * 2;
+  } else if constexpr (std::is_same_v<ValT, std::string> ||
+                       std::is_same_v<ValT, std::vector<uint8_t>>) {
+    return varint_size(val.size()) + val.size();
+  } else {
+    constexpr uint8_t wt = scalar_wire_type<ValT, Override>();
+    if constexpr (wt == WireFixed32 || wt == WireSfixed32 || wt == WireFloat32) return 4;
+    if constexpr (wt == WireFixed64 || wt == WireSfixed64 || wt == WireFloat64) return 8;
+    return 1;
+  }
+}
+
+template <uint32_t FieldNum, WireOverride Override, WireOverride KeyOverride, typename FieldT>
+[[nodiscard]] inline size_t field_wire_size_hint(const FieldT& value, int hint_depth) noexcept {
+  constexpr size_t tag_sz = varint_size((static_cast<uint64_t>(FieldNum) << 4) | 0x0Fu);
+  if constexpr (RegisteredStruct<FieldT>) {
+    const size_t sub = struct_wire_size_hint(value, hint_depth + 1);
+    return tag_sz + (sub > 16383u ? 4u : 2u) + sub;
+  } else if constexpr (IsStdOptional<FieldT>::value || IsUniquePtr<FieldT>::value ||
+                       IsBox<FieldT>::value) {
+    if (!value) return 0;
+    using Inner = typename PointeeType<FieldT>::type;
+    if constexpr (RegisteredStruct<Inner>) {
+      const size_t sub = struct_wire_size_hint(*value, hint_depth + 1);
+      return tag_sz + (sub > 16383u ? 4u : 2u) + sub;
+    } else {
+      return field_wire_size_hint<FieldNum, Override, KeyOverride>(*value, hint_depth);
+    }
+  } else if constexpr (IsStdVector<FieldT>::value &&
+                       !std::is_same_v<FieldT, std::vector<uint8_t>>) {
+    using Elem = typename FieldT::value_type;
+    size_t body = 1 + varint_size(value.size());
+    if constexpr (std::is_same_v<Elem, bool>) {
+      body += value.size();
+    } else if constexpr (!RegisteredStruct<Elem> && !IsUniquePtr<Elem>::value &&
+                         !IsBox<Elem>::value && !IsStdVector<Elem>::value &&
+                         !IsAnyMapV<Elem> && !std::is_same_v<Elem, std::string>) {
+      constexpr uint8_t ewt = scalar_wire_type<Elem, Override>();
+      if constexpr (ewt == WireFixed32 || ewt == WireSfixed32 || ewt == WireFloat32) {
+        body += value.size() * 4;
+      } else if constexpr (ewt == WireFixed64 || ewt == WireSfixed64 || ewt == WireFloat64) {
+        body += value.size() * 8;
+      } else {
+        body += value.size();
+      }
+    } else {
+      for (const auto& elem : value) {
+        body += elem_wire_size_hint<Override, KeyOverride>(elem, hint_depth + 1);
+      }
+    }
+    return tag_sz + (body > 16383u ? 4u : 2u) + body;
+  } else if constexpr (IsAnyMapV<FieldT>) {
+    size_t body = 2 + varint_size(value.size());
+    for (const auto& [k, v] : value) {
+      body += elem_wire_size_hint<KeyOverride, KeyOverride>(k, hint_depth + 1);
+      body += elem_wire_size_hint<Override, KeyOverride>(v, hint_depth + 1);
+    }
+    return tag_sz + (body > 16383u ? 4u : 2u) + body;
+  } else if constexpr (std::is_same_v<FieldT, bool>) {
+    return tag_sz;
+  } else {
+    return tag_sz + elem_wire_size_hint<Override, KeyOverride>(value, hint_depth);
+  }
+}
+
+template <RegisteredStruct T>
+[[nodiscard]] inline size_t struct_wire_size_hint(const T& msg, int hint_depth) noexcept {
+  if (hint_depth >= 2) return 0;
+  const auto fields = StructTraits<T>::fields();
+  size_t total = 0;
+  std::apply(
+      [&](const auto&... fd) {
+        ((total += field_wire_size_hint<std::remove_cvref_t<decltype(fd)>::number,
+                                        std::remove_cvref_t<decltype(fd)>::wire_override,
+                                        std::remove_cvref_t<decltype(fd)>::key_wire_override>(
+              msg.*(fd.member), hint_depth)),
+         ...);
+      },
+      fields);
+  return total;
+}
+
+template <RegisteredStruct T>
 [[nodiscard]] inline const char* encode_struct_body(FastWriter& w,
                                                     const T& msg,
-                                                    MarshalOptions opts);
+                                                    MarshalOptions opts,
+                                                    int depth = 0);
 
 template <typename ValT, WireOverride Override>
 [[nodiscard]] inline const char* encode_scalar_payload(FastWriter& w, const ValT& val) {
@@ -382,37 +485,47 @@ template <typename ValT, WireOverride Override>
 template <WireOverride Override, WireOverride KeyOverride, typename ContainerT>
 [[nodiscard]] inline const char* encode_vector_payload(FastWriter& w,
                                                        const ContainerT& value,
-                                                       MarshalOptions opts);
+                                                       MarshalOptions opts,
+                                                       int depth);
 
 template <WireOverride Override, WireOverride KeyOverride, typename MapT>
 [[nodiscard]] inline const char* encode_map_payload(FastWriter& w,
                                                     const MapT& value,
-                                                    MarshalOptions opts);
+                                                    MarshalOptions opts,
+                                                    int depth);
 
 template <WireOverride Override, WireOverride KeyOverride, typename ValT>
 [[nodiscard]] inline const char* encode_container_elem(FastWriter& w,
                                                        const ValT& val,
-                                                       MarshalOptions opts) {
+                                                       MarshalOptions opts,
+                                                       int depth) {
   if constexpr (RegisteredStruct<ValT>) {
-    const size_t len_pos = w.reserve_len_2b();
-    const char* err = encode_struct_body(w, val, opts);
+    const size_t sub_hint = struct_wire_size_hint(val, 1);
+    const bool use_4b = sub_hint > 16383u;
+    const size_t len_pos = w.reserve_len_hint(sub_hint);
+    const char* err = encode_struct_body(w, val, opts, depth + 1);
     if (err != nullptr) [[unlikely]] return err;
-    w.backpatch_len(len_pos);
+    w.backpatch_len_hint(len_pos, use_4b);
     return nullptr;
   } else if constexpr (IsUniquePtr<ValT>::value || IsBox<ValT>::value) {
     using Inner = typename PointeeType<ValT>::type;
     static_assert(RegisteredStruct<Inner>, "Smart-pointer element must be RegisteredStruct");
-    const size_t len_pos = w.reserve_len_2b();
+    if (depth + 1 > MAX_CONTAINER_DEPTH) [[unlikely]] {
+      return "omnibuf: message nesting depth exceeds max_depth";
+    }
+    const size_t sub_hint = val ? struct_wire_size_hint(*val, 1) : 0;
+    const bool use_4b = sub_hint > 16383u;
+    const size_t len_pos = w.reserve_len_hint(sub_hint);
     if (val) {
-      const char* err = encode_struct_body(w, *val, opts);
+      const char* err = encode_struct_body(w, *val, opts, depth + 1);
       if (err != nullptr) [[unlikely]] return err;
     }
-    w.backpatch_len(len_pos);
+    w.backpatch_len_hint(len_pos, use_4b);
     return nullptr;
   } else if constexpr (IsStdVector<ValT>::value && !std::is_same_v<ValT, std::vector<uint8_t>>) {
-    return encode_vector_payload<Override, KeyOverride>(w, val, opts);
+    return encode_vector_payload<Override, KeyOverride>(w, val, opts, depth + 1);
   } else if constexpr (IsAnyMapV<ValT>) {
-    return encode_map_payload<Override, KeyOverride>(w, val, opts);
+    return encode_map_payload<Override, KeyOverride>(w, val, opts, depth + 1);
   } else {
     return encode_scalar_payload<ValT, Override>(w, val);
   }
@@ -421,10 +534,23 @@ template <WireOverride Override, WireOverride KeyOverride, typename ValT>
 template <WireOverride Override, WireOverride KeyOverride, typename ContainerT>
 [[nodiscard]] inline const char* encode_vector_payload(FastWriter& w,
                                                        const ContainerT& value,
-                                                       MarshalOptions opts) {
+                                                       MarshalOptions opts,
+                                                       int depth) {
+  if (depth > MAX_CONTAINER_DEPTH) [[unlikely]] {
+    return "omnibuf: array nesting depth exceeds max_depth";
+  }
   using Elem = typename ContainerT::value_type;
   constexpr uint8_t elem_wt = container_value_wire_type<Elem, Override>();
-  const size_t len_pos = w.reserve_len_2b();
+  size_t body_hint = 1 + varint_size(value.size());
+  if constexpr (std::is_same_v<Elem, bool>) {
+    body_hint += value.size();
+  } else {
+    for (const auto& elem : value) {
+      body_hint += elem_wire_size_hint<Override, KeyOverride>(elem, 1);
+    }
+  }
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(elem_wt);
   w.write_varint(value.size());
   if constexpr (std::is_same_v<Elem, bool>) {
@@ -432,27 +558,51 @@ template <WireOverride Override, WireOverride KeyOverride, typename ContainerT>
     for (bool b : value) {
       w.write_byte(b ? uint8_t{1} : uint8_t{0});
     }
+  } else if constexpr (std::endian::native == std::endian::little &&
+                       !RegisteredStruct<Elem> && !IsUniquePtr<Elem>::value &&
+                       !IsBox<Elem>::value && !IsStdVector<Elem>::value && !IsAnyMapV<Elem> &&
+                       (elem_wt == WireFixed32 || elem_wt == WireSfixed32 ||
+                        elem_wt == WireFloat32) &&
+                       sizeof(Elem) == 4 && std::is_trivially_copyable_v<Elem>) {
+    w.write_bytes(value.data(), value.size() * 4);
+  } else if constexpr (std::endian::native == std::endian::little &&
+                       !RegisteredStruct<Elem> && !IsUniquePtr<Elem>::value &&
+                       !IsBox<Elem>::value && !IsStdVector<Elem>::value && !IsAnyMapV<Elem> &&
+                       (elem_wt == WireFixed64 || elem_wt == WireSfixed64 ||
+                        elem_wt == WireFloat64) &&
+                       sizeof(Elem) == 8 && std::is_trivially_copyable_v<Elem>) {
+    w.write_bytes(value.data(), value.size() * 8);
   } else {
     for (const auto& elem : value) {
-      const char* err = encode_container_elem<Override, KeyOverride>(w, elem, opts);
+      const char* err = encode_container_elem<Override, KeyOverride>(w, elem, opts, depth);
       if (err != nullptr) [[unlikely]] return err;
     }
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
   return nullptr;
 }
 
 template <WireOverride Override, WireOverride KeyOverride, typename MapT>
 [[nodiscard]] inline const char* encode_map_payload(FastWriter& w,
                                                     const MapT& value,
-                                                    MarshalOptions opts) {
+                                                    MarshalOptions opts,
+                                                    int depth) {
+  if (depth > MAX_CONTAINER_DEPTH) [[unlikely]] {
+    return "omnibuf: map nesting depth exceeds max_depth";
+  }
   using K = typename MapT::key_type;
   using V = typename MapT::mapped_type;
   constexpr uint8_t key_wt = scalar_wire_type<K, KeyOverride>();
   static_assert(is_valid_map_key_wire_type(key_wt), "Unsupported OmniBuf WireMap key type");
   constexpr uint8_t val_wt = container_value_wire_type<V, Override>();
 
-  const size_t len_pos = w.reserve_len_2b();
+  size_t body_hint = 2 + varint_size(value.size());
+  for (const auto& [k, v] : value) {
+    body_hint += elem_wire_size_hint<KeyOverride, KeyOverride>(k, 1);
+    body_hint += elem_wire_size_hint<Override, KeyOverride>(v, 1);
+  }
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(key_wt);
   w.write_byte(val_wt);
   w.write_varint(value.size());
@@ -470,10 +620,11 @@ template <WireOverride Override, WireOverride KeyOverride, typename MapT>
       for (EntryPtr kv : sorted) {
         const char* k_err = encode_scalar_payload<K, KeyOverride>(w, kv->first);
         if (k_err != nullptr) [[unlikely]] return k_err;
-        const char* v_err = encode_container_elem<Override, KeyOverride>(w, kv->second, opts);
+        const char* v_err =
+            encode_container_elem<Override, KeyOverride>(w, kv->second, opts, depth);
         if (v_err != nullptr) [[unlikely]] return v_err;
       }
-      w.backpatch_len(len_pos);
+      w.backpatch_len_hint(len_pos, use_4b);
       return nullptr;
     }
   }
@@ -481,10 +632,10 @@ template <WireOverride Override, WireOverride KeyOverride, typename MapT>
   for (const auto& [k, v] : value) {
     const char* k_err = encode_scalar_payload<K, KeyOverride>(w, k);
     if (k_err != nullptr) [[unlikely]] return k_err;
-    const char* v_err = encode_container_elem<Override, KeyOverride>(w, v, opts);
+    const char* v_err = encode_container_elem<Override, KeyOverride>(w, v, opts, depth);
     if (v_err != nullptr) [[unlikely]] return v_err;
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
   return nullptr;
 }
 
@@ -494,13 +645,16 @@ template <uint32_t FieldNum,
           typename FieldT>
 [[nodiscard]] inline const char* encode_struct_field(FastWriter& w,
                                                      const FieldT& value,
-                                                     MarshalOptions opts) {
+                                                     MarshalOptions opts,
+                                                     int depth) {
   if constexpr (RegisteredStruct<FieldT>) {
     w.write_tag(FieldNum, WireSubMsg);
-    const size_t len_pos = w.reserve_len_2b();
-    const char* err = encode_struct_body(w, value, opts);
+    const size_t sub_hint = struct_wire_size_hint(value, 1);
+    const bool use_4b = sub_hint > 16383u;
+    const size_t len_pos = w.reserve_len_hint(sub_hint);
+    const char* err = encode_struct_body(w, value, opts, depth + 1);
     if (err != nullptr) [[unlikely]] return err;
-    w.backpatch_len(len_pos);
+    w.backpatch_len_hint(len_pos, use_4b);
     return nullptr;
   } else if constexpr (IsStdOptional<FieldT>::value || IsUniquePtr<FieldT>::value ||
                        IsBox<FieldT>::value) {
@@ -510,21 +664,23 @@ template <uint32_t FieldNum,
     using Inner = typename PointeeType<FieldT>::type;
     if constexpr (RegisteredStruct<Inner>) {
       w.write_tag(FieldNum, WireSubMsg);
-      const size_t len_pos = w.reserve_len_2b();
-      const char* err = encode_struct_body(w, *value, opts);
+      const size_t sub_hint = struct_wire_size_hint(*value, 1);
+      const bool use_4b = sub_hint > 16383u;
+      const size_t len_pos = w.reserve_len_hint(sub_hint);
+      const char* err = encode_struct_body(w, *value, opts, depth + 1);
       if (err != nullptr) [[unlikely]] return err;
-      w.backpatch_len(len_pos);
+      w.backpatch_len_hint(len_pos, use_4b);
       return nullptr;
     } else {
-      return encode_struct_field<FieldNum, Override, KeyOverride>(w, *value, opts);
+      return encode_struct_field<FieldNum, Override, KeyOverride>(w, *value, opts, depth);
     }
   } else if constexpr (IsStdVector<FieldT>::value &&
                        !std::is_same_v<FieldT, std::vector<uint8_t>>) {
     w.write_tag(FieldNum, WireArray);
-    return encode_vector_payload<Override, KeyOverride>(w, value, opts);
+    return encode_vector_payload<Override, KeyOverride>(w, value, opts, depth + 1);
   } else if constexpr (IsAnyMapV<FieldT>) {
     w.write_tag(FieldNum, WireMap);
-    return encode_map_payload<Override, KeyOverride>(w, value, opts);
+    return encode_map_payload<Override, KeyOverride>(w, value, opts, depth + 1);
   } else if constexpr (std::is_same_v<FieldT, bool>) {
     w.write_tag(FieldNum, value ? WireBoolTrue : WireBoolFalse);
     return nullptr;
@@ -539,24 +695,29 @@ template <typename T, typename FD>
 inline void encode_one_struct_descriptor(FastWriter& w,
                                          const T& msg,
                                          MarshalOptions opts,
+                                         int depth,
                                          const char*& err,
                                          const FD&) {
   if (err != nullptr) return;
   err = encode_struct_field<FD::number, FD::wire_override, FD::key_wire_override>(
-      w, msg.*(FD::member), opts);
+      w, msg.*(FD::member), opts, depth);
 }
 
 template <RegisteredStruct T>
 [[nodiscard]] inline const char* encode_struct_body(FastWriter& w,
                                                     const T& msg,
-                                                    MarshalOptions opts) {
+                                                    MarshalOptions opts,
+                                                    int depth) {
   static_assert(validate_struct_fields<T>(),
                 "StructTraits<T>::fields() has out-of-range or duplicate field numbers");
+  if (depth > MAX_CONTAINER_DEPTH) [[unlikely]] {
+    return "omnibuf: message nesting depth exceeds max_depth";
+  }
   const auto fields = StructTraits<T>::fields();
   const char* err = nullptr;
   std::apply(
       [&](const auto&... fd) {
-        (encode_one_struct_descriptor(w, msg, opts, err, fd), ...);
+        (encode_one_struct_descriptor(w, msg, opts, depth, err, fd), ...);
       },
       fields);
   return err;
@@ -614,18 +775,27 @@ template <typename ValT, WireOverride Override>
     if (pos < data.size()) [[likely]] {
       const uint8_t b0 = data[pos];
       if ((b0 & 1u) != 0) [[likely]] {
-        out = static_cast<ValT>(decode_zigzag(static_cast<uint64_t>(b0 >> 1)));
+        if constexpr (std::is_enum_v<ValT>) {
+          out = static_cast<ValT>(
+              static_cast<std::underlying_type_t<ValT>>(decode_zigzag(static_cast<uint64_t>(b0 >> 1))));
+        } else {
+          out = static_cast<ValT>(decode_zigzag(static_cast<uint64_t>(b0 >> 1)));
+        }
         return {pos + 1, nullptr};
       }
     }
     const auto [v, vn] = decode_varint(data.subspan(pos));
     if (vn == 0) [[unlikely]] return {0, "omnibuf: truncated WireSint"};
-    out = static_cast<ValT>(decode_zigzag(v));
+    if constexpr (std::is_enum_v<ValT>) {
+      out = static_cast<ValT>(static_cast<std::underlying_type_t<ValT>>(decode_zigzag(v)));
+    } else {
+      out = static_cast<ValT>(decode_zigzag(v));
+    }
     return {pos + vn, nullptr};
   } else if constexpr (wt == WireFixed32 || wt == WireSfixed32) {
     if (data.size() - pos < 4) [[unlikely]] return {0, "omnibuf: truncated 32-bit fixed"};
     const uint32_t bits = read_u32_le(data.data() + pos);
-    if constexpr (std::is_signed_v<ValT>) {
+    if constexpr (IsSignedScalarV<ValT>) {
       out = static_cast<ValT>(static_cast<int32_t>(bits));
     } else {
       out = static_cast<ValT>(bits);
@@ -634,7 +804,7 @@ template <typename ValT, WireOverride Override>
   } else if constexpr (wt == WireFixed64 || wt == WireSfixed64) {
     if (data.size() - pos < 8) [[unlikely]] return {0, "omnibuf: truncated 64-bit fixed"};
     const uint64_t bits = read_u64_le(data.data() + pos);
-    if constexpr (std::is_signed_v<ValT>) {
+    if constexpr (IsSignedScalarV<ValT>) {
       out = static_cast<ValT>(static_cast<int64_t>(bits));
     } else {
       out = static_cast<ValT>(bits);
@@ -758,14 +928,30 @@ template <WireOverride Override, WireOverride KeyOverride, typename ContainerT>
     return nullptr;
   } else {
     constexpr uint8_t exp_elem_wt = container_value_wire_type<Elem, Override>();
-    if constexpr (exp_elem_wt == WireUint && std::integral<Elem>) {
+    if constexpr (exp_elem_wt == WireUint && (std::integral<Elem> || std::is_enum_v<Elem>)) {
       if (!append_uint_arr_body(field_ref, body, &state)) [[unlikely]] {
         return "omnibuf: invalid uint array";
       }
       return nullptr;
-    } else if constexpr (exp_elem_wt == WireSint && std::integral<Elem>) {
+    } else if constexpr (exp_elem_wt == WireSint && (std::integral<Elem> || std::is_enum_v<Elem>)) {
       if (!append_sint_arr_body(field_ref, body, &state)) [[unlikely]] {
         return "omnibuf: invalid sint array";
+      }
+      return nullptr;
+    } else if constexpr (!RegisteredStruct<Elem> && !IsUniquePtr<Elem>::value &&
+                         !IsBox<Elem>::value && !IsStdVector<Elem>::value && !IsAnyMapV<Elem> &&
+                         (exp_elem_wt == WireFixed32 || exp_elem_wt == WireSfixed32 ||
+                          exp_elem_wt == WireFloat32)) {
+      if (!append_fixed32_arr_body(field_ref, body, exp_elem_wt, &state)) [[unlikely]] {
+        return "omnibuf: invalid 32-bit fixed array";
+      }
+      return nullptr;
+    } else if constexpr (!RegisteredStruct<Elem> && !IsUniquePtr<Elem>::value &&
+                         !IsBox<Elem>::value && !IsStdVector<Elem>::value && !IsAnyMapV<Elem> &&
+                         (exp_elem_wt == WireFixed64 || exp_elem_wt == WireSfixed64 ||
+                          exp_elem_wt == WireFloat64)) {
+      if (!append_fixed64_arr_body(field_ref, body, exp_elem_wt, &state)) [[unlikely]] {
+        return "omnibuf: invalid 64-bit fixed array";
       }
       return nullptr;
     } else {
@@ -870,7 +1056,7 @@ template <WireOverride Override,
       if (!sub_res) [[unlikely]] return {0, sub_res.err};
       mark_seen = true;
       bool fresh = false;
-      if (!field_ref.has_value() || !already_seen) {
+      if (!field_ref.has_value()) {
         field_ref.emplace();
         fresh = true;
       }
@@ -901,7 +1087,7 @@ template <WireOverride Override,
     if (!sub_res) [[unlikely]] return {0, sub_res.err};
     mark_seen = true;
     bool fresh = false;
-    if (!field_ref || !already_seen) {
+    if (!field_ref) {
       if constexpr (IsUniquePtr<FieldT>::value) {
         field_ref = std::make_unique<Inner>();
       } else {
@@ -1015,6 +1201,56 @@ inline bool dispatch_struct_fields(const Tuple& fields,
           ...);
 }
 
+template <typename FieldT>
+inline void clear_struct_member_eager(FieldT& field_ref) {
+  if constexpr (RegisteredStruct<FieldT>) {
+    // Cleared if unseen after tag loop so inner capacities are preserved if seen
+    (void)field_ref;
+  } else if constexpr (IsStdOptional<FieldT>::value) {
+    using Inner = typename FieldT::value_type;
+    if constexpr (!RegisteredStruct<Inner>) {
+      field_ref.reset();
+    }
+  } else if constexpr (IsUniquePtr<FieldT>::value || IsBox<FieldT>::value) {
+    // Reset only if unseen after tag loop so heap node + inner strings are reused
+    (void)field_ref;
+  } else if constexpr (IsStdVector<FieldT>::value || IsAnyMapV<FieldT> ||
+                       std::is_same_v<FieldT, std::string>) {
+    field_ref.clear();
+  } else {
+    field_ref = FieldT{};
+  }
+}
+
+template <size_t Idx, size_t SeenWords, typename FieldT>
+inline void clear_struct_member_if_unseen(FieldT& field_ref,
+                                          const std::array<uint64_t, SeenWords>& seen_words) {
+  constexpr size_t word_idx = Idx / 64;
+  constexpr uint64_t bit = uint64_t{1} << (Idx % 64);
+  if ((seen_words[word_idx] & bit) != 0) return;
+  if constexpr (RegisteredStruct<FieldT>) {
+    clear_struct_member(field_ref);
+  } else if constexpr (IsStdOptional<FieldT>::value) {
+    using Inner = typename FieldT::value_type;
+    if constexpr (RegisteredStruct<Inner>) {
+      field_ref.reset();
+    }
+  } else if constexpr (IsUniquePtr<FieldT>::value || IsBox<FieldT>::value) {
+    field_ref.reset();
+  }
+}
+
+template <typename Tuple, typename T, size_t SeenWords, size_t... Is>
+inline void clear_unseen_struct_fields(const Tuple& fields,
+                                       T& msg,
+                                       const std::array<uint64_t, SeenWords>& seen_words,
+                                       std::index_sequence<Is...>) {
+  (void)fields;
+  (clear_struct_member_if_unseen<Is>(
+       msg.*(std::remove_cvref_t<std::tuple_element_t<Is, Tuple>>::member), seen_words),
+   ...);
+}
+
 template <RegisteredStruct T>
 [[nodiscard]] inline const char* decode_struct_body(std::span<const uint8_t> data,
                                                     T& msg,
@@ -1032,7 +1268,8 @@ template <RegisteredStruct T>
   }
   const auto fields = StructTraits<T>::fields();
   if (!merge && !is_fresh) {
-    std::apply([&](const auto&... fd) { (clear_struct_member(msg.*(fd.member)), ...); }, fields);
+    std::apply([&](const auto&... fd) { (clear_struct_member_eager(msg.*(fd.member)), ...); },
+               fields);
   }
   using Tuple = std::remove_cvref_t<decltype(fields)>;
   constexpr size_t num_fields = std::tuple_size_v<Tuple>;
@@ -1088,6 +1325,9 @@ template <RegisteredStruct T>
     }
     pos = step_res.pos;
   }
+  if (!merge && !is_fresh) {
+    clear_unseen_struct_fields(fields, msg, seen_words, std::make_index_sequence<num_fields>{});
+  }
   return nullptr;
 }
 
@@ -1104,8 +1344,9 @@ template <RegisteredStruct T>
 [[nodiscard]] inline Result<std::vector<uint8_t>> marshal(const T& msg,
                                                           MarshalOptions opts = {}) {
   std::vector<uint8_t> dst;
+  const size_t hint = detail::struct_wire_size_hint(msg, 0);
   if (opts.self_describing) {
-    dst.reserve(512);
+    dst.reserve(hint + 512);
     std::set<const void*> active;
     bool cyclic = false;
     auto meta = detail::build_struct_schema_meta<T>(1, active, &cyclic);
@@ -1118,8 +1359,8 @@ template <RegisteredStruct T>
   }
   MarshalOptions body_opts = opts;
   body_opts.self_describing = false;
-  FastWriter w(dst, 512);
-  const char* err = detail::encode_struct_body(w, msg, body_opts);
+  FastWriter w(dst, hint + 64);
+  const char* err = detail::encode_struct_body(w, msg, body_opts, 0);
   if (err != nullptr) [[unlikely]] return Error{err};
   w.finish();
   return dst;

@@ -681,6 +681,9 @@ class DescriptorPool {
       if (file.has_extensions) {
         return Error{"omnibuf::proto: proto2 extensions are not supported"};
       }
+      if (!is_valid_utf8(file.name) || !is_valid_utf8(file.package)) {
+        return Error{"omnibuf::proto: invalid UTF-8 in file descriptor"};
+      }
       for (const auto& msg : file.message_types) {
         register_rec(register_rec, file.package, msg, file.syntax);
       }
@@ -698,11 +701,23 @@ class DescriptorPool {
       if (dp.has_extensions) {
         return Error{"omnibuf::proto: proto2 extensions are not supported"};
       }
+      if (!is_valid_utf8(dp.name)) {
+        return Error{"omnibuf::proto: invalid UTF-8 in message name"};
+      }
       const bool is_proto2 = (raw_it->second.syntax == "proto2" || raw_it->second.syntax.empty());
 
       for (const auto& f : dp.fields) {
+        if (!is_valid_utf8(f.name)) {
+          return Error{"omnibuf::proto: invalid UTF-8 in field name"};
+        }
         if (!f.extendee.empty()) {
           return Error{"omnibuf::proto: proto2 extensions are not supported"};
+        }
+        if (f.number == 0 || f.number > MAX_FIELD_NUMBER) {
+          return Error{"omnibuf::proto: field number out of range on " + full + "." + f.name};
+        }
+        if (md_ptr->field_index_by_number.contains(f.number)) {
+          return Error{"omnibuf::proto: duplicate field number on " + full + "." + f.name};
         }
         if (!f.has_type || f.type == FieldType::Unknown) {
           return Error{"omnibuf::proto: missing or unknown field type on " + full + "." + f.name};
@@ -741,10 +756,16 @@ class DescriptorPool {
             fd.is_map = true;
             fd.is_repeated = false;
             fd.has_explicit_presence = false;
+            bool has_k = false;
+            bool has_v = false;
             for (const auto& mf : target_raw->second.proto.fields) {
-              if (mf.number == 1) fd.map_key_type = mf.type;
-              if (mf.number == 2) {
+              if (mf.number == 1 && mf.has_type) {
+                fd.map_key_type = mf.type;
+                has_k = true;
+              }
+              if (mf.number == 2 && mf.has_type) {
                 fd.map_val_type = mf.type;
+                has_v = true;
                 if (mf.type == FieldType::Message) {
                   auto vit = messages_.find(clean_name(mf.type_name));
                   if (vit == messages_.end()) {
@@ -753,6 +774,15 @@ class DescriptorPool {
                   fd.message_desc = vit->second.get();
                 }
               }
+            }
+            if (!has_k || !has_v) {
+              return Error{"omnibuf::proto: malformed map_entry descriptor"};
+            }
+            auto kwt = proto_type_to_wire_type(fd.map_key_type);
+            auto vwt = proto_type_to_wire_type(fd.map_val_type);
+            if (!kwt || !vwt || !is_valid_map_key_wire_type(kwt.value()) ||
+                !is_valid_map_val_wire_type(vwt.value())) {
+              return Error{"omnibuf::proto: invalid map key/value type in descriptor"};
             }
           } else {
             auto mit = messages_.find(target_name);
@@ -1082,7 +1112,11 @@ struct DecodedMapKey {
 
 [[nodiscard]] inline Result<void> encode_dynamic_msg(std::vector<uint8_t>& dst,
                                                      const MessageDescriptor& md,
-                                                     const DynamicMessage& msg) {
+                                                     const DynamicMessage& msg,
+                                                     int depth = 0) {
+  if (depth > MAX_CONTAINER_DEPTH) {
+    return Error{"omnibuf::proto: nesting depth exceeds MAX_CONTAINER_DEPTH"};
+  }
   const auto& fv_map = msg.fields();
   for (const auto& fd : md.fields) {
     auto it = fv_map.find(fd.number);
@@ -1092,6 +1126,9 @@ struct DecodedMapKey {
     }
 
     if (fd.is_map) {
+      if (depth + 1 > MAX_CONTAINER_DEPTH) {
+        return Error{"omnibuf::proto: map nesting depth exceeds MAX_CONTAINER_DEPTH"};
+      }
       auto key_wt = proto_type_to_wire_type(fd.map_key_type);
       auto val_wt = proto_type_to_wire_type(fd.map_val_type);
       if (!key_wt || !val_wt) return Error{"omnibuf::proto: invalid map wire type"};
@@ -1113,8 +1150,10 @@ struct DecodedMapKey {
           dst.push_back(0);
           dst.push_back(0);
           if (v_ptr) {
-            auto vr = encode_dynamic_msg(dst, *fd.message_desc, *v_ptr);
+            auto vr = encode_dynamic_msg(dst, *fd.message_desc, *v_ptr, depth + 2);
             if (!vr) return vr;
+          } else if (depth + 2 > MAX_CONTAINER_DEPTH) {
+            return Error{"omnibuf::proto: nesting depth exceeds MAX_CONTAINER_DEPTH"};
           }
           backpatch_container_len(dst, v_pos);
         }
@@ -1133,6 +1172,9 @@ struct DecodedMapKey {
     }
 
     if (fd.is_repeated) {
+      if (depth + 1 > MAX_CONTAINER_DEPTH) {
+        return Error{"omnibuf::proto: array nesting depth exceeds MAX_CONTAINER_DEPTH"};
+      }
       auto elem_wt = proto_type_to_wire_type(fd.type);
       if (!elem_wt) return Error{elem_wt.error()};
       append_tag(dst, fd.number, WireArray);
@@ -1150,8 +1192,10 @@ struct DecodedMapKey {
           dst.push_back(0);
           dst.push_back(0);
           if (elem_ptr) {
-            auto er = encode_dynamic_msg(dst, *fd.message_desc, *elem_ptr);
+            auto er = encode_dynamic_msg(dst, *fd.message_desc, *elem_ptr, depth + 2);
             if (!er) return er;
+          } else if (depth + 2 > MAX_CONTAINER_DEPTH) {
+            return Error{"omnibuf::proto: nesting depth exceeds MAX_CONTAINER_DEPTH"};
           }
           backpatch_container_len(dst, e_pos);
         }
@@ -1173,7 +1217,7 @@ struct DecodedMapKey {
       const size_t len_pos = dst.size();
       dst.push_back(0);
       dst.push_back(0);
-      auto sr = encode_dynamic_msg(dst, *fd.message_desc, *it->second.submsg);
+      auto sr = encode_dynamic_msg(dst, *fd.message_desc, *it->second.submsg, depth + 1);
       if (!sr) return sr;
       backpatch_container_len(dst, len_pos);
       continue;

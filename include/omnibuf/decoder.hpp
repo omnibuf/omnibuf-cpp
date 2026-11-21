@@ -67,8 +67,52 @@ class Result<void> {
   std::unique_ptr<std::string> error_;
 };
 
+namespace detail {
+
+template <typename T, bool IsEnum = std::is_enum_v<T>>
+struct IsSignedScalarImpl : std::is_signed<T> {};
+
+template <typename T>
+struct IsSignedScalarImpl<T, true> : std::is_signed<std::underlying_type_t<T>> {};
+
+template <typename T>
+inline constexpr bool IsSignedScalarV = IsSignedScalarImpl<T>::value;
+
+struct DeferredDeleteNode {
+  void* ptr;
+  void (*deleter)(void*) noexcept;
+};
+
+inline void destroy_with_trampoline(void* p, void (*del)(void*) noexcept) noexcept {
+  if (p == nullptr || del == nullptr) return;
+  thread_local int depth = 0;
+  thread_local std::vector<DeferredDeleteNode> queue;
+  if (depth >= 16) {
+    try {
+      queue.push_back({p, del});
+    } catch (...) {
+      del(p);
+    }
+    return;
+  }
+  ++depth;
+  del(p);
+  if (depth == 1 && !queue.empty()) {
+    while (!queue.empty()) {
+      const DeferredDeleteNode next = queue.back();
+      queue.pop_back();
+      next.deleter(next.ptr);
+    }
+    std::vector<DeferredDeleteNode>().swap(queue);
+  }
+  --depth;
+}
+
+}  // namespace detail
+
 // Deep-copying, value-comparable heap wrapper for recursive singular submessages.
-// Supports incomplete T at member-declaration time while providing std::optional-like ergonomics.
+// Supports incomplete T at member-declaration, copy, move, and destruction time via
+// erased operations, and bounds recursion depth during destruction via trampoline.
 template <typename T>
 class Box {
  public:
@@ -76,32 +120,47 @@ class Box {
   constexpr Box(std::nullptr_t) noexcept {}  // NOLINT(google-explicit-constructor)
   constexpr Box(std::nullopt_t) noexcept {}  // NOLINT(google-explicit-constructor)
 
-  Box(const T& v) : ptr_(new T(v)) {}      // NOLINT(google-explicit-constructor)
-  Box(T&& v) : ptr_(new T(std::move(v))) {}  // NOLINT(google-explicit-constructor)
+  Box(const T& v)  // NOLINT(google-explicit-constructor)
+      : ptr_(new T(v)), deleter_(&delete_impl), cloner_(&clone_impl) {}
+  Box(T&& v)  // NOLINT(google-explicit-constructor)
+      : ptr_(new T(std::move(v))), deleter_(&delete_impl), cloner_(&clone_impl) {}
 
   template <typename U>
     requires std::is_same_v<U, T>
   Box(const std::optional<U>& opt)  // NOLINT(google-explicit-constructor)
-      : ptr_(opt ? new T(*opt) : nullptr) {}
+      : ptr_(opt ? new T(*opt) : nullptr),
+        deleter_(opt ? &delete_impl : nullptr),
+        cloner_(opt ? &clone_impl : nullptr) {}
 
   template <typename U>
     requires std::is_same_v<U, T>
   Box(std::optional<U>&& opt)  // NOLINT(google-explicit-constructor)
-      : ptr_(opt ? new T(std::move(*opt)) : nullptr) {}
+      : ptr_(opt ? new T(std::move(*opt)) : nullptr),
+        deleter_(opt ? &delete_impl : nullptr),
+        cloner_(opt ? &clone_impl : nullptr) {}
 
-  Box(const Box& other) : ptr_(other.ptr_ ? new T(*other.ptr_) : nullptr) {}
-  Box(Box&& other) noexcept : ptr_(std::exchange(other.ptr_, nullptr)) {}
+  Box(const Box& other)
+      : ptr_(other.ptr_ ? other.cloner_(other.ptr_) : nullptr),
+        deleter_(other.ptr_ ? other.deleter_ : nullptr),
+        cloner_(other.ptr_ ? other.cloner_ : nullptr) {}
 
-  ~Box() { delete ptr_; }
+  Box(Box&& other) noexcept
+      : ptr_(std::exchange(other.ptr_, nullptr)),
+        deleter_(std::exchange(other.deleter_, nullptr)),
+        cloner_(std::exchange(other.cloner_, nullptr)) {}
+
+  ~Box() noexcept { reset(); }
 
   Box& operator=(const Box& other) {
     if (this != &other) {
       if (!other.ptr_) {
         reset();
-      } else if (ptr_) {
-        *ptr_ = *other.ptr_;
       } else {
-        ptr_ = new T(*other.ptr_);
+        T* copy = other.cloner_(other.ptr_);
+        reset();
+        ptr_ = copy;
+        deleter_ = other.deleter_;
+        cloner_ = other.cloner_;
       }
     }
     return *this;
@@ -109,8 +168,10 @@ class Box {
 
   Box& operator=(Box&& other) noexcept {
     if (this != &other) {
-      delete ptr_;
+      reset();
       ptr_ = std::exchange(other.ptr_, nullptr);
+      deleter_ = std::exchange(other.deleter_, nullptr);
+      cloner_ = std::exchange(other.cloner_, nullptr);
     }
     return *this;
   }
@@ -125,6 +186,8 @@ class Box {
       *ptr_ = v;
     } else {
       ptr_ = new T(v);
+      deleter_ = &delete_impl;
+      cloner_ = &clone_impl;
     }
     return *this;
   }
@@ -134,13 +197,19 @@ class Box {
       *ptr_ = std::move(v);
     } else {
       ptr_ = new T(std::move(v));
+      deleter_ = &delete_impl;
+      cloner_ = &clone_impl;
     }
     return *this;
   }
 
   void reset() noexcept {
-    delete ptr_;
-    ptr_ = nullptr;
+    if (ptr_ != nullptr) {
+      void* p = std::exchange(ptr_, nullptr);
+      auto del = std::exchange(deleter_, nullptr);
+      cloner_ = nullptr;
+      detail::destroy_with_trampoline(p, del);
+    }
   }
 
   template <typename... Args>
@@ -157,6 +226,8 @@ class Box {
       } else {
         ptr_ = new T(std::forward<Args>(args)...);
       }
+      deleter_ = &delete_impl;
+      cloner_ = &clone_impl;
     }
     return *ptr_;
   }
@@ -191,7 +262,18 @@ class Box {
   friend bool operator!=(const Box& a, const Box& b) { return !(a == b); }
 
  private:
+  static void delete_impl(void* p) noexcept { delete static_cast<T*>(p); }
+  static T* clone_impl(const void* p) {
+    if constexpr (std::is_copy_constructible_v<T>) {
+      return new T(*static_cast<const T*>(p));
+    } else {
+      throw std::logic_error("omnibuf::Box<T> copy requires copy-constructible T");
+    }
+  }
+
   T* ptr_ = nullptr;
+  void (*deleter_)(void*) noexcept = nullptr;
+  T* (*cloner_)(const void*) = nullptr;
 };
 
 inline constexpr size_t kMaxInitialReserve = 4096;
@@ -726,6 +808,40 @@ struct SliceStep {
   return true;
 }
 
+[[nodiscard]] inline bool append_string_view_arr_body(std::vector<std::string_view>& dst,
+                                                      std::span<const uint8_t> body,
+                                                      DecodeState* state = nullptr) {
+  const auto hdr = parse_array_header(body);
+  if (!hdr.ok || hdr.elem_wt != WireString) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
+  size_t p = hdr.pos;
+  dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
+  for (size_t i = 0; i < hdr.count; ++i) {
+    const auto s_res = read_str_slice_fast(body, p);
+    if (!s_res) return false;
+    dst.emplace_back(reinterpret_cast<const char*>(s_res.ptr), s_res.len);
+    p = s_res.next_pos;
+  }
+  return p == body.size();
+}
+
+[[nodiscard]] inline bool append_bytes_view_arr_body(std::vector<std::span<const uint8_t>>& dst,
+                                                     std::span<const uint8_t> body,
+                                                     DecodeState* state = nullptr) {
+  const auto hdr = parse_array_header(body);
+  if (!hdr.ok || hdr.elem_wt != WireBytes) return false;
+  if (state && !state->charge_elements(hdr.count)) return false;
+  size_t p = hdr.pos;
+  dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
+  for (size_t i = 0; i < hdr.count; ++i) {
+    const auto b_res = read_len_slice_fast(body, p, 0);
+    if (!b_res) return false;
+    dst.emplace_back(b_res.ptr, b_res.len);
+    p = b_res.next_pos;
+  }
+  return p == body.size();
+}
+
 template <typename T>
 [[nodiscard]] inline bool append_uint_arr_body(std::vector<T>& dst,
                                                std::span<const uint8_t> body,
@@ -739,7 +855,11 @@ template <typename T>
     const auto [v, vn] = decode_varint(body.subspan(p));
     if (vn == 0) return false;
     p += vn;
-    dst.push_back(static_cast<T>(v));
+    if constexpr (std::is_enum_v<T>) {
+      dst.push_back(static_cast<T>(static_cast<std::underlying_type_t<T>>(v)));
+    } else {
+      dst.push_back(static_cast<T>(v));
+    }
   }
   return p == body.size();
 }
@@ -757,7 +877,11 @@ template <typename T>
     const auto [v, vn] = decode_varint(body.subspan(p));
     if (vn == 0) return false;
     p += vn;
-    dst.push_back(static_cast<T>(decode_zigzag(v)));
+    if constexpr (std::is_enum_v<T>) {
+      dst.push_back(static_cast<T>(static_cast<std::underlying_type_t<T>>(decode_zigzag(v))));
+    } else {
+      dst.push_back(static_cast<T>(decode_zigzag(v)));
+    }
   }
   return p == body.size();
 }
@@ -770,20 +894,30 @@ template <typename T>
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != expected_wt) return false;
   if (state && !state->charge_elements(hdr.count)) return false;
-  size_t p = hdr.pos;
-  dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
-  for (size_t i = 0; i < hdr.count; ++i) {
-    const uint32_t bits = read_u32_le(body.data() + p);
-    p += 4;
-    if constexpr (std::is_same_v<T, float>) {
-      dst.push_back(bits_to_float32(bits));
-    } else if constexpr (std::is_signed_v<T>) {
-      dst.push_back(static_cast<T>(static_cast<int32_t>(bits)));
-    } else {
-      dst.push_back(static_cast<T>(bits));
+  if constexpr (std::endian::native == std::endian::little && sizeof(T) == 4 &&
+                std::is_trivially_copyable_v<T>) {
+    if (hdr.count > 0) {
+      const size_t old_sz = dst.size();
+      dst.resize(old_sz + hdr.count);
+      std::memcpy(dst.data() + old_sz, body.data() + hdr.pos, hdr.count * 4);
     }
+    return true;
+  } else {
+    size_t p = hdr.pos;
+    dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
+    for (size_t i = 0; i < hdr.count; ++i) {
+      const uint32_t bits = read_u32_le(body.data() + p);
+      p += 4;
+      if constexpr (std::is_same_v<T, float>) {
+        dst.push_back(bits_to_float32(bits));
+      } else if constexpr (detail::IsSignedScalarV<T>) {
+        dst.push_back(static_cast<T>(static_cast<int32_t>(bits)));
+      } else {
+        dst.push_back(static_cast<T>(bits));
+      }
+    }
+    return true;
   }
-  return true;
 }
 
 template <typename T>
@@ -794,20 +928,30 @@ template <typename T>
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != expected_wt) return false;
   if (state && !state->charge_elements(hdr.count)) return false;
-  size_t p = hdr.pos;
-  dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
-  for (size_t i = 0; i < hdr.count; ++i) {
-    const uint64_t bits = read_u64_le(body.data() + p);
-    p += 8;
-    if constexpr (std::is_same_v<T, double>) {
-      dst.push_back(bits_to_float64(bits));
-    } else if constexpr (std::is_signed_v<T>) {
-      dst.push_back(static_cast<T>(static_cast<int64_t>(bits)));
-    } else {
-      dst.push_back(static_cast<T>(bits));
+  if constexpr (std::endian::native == std::endian::little && sizeof(T) == 8 &&
+                std::is_trivially_copyable_v<T>) {
+    if (hdr.count > 0) {
+      const size_t old_sz = dst.size();
+      dst.resize(old_sz + hdr.count);
+      std::memcpy(dst.data() + old_sz, body.data() + hdr.pos, hdr.count * 8);
     }
+    return true;
+  } else {
+    size_t p = hdr.pos;
+    dst.reserve(grow_capacity(dst.capacity(), dst.size() + hdr.count));
+    for (size_t i = 0; i < hdr.count; ++i) {
+      const uint64_t bits = read_u64_le(body.data() + p);
+      p += 8;
+      if constexpr (std::is_same_v<T, double>) {
+        dst.push_back(bits_to_float64(bits));
+      } else if constexpr (detail::IsSignedScalarV<T>) {
+        dst.push_back(static_cast<T>(static_cast<int64_t>(bits)));
+      } else {
+        dst.push_back(static_cast<T>(bits));
+      }
+    }
+    return true;
   }
-  return true;
 }
 
 template <uint8_t WT, typename T>
@@ -840,7 +984,7 @@ template <uint8_t WT, typename T>
     p += 4;
     if constexpr (std::is_same_v<T, float>) {
       out = bits_to_float32(bits);
-    } else if constexpr (std::is_signed_v<T>) {
+    } else if constexpr (detail::IsSignedScalarV<T>) {
       out = static_cast<T>(static_cast<int32_t>(bits));
     } else {
       out = static_cast<T>(bits);
@@ -852,7 +996,7 @@ template <uint8_t WT, typename T>
     p += 8;
     if constexpr (std::is_same_v<T, double>) {
       out = bits_to_float64(bits);
-    } else if constexpr (std::is_signed_v<T>) {
+    } else if constexpr (detail::IsSignedScalarV<T>) {
       out = static_cast<T>(static_cast<int64_t>(bits));
     } else {
       out = static_cast<T>(bits);
@@ -861,13 +1005,21 @@ template <uint8_t WT, typename T>
   } else if constexpr (WT == WireString) {
     const auto s_res = read_str_slice_fast(body, p);
     if (!s_res) return false;
-    out.assign(reinterpret_cast<const char*>(s_res.ptr), s_res.len);
+    if constexpr (std::is_same_v<T, std::string_view>) {
+      out = std::string_view(reinterpret_cast<const char*>(s_res.ptr), s_res.len);
+    } else {
+      out.assign(reinterpret_cast<const char*>(s_res.ptr), s_res.len);
+    }
     p = s_res.next_pos;
     return true;
   } else if constexpr (WT == WireBytes) {
     const auto b_res = read_len_slice_fast(body, p, 0);
     if (!b_res) return false;
-    out.assign(b_res.ptr, b_res.ptr + b_res.len);
+    if constexpr (std::is_same_v<T, std::span<const uint8_t>>) {
+      out = std::span<const uint8_t>(b_res.ptr, b_res.len);
+    } else {
+      out.assign(b_res.ptr, b_res.ptr + b_res.len);
+    }
     p = b_res.next_pos;
     return true;
   } else {

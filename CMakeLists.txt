@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   omnibuf_cpp
-  VERSION 0.1.0
+  VERSION 0.1.1
   DESCRIPTION "Modern C++20 implementation of the OmniBuf wire format"
   LANGUAGES CXX
 )
@@ -169,6 +169,20 @@ if(OMNIBUF_BUILD_TESTS)
     PRIVATE OMNIBUF_SCHEMAS_FDS_PATH="${OMNIBUF_SCHEMAS_FDS}"
   )
   add_test(NAME omnibuf_tests COMMAND omnibuf_tests)
+
+  # Audit regression suite
+  add_executable(audit_regressions tests/audit_regressions.cpp)
+  add_dependencies(audit_regressions omnibuf_codegen protoc-gen-omnibuf-cpp)
+  target_include_directories(audit_regressions PRIVATE "${OMNIBUF_GEN_DIR}")
+  target_link_libraries(audit_regressions PRIVATE omnibuf)
+  omnibuf_configure_internal_target(audit_regressions)
+  target_compile_definitions(
+    audit_regressions
+    PRIVATE
+      OMNIBUF_SCHEMAS_FDS_PATH="${OMNIBUF_SCHEMAS_FDS}"
+      OMNIBUF_PLUGIN_BIN="$<TARGET_FILE:protoc-gen-omnibuf-cpp>"
+  )
+  add_test(NAME audit_regressions COMMAND audit_regressions)
 
   # Reproducible PeerUpdate benchmark executable (always compiled with -O3 -DNDEBUG)
   add_executable(omnibuf_bench benchmarks/peer_bench.cpp)

@@ -45,11 +45,14 @@ struct MapEntryInfo {
 
 struct MessageRecord {
   std::string full_proto_name;
+  std::string source_file;
   std::string cpp_qualified;     // e.g. ::omnibuf::test::EdgeShowcase::InnerPayload
   std::string cpp_local_path;    // relative to file namespace, e.g. EdgeShowcase::InnerPayload
   std::string struct_ident;      // e.g. InnerPayload
   std::string opaque_qualified;  // e.g. ::omnibuf::test::OpaqueEdgeShowcase_InnerPayload
   std::string opaque_ident;      // e.g. OpaqueEdgeShowcase_InnerPayload
+  std::string view_qualified;    // e.g. ::omnibuf::test::EdgeShowcase_InnerPayloadView
+  std::string view_ident;        // e.g. EdgeShowcase_InnerPayloadView
   const DescriptorProto* desc = nullptr;
   bool is_proto2 = false;
 };
@@ -92,25 +95,47 @@ bool is_cpp_keyword(std::string_view name) {
   return kKeywords.contains(name);
 }
 
+std::string safe_join_ident(std::string_view a, std::string_view b) {
+  std::string out(a);
+  if (!out.empty() && !b.empty() && out.back() == '_' && b.front() == '_') {
+    out.pop_back();
+  }
+  out.append(b);
+  return out;
+}
+
 std::string sanitize_basic_ident(std::string_view raw) {
-  if (raw.empty()) return "_";
+  if (raw.empty()) return "f";
   std::string out;
-  out.reserve(raw.size() + 2);
+  out.reserve(raw.size() + 4);
   for (char c : raw) {
     const unsigned char uc = static_cast<unsigned char>(c);
-    if (std::isalnum(uc) || c == '_') {
+    if (std::isalnum(uc)) {
       out.push_back(c);
     } else {
-      out.push_back('_');
+      if (out.empty() || out.back() != '_') {
+        out.push_back('_');
+      }
     }
   }
-  if (std::isdigit(static_cast<unsigned char>(out.front()))) {
-    out.insert(out.begin(), '_');
+  if (out.empty()) out = "f";
+  if (std::isdigit(static_cast<unsigned char>(out.front())) || out.front() == '_') {
+    out = safe_join_ident("f_", out);
   }
   if (is_cpp_keyword(out)) {
-    out.push_back('_');
+    out = safe_join_ident(out, "_");
   }
   return out;
+}
+
+std::string deduplicate_ident(std::string base, const std::unordered_set<std::string>& used) {
+  if (!used.contains(base)) return base;
+  std::string cand = safe_join_ident(base, "_");
+  if (!used.contains(cand)) return cand;
+  for (size_t n = 1;; ++n) {
+    cand = safe_join_ident(base, "_" + std::to_string(n));
+    if (!used.contains(cand)) return cand;
+  }
 }
 
 std::string sanitize_field_ident(std::string_view raw,
@@ -118,6 +143,8 @@ std::string sanitize_field_ident(std::string_view raw,
   static const std::unordered_set<std::string_view> kReservedStructMethods = {
       "clear",
       "schema_meta",
+      "value_schema_meta",
+      "min_wire_size",
       "try_marshal_omnibuf_fast",
       "marshal_omnibuf_fast",
       "marshal_omnibuf_append",
@@ -128,8 +155,17 @@ std::string sanitize_field_ident(std::string_view raw,
       "decode_omnibuf_raw",
   };
   std::string out = sanitize_basic_ident(raw);
-  while (kReservedStructMethods.contains(out) || local_type_names.contains(out)) {
-    out.push_back('_');
+  if (kReservedStructMethods.contains(out) || local_type_names.contains(out)) {
+    std::string cand = safe_join_ident(out, "_");
+    if (!kReservedStructMethods.contains(cand) && !local_type_names.contains(cand)) {
+      return cand;
+    }
+    for (size_t n = 1;; ++n) {
+      cand = safe_join_ident(out, "_" + std::to_string(n));
+      if (!kReservedStructMethods.contains(cand) && !local_type_names.contains(cand)) {
+        return cand;
+      }
+    }
   }
   return out;
 }
@@ -305,7 +341,8 @@ std::optional<std::string> validate_target_file(const FileDescriptorProto& file)
   return std::nullopt;
 }
 
-void index_descriptor_tree(const std::string& proto_prefix,
+void index_descriptor_tree(const std::string& source_file,
+                           const std::string& proto_prefix,
                            const std::string& cpp_ns_prefix,
                            const std::string& local_cpp_prefix,
                            const std::string& opaque_chain_prefix,
@@ -333,18 +370,24 @@ void index_descriptor_tree(const std::string& proto_prefix,
   const std::string cpp_qual =
       cpp_ns_prefix.empty() ? ("::" + local_path) : ("::" + cpp_ns_prefix + "::" + local_path);
   const std::string opaque_chain =
-      opaque_chain_prefix.empty() ? s_name : (opaque_chain_prefix + "_" + s_name);
+      opaque_chain_prefix.empty() ? s_name : safe_join_ident(safe_join_ident(opaque_chain_prefix, "_"), s_name);
   const std::string opaque_ident = "Opaque" + opaque_chain;
   const std::string opaque_qual =
       cpp_ns_prefix.empty() ? ("::" + opaque_ident) : ("::" + cpp_ns_prefix + "::" + opaque_ident);
+  const std::string view_ident = opaque_chain + "View";
+  const std::string view_qual =
+      cpp_ns_prefix.empty() ? ("::" + view_ident) : ("::" + cpp_ns_prefix + "::" + view_ident);
 
   catalog.messages[full_proto] = MessageRecord{
       .full_proto_name = full_proto,
+      .source_file = source_file,
       .cpp_qualified = cpp_qual,
       .cpp_local_path = local_path,
       .struct_ident = s_name,
       .opaque_qualified = opaque_qual,
       .opaque_ident = opaque_ident,
+      .view_qualified = view_qual,
+      .view_ident = view_ident,
       .desc = &d,
       .is_proto2 = is_proto2,
   };
@@ -355,8 +398,8 @@ void index_descriptor_tree(const std::string& proto_prefix,
     catalog.enum_cpp_names[e_proto] = e_cpp;
   }
   for (const auto& nested : d.nested_types) {
-    index_descriptor_tree(full_proto, cpp_ns_prefix, local_path, opaque_chain, nested, is_proto2,
-                          catalog);
+    index_descriptor_tree(source_file, full_proto, cpp_ns_prefix, local_path, opaque_chain, nested,
+                          is_proto2, catalog);
   }
 }
 
@@ -373,7 +416,7 @@ TypeCatalog build_catalog(const CodeGeneratorRequest& req) {
           cpp_ns.empty() ? ("::" + e_ident) : ("::" + cpp_ns + "::" + e_ident);
     }
     for (const auto& m : file.message_types) {
-      index_descriptor_tree(file.package, cpp_ns, "", "", m, is_proto2, catalog);
+      index_descriptor_tree(file.name, file.package, cpp_ns, "", "", m, is_proto2, catalog);
     }
   }
   return catalog;
@@ -394,6 +437,16 @@ std::string resolve_cpp_opaque(std::string_view type_name, const TypeCatalog& ca
   if (dot == std::string::npos) return "::Opaque" + sanitize_basic_ident(clean);
   return "::" + proto_package_to_cpp_ns(clean.substr(0, dot)) + "::Opaque" +
          sanitize_basic_ident(clean.substr(dot + 1));
+}
+
+std::string resolve_cpp_view(std::string_view type_name, const TypeCatalog& catalog) {
+  const std::string clean = trim_leading_dot(type_name);
+  auto it = catalog.messages.find(clean);
+  if (it != catalog.messages.end()) return it->second.view_qualified;
+  const size_t dot = clean.rfind('.');
+  if (dot == std::string::npos) return "::" + sanitize_basic_ident(clean) + "View";
+  return "::" + proto_package_to_cpp_ns(clean.substr(0, dot)) + "::" +
+         sanitize_basic_ident(clean.substr(dot + 1)) + "View";
 }
 
 std::string resolve_cpp_enum(std::string_view type_name, const TypeCatalog& catalog) {
@@ -652,20 +705,26 @@ MessagePlan build_message_plan(const MessageRecord& rec,
     }
   }
 
+  std::unordered_set<std::string> used_members = plan.local_type_names;
+
   for (uint32_t oi = 0; oi < msg.oneof_decls.size(); ++oi) {
     auto it = oneof_fields.find(oi);
     if (it == oneof_fields.end()) continue;
     RealOneofInfo info;
     info.oneof_index = oi;
     info.raw_name = msg.oneof_decls[oi].name;
-    info.enum_name = to_pascal_case(info.raw_name) + "Case";
-    while (plan.local_type_names.contains(info.enum_name)) {
-      info.enum_name += "_";
-    }
+    info.enum_name =
+        deduplicate_ident(to_pascal_case(info.raw_name) + "Case", plan.local_type_names);
     plan.local_type_names.insert(info.enum_name);
-    info.member_var = "oneof_" + sanitize_basic_ident(info.raw_name) + "_case_";
-    info.case_fn_name = sanitize_basic_ident(info.raw_name) + "_case";
-    info.clear_fn_name = "clear_" + sanitize_basic_ident(info.raw_name);
+    used_members.insert(info.enum_name);
+    const std::string oneof_base = sanitize_basic_ident(info.raw_name);
+    info.member_var = deduplicate_ident(
+        safe_join_ident(safe_join_ident("oneof_", oneof_base), "_case_"), used_members);
+    used_members.insert(info.member_var);
+    info.case_fn_name = deduplicate_ident(safe_join_ident(oneof_base, "_case"), used_members);
+    used_members.insert(info.case_fn_name);
+    info.clear_fn_name = deduplicate_ident(safe_join_ident("clear_", oneof_base), used_members);
+    used_members.insert(info.clear_fn_name);
     info.field_indices = std::move(it->second);
     plan.oneof_idx_to_plan[oi] = plan.real_oneofs.size();
     plan.real_oneofs.push_back(std::move(info));
@@ -673,12 +732,6 @@ MessagePlan build_message_plan(const MessageRecord& rec,
 
   plan.field_idents.resize(msg.fields.size());
   plan.field_uses_box.assign(msg.fields.size(), false);
-  std::unordered_set<std::string> used_members = plan.local_type_names;
-  for (const auto& ro : plan.real_oneofs) {
-    used_members.insert(ro.member_var);
-    used_members.insert(ro.case_fn_name);
-    used_members.insert(ro.clear_fn_name);
-  }
 
   for (size_t i = 0; i < msg.fields.size(); ++i) {
     const auto& f = msg.fields[i];
@@ -789,6 +842,7 @@ void emit_try_encode_field_fast(std::ostringstream& out,
                                 std::string_view oneof_guard_expr,
                                 const TypeCatalog& catalog,
                                 std::string_view w_var,
+                                std::string_view depth_expr,
                                 std::string_view indent) {
   const uint32_t fnum = f.number;
   const bool is_repeated = (f.label == FieldLabel::Repeated);
@@ -798,12 +852,21 @@ void emit_try_encode_field_fast(std::ostringstream& out,
     const std::string inner_indent = std::string(indent) + "  ";
     if (f.type == FieldType::Message) {
       out << inner_indent << "if (" << member_expr << ".has_value()) {\n";
+      out << inner_indent << "  if ((" << depth_expr
+          << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+      out << inner_indent << "    return \"omnibuf: max nesting depth exceeded\";\n";
+      out << inner_indent << "  }\n";
       out << inner_indent << "  " << w_var << ".write_tag(" << fnum
           << "u, ::omnibuf::WireSubMsg);\n";
-      out << inner_indent << "  const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+      out << inner_indent << "  const size_t body_hint = " << member_expr
+          << "->min_wire_size((" << depth_expr << ") + 1);\n";
+      out << inner_indent << "  const bool use_4b = body_hint > 16383u;\n";
+      out << inner_indent << "  const size_t len_pos = " << w_var
+          << ".reserve_len_hint(body_hint);\n";
       out << inner_indent << "  if (const char* err = " << member_expr
-          << "->try_marshal_omnibuf_fast(" << w_var << ")) [[unlikely]] return err;\n";
-      out << inner_indent << "  " << w_var << ".backpatch_len(len_pos);\n";
+          << "->try_marshal_omnibuf_fast(" << w_var << ", (" << depth_expr
+          << ") + 1)) [[unlikely]] return err;\n";
+      out << inner_indent << "  " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
       out << inner_indent << "}\n";
     } else {
       emit_try_encode_scalar_value_fast(out, f, member_expr, w_var, inner_indent);
@@ -817,12 +880,16 @@ void emit_try_encode_field_fast(std::ostringstream& out,
     auto map_it = catalog.map_entries.find(target);
     if (map_it != catalog.map_entries.end()) {
       const auto& mi = map_it->second;
+      out << indent << "if ((" << depth_expr
+          << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+      out << indent << "  return \"omnibuf: max nesting depth exceeded\";\n";
+      out << indent << "}\n";
       out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireMap);\n";
       if (mi.val_type == FieldType::Message) {
         out << indent << "if (const char* err = ::omnibuf::try_encode_submsg_map<"
             << wire_const_expr(mi.key_type) << ">(" << w_var << ", " << member_expr
-            << ", [](::omnibuf::FastWriter& sw, const auto& sv) {\n";
-        out << indent << "  return sv.try_marshal_omnibuf_fast(sw);\n";
+            << ", [&](::omnibuf::FastWriter& sw, const auto& sv) {\n";
+        out << indent << "  return sv.try_marshal_omnibuf_fast(sw, (" << depth_expr << ") + 2);\n";
         out << indent << "})) [[unlikely]] return err;\n";
       } else {
         out << indent << "if (const char* err = ::omnibuf::try_encode_scalar_map<"
@@ -833,32 +900,57 @@ void emit_try_encode_field_fast(std::ostringstream& out,
     }
     if (is_repeated) {
       out << indent << "{\n";
+      out << indent << "  if ((" << depth_expr
+          << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+      out << indent << "    return \"omnibuf: max nesting depth exceeded\";\n";
+      out << indent << "  }\n";
       out << indent << "  " << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireArray);\n";
-      out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+      out << indent << "  size_t arr_hint = 2u;\n";
+      out << indent << "  for (const auto& elem : " << member_expr << ") {\n";
+      out << indent << "    const size_t eh = elem.min_wire_size((" << depth_expr << ") + 2);\n";
+      out << indent << "    arr_hint += (eh > 16383u ? 4u : 2u) + eh;\n";
+      out << indent << "    if (arr_hint > 16383u) break;\n";
+      out << indent << "  }\n";
+      out << indent << "  const bool arr_4b = arr_hint > 16383u;\n";
+      out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_hint(arr_hint);\n";
       out << indent << "  " << w_var << ".write_byte(::omnibuf::WireSubMsg);\n";
       out << indent << "  " << w_var << ".write_varint(" << member_expr << ".size());\n";
       out << indent << "  for (const auto& elem : " << member_expr << ") {\n";
-      out << indent << "    const size_t elem_pos = " << w_var << ".reserve_len_2b();\n";
-      out << indent
-          << "    if (const char* err = elem.try_marshal_omnibuf_fast(" << w_var
-          << ")) [[unlikely]] return err;\n";
-      out << indent << "    " << w_var << ".backpatch_len(elem_pos);\n";
+      out << indent << "    const size_t elem_hint = arr_4b ? elem.min_wire_size((" << depth_expr
+          << ") + 2) : 0u;\n";
+      out << indent << "    const bool elem_4b = elem_hint > 16383u;\n";
+      out << indent << "    const size_t elem_pos = " << w_var
+          << ".reserve_len_hint(elem_hint);\n";
+      out << indent << "    if (const char* err = elem.try_marshal_omnibuf_fast(" << w_var << ", ("
+          << depth_expr << ") + 2)) [[unlikely]] return err;\n";
+      out << indent << "    " << w_var << ".backpatch_len_hint(elem_pos, elem_4b);\n";
       out << indent << "  }\n";
-      out << indent << "  " << w_var << ".backpatch_len(len_pos);\n";
+      out << indent << "  " << w_var << ".backpatch_len_hint(len_pos, arr_4b);\n";
       out << indent << "}\n";
       return;
     }
     out << indent << "if (" << member_expr << ".has_value()) {\n";
+    out << indent << "  if ((" << depth_expr
+        << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+    out << indent << "    return \"omnibuf: max nesting depth exceeded\";\n";
+    out << indent << "  }\n";
     out << indent << "  " << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSubMsg);\n";
-    out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+    out << indent << "  const size_t body_hint = " << member_expr << "->min_wire_size(("
+        << depth_expr << ") + 1);\n";
+    out << indent << "  const bool use_4b = body_hint > 16383u;\n";
+    out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_hint(body_hint);\n";
     out << indent << "  if (const char* err = " << member_expr << "->try_marshal_omnibuf_fast("
-        << w_var << ")) [[unlikely]] return err;\n";
-    out << indent << "  " << w_var << ".backpatch_len(len_pos);\n";
+        << w_var << ", (" << depth_expr << ") + 1)) [[unlikely]] return err;\n";
+    out << indent << "  " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
     out << indent << "}\n";
     return;
   }
 
   if (is_repeated) {
+    out << indent << "if ((" << depth_expr
+        << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+    out << indent << "  return \"omnibuf: max nesting depth exceeded\";\n";
+    out << indent << "}\n";
     out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireArray);\n";
     switch (f.type) {
       case FieldType::String:
@@ -907,14 +999,17 @@ void emit_try_encode_field_fast(std::ostringstream& out,
         break;
       case FieldType::Enum:
         out << indent << "{\n";
-        out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+        out << indent << "  const size_t body_hint = 2u + " << member_expr << ".size();\n";
+        out << indent << "  const bool use_4b = body_hint > 16383u;\n";
+        out << indent << "  const size_t len_pos = " << w_var
+            << ".reserve_len_hint(body_hint);\n";
         out << indent << "  " << w_var << ".write_byte(::omnibuf::WireSint);\n";
         out << indent << "  " << w_var << ".write_varint(" << member_expr << ".size());\n";
         out << indent << "  for (auto ev : " << member_expr << ") {\n";
         out << indent << "    " << w_var
             << ".write_varint(::omnibuf::encode_zigzag(static_cast<int64_t>(static_cast<int32_t>(ev))));\n";
         out << indent << "  }\n";
-        out << indent << "  " << w_var << ".backpatch_len(len_pos);\n";
+        out << indent << "  " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
         out << indent << "}\n";
         break;
       default:
@@ -1075,7 +1170,9 @@ void emit_struct_declaration_recursive(std::ostringstream& out,
   out << inner
       << "[[nodiscard]] std::shared_ptr<::omnibuf::SchemaMeta> value_schema_meta(int schema_depth = 1) const;\n\n";
   out << inner
-      << "[[nodiscard]] const char* try_marshal_omnibuf_fast(::omnibuf::FastWriter& w) const;\n";
+      << "[[nodiscard]] size_t min_wire_size(int depth = 0) const noexcept;\n";
+  out << inner
+      << "[[nodiscard]] const char* try_marshal_omnibuf_fast(::omnibuf::FastWriter& w, int depth = 0) const;\n";
   out << inner << "void marshal_omnibuf_fast(::omnibuf::FastWriter& w) const;\n";
   out << inner << "void marshal_omnibuf_append(std::vector<uint8_t>& dst) const;\n";
   out << inner
@@ -1261,10 +1358,116 @@ void emit_struct_methods(std::ostringstream& out,
   out << "  return meta;\n";
   out << "}\n\n";
 
+  // min_wire_size (strict lower bound for >16 KiB container backpatch heuristic)
+  out << "inline size_t " << qname << "::min_wire_size(int depth) const noexcept {\n";
+  out << "  if (depth > ::omnibuf::MAX_CONTAINER_DEPTH) return 0u;\n";
+  out << "  size_t sz = 0u;\n";
+  for (size_t i = 0; i < msg.fields.size(); ++i) {
+    const auto& f = msg.fields[i];
+    const std::string& ident = plan.field_idents[i];
+    const bool is_repeated = (f.label == FieldLabel::Repeated);
+    const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
+    const bool is_oneof = is_real_oneof_field(f);
+    std::string guard_open;
+    std::string guard_close;
+    std::string ind = "  ";
+    if (is_oneof) {
+      const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
+      guard_open = "  if (" + ro.member_var + " == " + ro.enum_name + "::k" +
+                   to_pascal_case(f.name) + ") {\n";
+      guard_close = "  }\n";
+      ind = "    ";
+    }
+    if (f.type == FieldType::Message) {
+      const std::string target = trim_leading_dot(f.type_name);
+      auto map_it = catalog.map_entries.find(target);
+      if (map_it != catalog.map_entries.end()) {
+        const auto& mi = map_it->second;
+        out << "  sz += 6u;\n";
+        if (mi.val_type == FieldType::Message) {
+          out << "  for (const auto& [_, sv] : " << ident << ") {\n";
+          out << "    sz += 3u + sv.min_wire_size(depth + 2);\n";
+          out << "    if (sz > 16383u) return sz;\n";
+          out << "  }\n";
+        } else {
+          out << "  sz += " << ident << ".size() * 2u;\n";
+        }
+      } else if (is_repeated) {
+        out << "  sz += 5u;\n";
+        out << "  for (const auto& elem : " << ident << ") {\n";
+        out << "    sz += 2u + elem.min_wire_size(depth + 2);\n";
+        out << "    if (sz > 16383u) return sz;\n";
+        out << "  }\n";
+      } else {
+        out << guard_open;
+        out << ind << "if (" << ident << ".has_value()) {\n";
+        out << ind << "  sz += 3u + " << ident << "->min_wire_size(depth + 1);\n";
+        out << ind << "}\n";
+        out << guard_close;
+      }
+    } else if (is_repeated) {
+      size_t elem_min = 1u;
+      if (f.type == FieldType::Fixed32 || f.type == FieldType::Sfixed32 ||
+          f.type == FieldType::Float) {
+        elem_min = 4u;
+      } else if (f.type == FieldType::Fixed64 || f.type == FieldType::Sfixed64 ||
+                 f.type == FieldType::Double) {
+        elem_min = 8u;
+      }
+      if (f.type == FieldType::String || f.type == FieldType::Bytes) {
+        out << "  sz += 5u;\n";
+        out << "  for (const auto& elem : " << ident << ") {\n";
+        out << "    sz += 1u + elem.size();\n";
+        out << "    if (sz > 16383u) return sz;\n";
+        out << "  }\n";
+      } else {
+        out << "  sz += 5u + " << ident << ".size() * " << elem_min << "u;\n";
+      }
+    } else if (is_opt_scalar) {
+      out << "  if (" << ident << ".has_value()) {\n";
+      if (f.type == FieldType::String || f.type == FieldType::Bytes) {
+        out << "    sz += 2u + " << ident << "->size();\n";
+      } else if (f.type == FieldType::Fixed64 || f.type == FieldType::Sfixed64 ||
+                 f.type == FieldType::Double) {
+        out << "    sz += 9u;\n";
+      } else if (f.type == FieldType::Fixed32 || f.type == FieldType::Sfixed32 ||
+                 f.type == FieldType::Float) {
+        out << "    sz += 5u;\n";
+      } else if (f.type == FieldType::Bool) {
+        out << "    sz += 1u;\n";
+      } else {
+        out << "    sz += 2u;\n";
+      }
+      out << "  }\n";
+    } else {
+      out << guard_open;
+      if (f.type == FieldType::String || f.type == FieldType::Bytes) {
+        out << ind << "sz += 2u + " << ident << ".size();\n";
+      } else if (f.type == FieldType::Fixed64 || f.type == FieldType::Sfixed64 ||
+                 f.type == FieldType::Double) {
+        out << ind << "sz += 9u;\n";
+      } else if (f.type == FieldType::Fixed32 || f.type == FieldType::Sfixed32 ||
+                 f.type == FieldType::Float) {
+        out << ind << "sz += 5u;\n";
+      } else if (f.type == FieldType::Bool) {
+        out << ind << "sz += 1u;\n";
+      } else {
+        out << ind << "sz += 2u;\n";
+      }
+      out << guard_close;
+    }
+    out << "  if (sz > 16383u) return sz;\n";
+  }
+  out << "  return sz;\n";
+  out << "}\n\n";
+
   // try_marshal_omnibuf_fast & marshal wrappers
   out << "inline const char* " << qname
-      << "::try_marshal_omnibuf_fast(::omnibuf::FastWriter& w) const {\n";
+      << "::try_marshal_omnibuf_fast(::omnibuf::FastWriter& w, int depth) const {\n";
   out << "  (void)w;\n";
+  out << "  if (depth > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
+  out << "    return \"omnibuf: max nesting depth exceeded\";\n";
+  out << "  }\n";
   for (size_t i = 0; i < msg.fields.size(); ++i) {
     const auto& f = msg.fields[i];
     const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
@@ -1274,7 +1477,7 @@ void emit_struct_methods(std::ostringstream& out,
       oneof_guard = ro.member_var + " == " + ro.enum_name + "::k" + to_pascal_case(f.name);
     }
     emit_try_encode_field_fast(out, f, plan.field_idents[i], is_opt_scalar, oneof_guard, catalog,
-                               "w", "  ");
+                               "w", "depth", "  ");
   }
   out << "  return nullptr;\n";
   out << "}\n\n";
@@ -1357,9 +1560,8 @@ void emit_struct_methods(std::ostringstream& out,
   out << "  if (depth > state.opts.max_depth) [[unlikely]] {\n";
   out << "    return \"omnibuf: max nesting depth exceeded\";\n";
   out << "  }\n";
-  out << "  if (!merge && !is_fresh) {\n";
-  out << "    clear();\n";
-  out << "  }\n";
+  out << "  const bool clear_unseen = !merge && !is_fresh;\n";
+  out << "  (void)clear_unseen;\n";
   out << "  std::array<uint64_t, " << seen_words << "> seen_words{};\n";
   out << "  (void)seen_words;\n";
   out << "  const size_t n = data.size();\n";
@@ -1428,6 +1630,11 @@ void emit_struct_methods(std::ostringstream& out,
         out << "        }\n";
         out << "        const auto mr = ::omnibuf::read_len_slice_fast(data, pos, 3);\n";
         out << "        if (!mr) [[unlikely]] return mr.err;\n";
+        out << "        if (clear_unseen && (seen_words[" << word_idx << "] & " << bit_mask
+            << "ULL) == 0) {\n";
+        out << "          " << ident << ".clear();\n";
+        out << "        }\n";
+        out << "        seen_words[" << word_idx << "] |= " << bit_mask << "ULL;\n";
         if (mi.val_type == FieldType::Message) {
           out << "        if (!::omnibuf::decode_submsg_map_body<" << wire_const_expr(mi.key_type)
               << ">(" << ident << ", mr.span(), [&](std::span<const uint8_t> sb, auto& sv) {\n";
@@ -1464,6 +1671,11 @@ void emit_struct_methods(std::ostringstream& out,
         out << "        if (!state.charge_elements(hdr.count)) [[unlikely]] {\n";
         out << "          return \"omnibuf: max decoded elements exceeded\";\n";
         out << "        }\n";
+        out << "        if (clear_unseen && (seen_words[" << word_idx << "] & " << bit_mask
+            << "ULL) == 0) {\n";
+        out << "          " << ident << ".clear();\n";
+        out << "        }\n";
+        out << "        seen_words[" << word_idx << "] |= " << bit_mask << "ULL;\n";
         out << "        " << ident << ".reserve(::omnibuf::bounded_reserve_target(" << ident
             << ".capacity(), " << ident << ".size(), hdr.count));\n";
         out << "        size_t p = hdr.pos;\n";
@@ -1492,7 +1704,7 @@ void emit_struct_methods(std::ostringstream& out,
       out << "        const bool merge_sub = merge || ((seen_words[" << word_idx << "] & "
           << bit_mask << "ULL) != 0);\n";
       out << "        bool fresh_sub = false;\n";
-      out << "        if (!" << ident << ".has_value() || !merge_sub) {\n";
+      out << "        if (!" << ident << ".has_value()) {\n";
       out << "          " << ident << ".emplace();\n";
       out << "          fresh_sub = true;\n";
       out << "        }\n";
@@ -1514,6 +1726,11 @@ void emit_struct_methods(std::ostringstream& out,
       out << "        }\n";
       out << "        const auto ar = ::omnibuf::read_len_slice_fast(data, pos, 2);\n";
       out << "        if (!ar) [[unlikely]] return ar.err;\n";
+      out << "        if (clear_unseen && (seen_words[" << word_idx << "] & " << bit_mask
+          << "ULL) == 0) {\n";
+      out << "          " << ident << ".clear();\n";
+      out << "        }\n";
+      out << "        seen_words[" << word_idx << "] |= " << bit_mask << "ULL;\n";
       switch (f.type) {
         case FieldType::String:
           out << "        if (!::omnibuf::append_string_arr_body(" << ident
@@ -1593,11 +1810,13 @@ void emit_struct_methods(std::ostringstream& out,
       out << "      case " << tag_false << "ULL: {\n";
       emit_oneof_activate(idx, "        ");
       out << "        " << ident << " = false;\n";
+      out << "        seen_words[" << word_idx << "] |= " << bit_mask << "ULL;\n";
       out << "        break;\n";
       out << "      }\n";
       out << "      case " << tag_true << "ULL: {\n";
       emit_oneof_activate(idx, "        ");
       out << "        " << ident << " = true;\n";
+      out << "        seen_words[" << word_idx << "] |= " << bit_mask << "ULL;\n";
       out << "        break;\n";
       out << "      }\n";
       continue;
@@ -1677,8 +1896,13 @@ void emit_struct_methods(std::ostringstream& out,
         out << "        if (!sr) [[unlikely]] return sr.err;\n";
         emit_oneof_activate(idx, "        ");
         if (is_opt_scalar) {
-          out << "        " << ident
+          out << "        if (" << ident << ".has_value()) {\n";
+          out << "          " << ident
+              << "->assign(reinterpret_cast<const char*>(sr.ptr), sr.len);\n";
+          out << "        } else {\n";
+          out << "          " << ident
               << ".emplace(reinterpret_cast<const char*>(sr.ptr), sr.len);\n";
+          out << "        }\n";
         } else {
           out << "        " << ident
               << ".assign(reinterpret_cast<const char*>(sr.ptr), sr.len);\n";
@@ -1690,7 +1914,11 @@ void emit_struct_methods(std::ostringstream& out,
         out << "        if (!br) [[unlikely]] return br.err;\n";
         emit_oneof_activate(idx, "        ");
         if (is_opt_scalar) {
-          out << "        " << ident << ".emplace(br.ptr, br.ptr + br.len);\n";
+          out << "        if (" << ident << ".has_value()) {\n";
+          out << "          " << ident << "->assign(br.ptr, br.ptr + br.len);\n";
+          out << "        } else {\n";
+          out << "          " << ident << ".emplace(br.ptr, br.ptr + br.len);\n";
+          out << "        }\n";
         } else {
           out << "        " << ident << ".assign(br.ptr, br.ptr + br.len);\n";
         }
@@ -1699,6 +1927,7 @@ void emit_struct_methods(std::ostringstream& out,
       default:
         break;
     }
+    out << "        seen_words[" << word_idx << "] |= " << bit_mask << "ULL;\n";
     out << "        break;\n";
     out << "      }\n";
   }
@@ -1716,8 +1945,54 @@ void emit_struct_methods(std::ostringstream& out,
   out << "      }\n";
   out << "    }\n";
   out << "  }\n";
+  if (!msg.fields.empty() || !plan.real_oneofs.empty()) {
+    out << "  if (clear_unseen) {\n";
+    for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
+      const auto& f = msg.fields[idx];
+      const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
+      const size_t word_idx = idx >> 6;
+      const uint64_t bit_mask = uint64_t{1} << (idx & 63u);
+      out << "    if ((seen_words[" << word_idx << "] & " << bit_mask << "ULL) == 0) {\n";
+      emit_clear_single_member(out, f, plan.field_idents[idx], is_opt_scalar, catalog, "      ");
+      out << "    }\n";
+    }
+    for (const auto& ro : plan.real_oneofs) {
+      out << "    if (";
+      for (size_t j = 0; j < ro.field_indices.size(); ++j) {
+        if (j > 0) out << " && ";
+        const size_t fi = ro.field_indices[j];
+        out << "(seen_words[" << (fi >> 6) << "] & " << (uint64_t{1} << (fi & 63u)) << "ULL) == 0";
+      }
+      out << ") {\n";
+      out << "      " << ro.member_var << " = " << ro.enum_name << "::kNotSet;\n";
+      out << "    }\n";
+    }
+    out << "  }\n";
+  }
   out << "  return nullptr;\n";
   out << "}\n\n";
+}
+
+uint16_t field_expected_wire_mask(const FieldDescriptorProto& f, const TypeCatalog& catalog) {
+  const bool is_repeated = (f.label == FieldLabel::Repeated);
+  if (f.type == FieldType::Message) {
+    const std::string target = trim_leading_dot(f.type_name);
+    if (catalog.map_entries.contains(target)) {
+      return static_cast<uint16_t>(uint16_t{1} << omnibuf::WireMap);
+    }
+    if (is_repeated) {
+      return static_cast<uint16_t>(uint16_t{1} << omnibuf::WireArray);
+    }
+    return static_cast<uint16_t>(uint16_t{1} << omnibuf::WireSubMsg);
+  }
+  if (is_repeated) {
+    return static_cast<uint16_t>(uint16_t{1} << omnibuf::WireArray);
+  }
+  if (f.type == FieldType::Bool) {
+    return static_cast<uint16_t>((uint16_t{1} << omnibuf::WireBoolFalse) |
+                                 (uint16_t{1} << omnibuf::WireBoolTrue));
+  }
+  return static_cast<uint16_t>(uint16_t{1} << scalar_wire_const(f.type));
 }
 
 void emit_opaque_class(std::ostringstream& cls_out,
@@ -1728,11 +2003,8 @@ void emit_opaque_class(std::ostringstream& cls_out,
   const DescriptorProto& msg = *rec.desc;
   const std::string& cls = rec.opaque_ident;
 
-  uint32_t max_fnum = 0;
-  for (const auto& f : msg.fields) {
-    if (f.number > max_fnum) max_fnum = f.number;
-  }
-  const size_t dirty_words = std::max<size_t>(1, static_cast<size_t>(max_fnum / 64) + 1);
+  const size_t num_fields = msg.fields.size();
+  const size_t dirty_words = std::max<size_t>(1, (num_fields + 63) / 64);
 
   auto is_heap_dirty_field = [&](size_t idx) noexcept {
     const auto& f = msg.fields[idx];
@@ -1741,16 +2013,26 @@ void emit_opaque_class(std::ostringstream& cls_out,
            is_explicit_optional_scalar(f, rec.is_proto2);
   };
 
+  auto dirty_var_name = [&](const FieldDescriptorProto& f) {
+    return safe_join_ident(safe_join_ident("f_", sanitize_basic_ident(f.name)), "_");
+  };
+
   cls_out << "class " << cls << " {\n";
   cls_out << " public:\n";
   cls_out << "  " << cls << "() = default;\n";
   cls_out << "  explicit " << cls << "(std::span<const uint8_t> raw) noexcept : raw_view_(raw) {}\n";
   cls_out << "  explicit " << cls << "(std::vector<uint8_t> owned)\n";
-  cls_out << "      : owned_raw_(std::make_unique<std::vector<uint8_t>>(std::move(owned))) {}\n";
+  cls_out << "      : backing_(std::make_shared<const std::vector<uint8_t>>(std::move(owned))) {\n";
+  cls_out << "    raw_view_ = *backing_;\n";
+  cls_out << "  }\n";
+  cls_out << "  " << cls
+          << "(std::span<const uint8_t> raw, std::shared_ptr<const std::vector<uint8_t>> backing,\n";
+  cls_out << "         std::shared_ptr<::omnibuf::OpaqueArena> arena) noexcept\n";
+  cls_out << "      : raw_view_(raw), backing_(std::move(backing)), arena_(std::move(arena)) {}\n";
   cls_out << "  " << cls << "(const " << cls << "& other)\n";
   cls_out << "      : raw_view_(other.raw_view_),\n";
-  cls_out << "        owned_raw_(other.owned_raw_ ? std::make_unique<std::vector<uint8_t>>(*other.owned_raw_)\n";
-  cls_out << "                                    : nullptr),\n";
+  cls_out << "        backing_(other.backing_),\n";
+  cls_out << "        arena_(other.arena_),\n";
   cls_out << "        dirty_(other.dirty_),\n";
   cls_out << "        dirty_scalars_(other.dirty_scalars_),\n";
   cls_out << "        dirty_heap_(other.dirty_heap_ ? std::make_unique<DirtyHeap>(*other.dirty_heap_)\n";
@@ -1765,13 +2047,17 @@ void emit_opaque_class(std::ostringstream& cls_out,
   cls_out << "  " << cls << "& operator=(" << cls << "&&) noexcept = default;\n\n";
 
   cls_out << "  void unmarshal(std::span<const uint8_t> raw) noexcept {\n";
-  cls_out << "    owned_raw_.reset();\n";
+  cls_out << "    backing_.reset();\n";
+  cls_out << "    arena_.reset();\n";
   cls_out << "    raw_view_ = raw;\n";
   cls_out << "    dirty_.fill(0);\n";
+  cls_out << "    dirty_scalars_ = {};\n";
+  cls_out << "    dirty_heap_.reset();\n";
+  cls_out << "    dir_state_ = 0;\n";
   cls_out << "  }\n\n";
 
   cls_out << "  [[nodiscard]] std::span<const uint8_t> raw() const noexcept {\n";
-  cls_out << "    return owned_raw_ ? std::span<const uint8_t>(*owned_raw_) : raw_view_;\n";
+  cls_out << "    return raw_view_;\n";
   cls_out << "  }\n\n";
 
   cls_out << "  [[nodiscard]] ::omnibuf::Result<void> validate(::omnibuf::DecodeOptions opts = {}) const {\n";
@@ -1785,7 +2071,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
   for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
     const auto& f = msg.fields[idx];
-    const std::string dirty_var = "f_" + f.name + "_";
+    const std::string dirty_var = dirty_var_name(f);
     const std::string heap_ref = "dirty_heap_->" + dirty_var;
     const std::string heap_mut = "ensure_dirty_heap()." + dirty_var;
     const std::string scalar_ref = "dirty_scalars_." + dirty_var;
@@ -1793,14 +2079,20 @@ void emit_opaque_class(std::ostringstream& cls_out,
     const bool is_repeated = (f.label == FieldLabel::Repeated);
     const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
     const bool is_oneof = is_real_oneof_field(f);
+    const std::string oneof_group_ref =
+        is_oneof ? ("kOneofGroup_" + std::to_string(plan.oneof_idx_to_plan.at(*f.oneof_index)) + "_")
+                 : "";
 
     auto emit_dirty_oneof_siblings = [&](std::ostringstream& os, std::string_view ind) {
       if (!is_oneof) return;
       const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
       for (size_t sib_fi : ro.field_indices) {
         if (sib_fi == idx) continue;
-        const auto& sf = msg.fields[sib_fi];
-        os << ind << "mark_dirty(" << sf.number << "u);\n";
+        os << ind << "mark_dirty_ord_(" << sib_fi << "u);\n";
+        if (msg.fields[sib_fi].type == FieldType::Message) {
+          os << ind << "if (arena_) arena_->invalidate(this, " << msg.fields[sib_fi].number
+             << "u);\n";
+        }
       }
       os << ind << "dirty_scalars_.oneof_" << ro.oneof_index << "_active_ = " << fnum << "u;\n";
     };
@@ -1821,7 +2113,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
                   << k_param << " key) const;\n";
           out_of_line_out << "inline std::pair<" << v_opaque << ", bool> " << cls << "::lookup_"
                           << f.name << "(" << k_param << " key) const {\n";
-          out_of_line_out << "  if (is_dirty(" << fnum << "u)) {\n";
+          out_of_line_out << "  if (is_dirty_ord_(" << idx << "u)) {\n";
           if (mi.key_type == FieldType::String) {
             out_of_line_out << "    auto it = " << heap_ref << ".find(std::string(key));\n";
           } else {
@@ -1829,18 +2121,19 @@ void emit_opaque_class(std::ostringstream& cls_out,
           }
           out_of_line_out << "    if (it == " << heap_ref << ".end()) return {" << v_opaque
                           << "{}, false};\n";
-          out_of_line_out << "    return {" << v_opaque << "(it->second.marshal_omnibuf()), true};\n";
+          out_of_line_out << "    const auto& sp = ensure_arena().retain_ephemeral(it->second.marshal_omnibuf());\n";
+          out_of_line_out << "    return {" << v_opaque << "(*sp, sp, arena_), true};\n";
           out_of_line_out << "  }\n";
           out_of_line_out << "  const auto [sl, ok] = ::omnibuf::lookup_submsg_map_slice<"
                           << wire_const_expr(mi.key_type) << ", " << k_cpp << ">(raw(), " << fnum
                           << "u, key);\n";
           out_of_line_out << "  return ok ? std::pair<" << v_opaque << ", bool>{" << v_opaque
-                          << "(sl), true} : std::pair<" << v_opaque << ", bool>{" << v_opaque
-                          << "{}, false};\n";
+                          << "(sl, backing_, arena_), true} : std::pair<" << v_opaque << ", bool>{"
+                          << v_opaque << "{}, false};\n";
           out_of_line_out << "}\n\n";
 
           cls_out << "  [[nodiscard]] " << m_type << " get_" << f.name << "() const {\n";
-          cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ";\n";
+          cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
           cls_out << "    return ::omnibuf::read_submsg_map<" << wire_const_expr(mi.key_type)
                   << ", " << m_type << ">(raw(), " << fnum
                   << "u, [](std::span<const uint8_t> sb, auto& sv) {\n";
@@ -1850,7 +2143,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
           cls_out << "  [[nodiscard]] ::omnibuf::Result<" << m_type << "> try_get_" << f.name
                   << "() const {\n";
-          cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ";\n";
+          cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
           cls_out << "    return ::omnibuf::try_read_submsg_map<" << wire_const_expr(mi.key_type)
                   << ", " << m_type << ">(raw(), " << fnum
                   << "u, [](std::span<const uint8_t> sb, auto& sv) {\n";
@@ -1862,7 +2155,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
               scalar_cpp_type_for_kind(mi.val_type, mi.val_type_name, catalog);
           cls_out << "  [[nodiscard]] std::pair<" << v_cpp << ", bool> lookup_" << f.name << "("
                   << k_param << " key) const {\n";
-          cls_out << "    if (is_dirty(" << fnum << "u)) {\n";
+          cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
           if (mi.key_type == FieldType::String) {
             cls_out << "      auto it = " << heap_ref << ".find(std::string(key));\n";
           } else {
@@ -1878,7 +2171,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
           cls_out << "  }\n";
 
           cls_out << "  [[nodiscard]] " << m_type << " get_" << f.name << "() const {\n";
-          cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ";\n";
+          cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
           cls_out << "    return ::omnibuf::read_scalar_map<" << wire_const_expr(mi.key_type)
                   << ", " << wire_const_expr(mi.val_type) << ", " << m_type << ">(raw(), " << fnum
                   << "u).first;\n";
@@ -1886,7 +2179,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
           cls_out << "  [[nodiscard]] ::omnibuf::Result<" << m_type << "> try_get_" << f.name
                   << "() const {\n";
-          cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ";\n";
+          cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
           cls_out << "    return ::omnibuf::try_read_scalar_map<" << wire_const_expr(mi.key_type)
                   << ", " << wire_const_expr(mi.val_type) << ", " << m_type << ">(raw(), " << fnum
                   << "u);\n";
@@ -1895,7 +2188,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
         cls_out << "  void set_" << f.name << "(" << m_type << " v) {\n";
         cls_out << "    " << heap_mut << " = std::move(v);\n";
-        cls_out << "    mark_dirty(" << fnum << "u);\n";
+        cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
         cls_out << "  }\n\n";
         continue;
       }
@@ -1905,28 +2198,30 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
       if (is_repeated) {
         cls_out << "  [[nodiscard]] size_t " << f.name << "_len() const noexcept {\n";
-        cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ".size();\n";
+        cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ".size();\n";
         cls_out << "    return ::omnibuf::submsg_arr_len(raw(), " << fnum << "u);\n";
         cls_out << "  }\n";
 
         cls_out << "  [[nodiscard]] " << sub_opaque << " get_" << f.name << "(size_t idx) const;\n";
         out_of_line_out << "inline " << sub_opaque << " " << cls << "::get_" << f.name
                         << "(size_t idx) const {\n";
-        out_of_line_out << "  if (is_dirty(" << fnum << "u)) {\n";
+        out_of_line_out << "  if (is_dirty_ord_(" << idx << "u)) {\n";
         out_of_line_out << "    if (idx < " << heap_ref << ".size()) {\n";
-        out_of_line_out << "      return " << sub_opaque << "(" << heap_ref
+        out_of_line_out << "      const auto& sp = ensure_arena().retain_ephemeral(" << heap_ref
                         << "[idx].marshal_omnibuf());\n";
+        out_of_line_out << "      return " << sub_opaque << "(*sp, sp, arena_);\n";
         out_of_line_out << "    }\n";
         out_of_line_out << "    return " << sub_opaque << "{};\n";
         out_of_line_out << "  }\n";
         out_of_line_out << "  const auto [elem, ok] = ::omnibuf::read_submsg_arr_elem(raw(), "
                         << fnum << "u, idx);\n";
-        out_of_line_out << "  return ok ? " << sub_opaque << "(elem) : " << sub_opaque << "{};\n";
+        out_of_line_out << "  return ok ? " << sub_opaque << "(elem, backing_, arena_) : "
+                        << sub_opaque << "{};\n";
         out_of_line_out << "}\n\n";
 
         cls_out << "  void set_" << f.name << "(std::vector<" << sub_cpp << "> v) {\n";
         cls_out << "    " << heap_mut << " = std::move(v);\n";
-        cls_out << "    mark_dirty(" << fnum << "u);\n";
+        cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
         cls_out << "  }\n\n";
         continue;
       }
@@ -1937,35 +2232,61 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
       out_of_line_out << "inline " << sub_opaque << " " << cls << "::get_" << f.name
                       << "() const {\n";
-      out_of_line_out << "  if (is_dirty(" << fnum << "u)) {\n";
+      out_of_line_out << "  if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
         out_of_line_out << "    if (dirty_scalars_.oneof_" << ro.oneof_index
                         << "_active_ != " << fnum << "u) return " << sub_opaque << "{};\n";
       }
       out_of_line_out << "    if (" << heap_ref << ".has_value()) {\n";
-      out_of_line_out << "      return " << sub_opaque << "(" << heap_ref
-                      << "->marshal_omnibuf());\n";
+      out_of_line_out << "      if (arena_) {\n";
+      out_of_line_out << "        if (const auto* cached = arena_->find(this, " << fnum
+                      << "u)) {\n";
+      out_of_line_out << "          return " << sub_opaque << "(**cached, *cached, arena_);\n";
+      out_of_line_out << "        }\n";
+      out_of_line_out << "      }\n";
+      out_of_line_out << "      const auto& sp = ensure_arena().store(this, " << fnum << "u, "
+                      << heap_ref << "->marshal_omnibuf());\n";
+      out_of_line_out << "      return " << sub_opaque << "(*sp, sp, arena_);\n";
       out_of_line_out << "    }\n";
       out_of_line_out << "    return " << sub_opaque << "{};\n";
       out_of_line_out << "  }\n";
       out_of_line_out << "  const auto pkt = raw();\n";
-      out_of_line_out << "  const auto first = ::omnibuf::next_container_field(pkt, 0, " << fnum
-                      << "u, ::omnibuf::WireSubMsg, 0);\n";
-      out_of_line_out << "  if (!first.valid || !first.matched) return " << sub_opaque << "{};\n";
-      out_of_line_out
-          << "  const auto second = ::omnibuf::next_container_field(pkt, first.next_pos, " << fnum
-          << "u, ::omnibuf::WireSubMsg, 0);\n";
-      out_of_line_out << "  if (!second.valid) return " << sub_opaque << "{};\n";
-      out_of_line_out << "  if (!second.matched) return " << sub_opaque << "(first.body);\n";
-      out_of_line_out << "  auto [merged, ok] = ::omnibuf::read_submsg(pkt, " << fnum << "u);\n";
-      out_of_line_out << "  return ok ? " << sub_opaque << "(std::move(merged)) : " << sub_opaque
-                      << "{};\n";
+      if (is_oneof) {
+        out_of_line_out << "  auto r = ::omnibuf::read_oneof_submsg(pkt, " << fnum << "u, "
+                        << oneof_group_ref << ", false);\n";
+        out_of_line_out << "  if (!r.valid || r.count == 0) return " << sub_opaque << "{};\n";
+        out_of_line_out << "  if (r.count == 1) return " << sub_opaque
+                        << "(r.single, backing_, arena_);\n";
+        out_of_line_out << "  const auto& sp = ensure_arena().store(this, " << fnum
+                        << "u, std::move(r.merged));\n";
+        out_of_line_out << "  return " << sub_opaque << "(*sp, sp, arena_);\n";
+      } else {
+        out_of_line_out << "  const auto first = ::omnibuf::next_container_field(pkt, 0, " << fnum
+                        << "u, ::omnibuf::WireSubMsg, 0);\n";
+        out_of_line_out << "  if (!first.valid || !first.matched) return " << sub_opaque << "{};\n";
+        out_of_line_out
+            << "  const auto second = ::omnibuf::next_container_field(pkt, first.next_pos, " << fnum
+            << "u, ::omnibuf::WireSubMsg, 0);\n";
+        out_of_line_out << "  if (!second.valid) return " << sub_opaque << "{};\n";
+        out_of_line_out << "  if (!second.matched) return " << sub_opaque
+                        << "(first.body, backing_, arena_);\n";
+        out_of_line_out << "  if (arena_) {\n";
+        out_of_line_out << "    if (const auto* cached = arena_->find(this, " << fnum << "u)) {\n";
+        out_of_line_out << "      return " << sub_opaque << "(**cached, *cached, arena_);\n";
+        out_of_line_out << "    }\n";
+        out_of_line_out << "  }\n";
+        out_of_line_out << "  auto [merged, ok] = ::omnibuf::read_submsg(pkt, " << fnum << "u);\n";
+        out_of_line_out << "  if (!ok) return " << sub_opaque << "{};\n";
+        out_of_line_out << "  const auto& sp = ensure_arena().store(this, " << fnum
+                        << "u, std::move(merged));\n";
+        out_of_line_out << "  return " << sub_opaque << "(*sp, sp, arena_);\n";
+      }
       out_of_line_out << "}\n\n";
 
       out_of_line_out << "inline ::omnibuf::Result<std::optional<" << sub_opaque << ">> " << cls
                       << "::try_get_" << f.name << "() const {\n";
-      out_of_line_out << "  if (is_dirty(" << fnum << "u)) {\n";
+      out_of_line_out << "  if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
         out_of_line_out << "    if (dirty_scalars_.oneof_" << ro.oneof_index
@@ -1975,17 +2296,36 @@ void emit_opaque_class(std::ostringstream& cls_out,
       out_of_line_out << "    if (" << heap_ref << ".has_value()) {\n";
       out_of_line_out << "      auto mb = " << heap_ref << "->try_marshal_omnibuf();\n";
       out_of_line_out << "      if (!mb) return ::omnibuf::Error{mb.error()};\n";
+      out_of_line_out << "      const auto& sp = ensure_arena().store(this, " << fnum
+                      << "u, std::move(mb.value()));\n";
       out_of_line_out << "      return std::optional<" << sub_opaque << ">{" << sub_opaque
-                      << "(std::move(mb.value()))};\n";
+                      << "(*sp, sp, arena_)};\n";
       out_of_line_out << "    }\n";
       out_of_line_out << "    return std::optional<" << sub_opaque << ">{std::nullopt};\n";
       out_of_line_out << "  }\n";
-      out_of_line_out << "  auto sr = ::omnibuf::try_read_submsg(raw(), " << fnum << "u);\n";
-      out_of_line_out << "  if (!sr) return ::omnibuf::Error{sr.error()};\n";
-      out_of_line_out << "  if (!sr.value().has_value()) return std::optional<" << sub_opaque
-                      << ">{std::nullopt};\n";
-      out_of_line_out << "  return std::optional<" << sub_opaque << ">{" << sub_opaque
-                      << "(std::move(*sr.value()))};\n";
+      if (is_oneof) {
+        out_of_line_out << "  auto r = ::omnibuf::read_oneof_submsg(raw(), " << fnum << "u, "
+                        << oneof_group_ref << ", true);\n";
+        out_of_line_out
+            << "  if (!r.valid) return ::omnibuf::Error{\"omnibuf: corrupt packet\"};\n";
+        out_of_line_out << "  if (r.count == 0) return std::optional<" << sub_opaque
+                        << ">{std::nullopt};\n";
+        out_of_line_out << "  if (r.count == 1) return std::optional<" << sub_opaque << ">{"
+                        << sub_opaque << "(r.single, backing_, arena_)};\n";
+        out_of_line_out << "  const auto& sp = ensure_arena().store(this, " << fnum
+                        << "u, std::move(r.merged));\n";
+        out_of_line_out << "  return std::optional<" << sub_opaque << ">{" << sub_opaque
+                        << "(*sp, sp, arena_)};\n";
+      } else {
+        out_of_line_out << "  auto sr = ::omnibuf::try_read_submsg(raw(), " << fnum << "u);\n";
+        out_of_line_out << "  if (!sr) return ::omnibuf::Error{sr.error()};\n";
+        out_of_line_out << "  if (!sr.value().has_value()) return std::optional<" << sub_opaque
+                        << ">{std::nullopt};\n";
+        out_of_line_out << "  const auto& sp = ensure_arena().store(this, " << fnum
+                        << "u, std::move(*sr.value()));\n";
+        out_of_line_out << "  return std::optional<" << sub_opaque << ">{" << sub_opaque
+                        << "(*sp, sp, arena_)};\n";
+      }
       out_of_line_out << "}\n\n";
 
       const std::string param_box =
@@ -1998,8 +2338,9 @@ void emit_opaque_class(std::ostringstream& cls_out,
         cls_out << "    if (!v.has_value()) dirty_scalars_.oneof_" << ro.oneof_index
                 << "_active_ = 0u;\n";
       }
+      cls_out << "    if (arena_) arena_->invalidate(this, " << fnum << "u);\n";
       cls_out << "    " << heap_mut << " = std::move(v);\n";
-      cls_out << "    mark_dirty(" << fnum << "u);\n";
+      cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
       cls_out << "  }\n\n";
       continue;
     }
@@ -2008,7 +2349,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
       const uint8_t elem_wt = scalar_wire_const(f.type);
       const std::string cpp_t = scalar_cpp_type(f, catalog);
       cls_out << "  [[nodiscard]] size_t " << f.name << "_len() const noexcept {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ".size();\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ".size();\n";
       cls_out << "    return ::omnibuf::counted_arr_len(raw(), " << fnum << "u, "
               << static_cast<uint32_t>(elem_wt) << "u);\n";
       cls_out << "  }\n";
@@ -2059,7 +2400,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
       };
 
       cls_out << "  [[nodiscard]] std::vector<" << cpp_t << "> get_" << f.name << "() const {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ";\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
       cls_out << "    std::vector<" << cpp_t << "> dst;\n";
       cls_out << "    (void)::omnibuf::read_arrays_into(dst, raw(), " << fnum << "u, ";
       emit_arr_lambda(cls_out);
@@ -2069,7 +2410,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
       cls_out << "  [[nodiscard]] ::omnibuf::Result<std::vector<" << cpp_t << ">> try_get_"
               << f.name << "() const {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ";\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
       cls_out << "    return ::omnibuf::try_read_arrays<std::vector<" << cpp_t << ">>(raw(), "
               << fnum << "u, ";
       emit_arr_lambda(cls_out);
@@ -2078,7 +2419,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
       cls_out << "  void set_" << f.name << "(std::vector<" << cpp_t << "> v) {\n";
       cls_out << "    " << heap_mut << " = std::move(v);\n";
-      cls_out << "    mark_dirty(" << fnum << "u);\n";
+      cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
       cls_out << "  }\n\n";
       continue;
     }
@@ -2086,45 +2427,124 @@ void emit_opaque_class(std::ostringstream& cls_out,
     const std::string cpp_t = scalar_cpp_type(f, catalog);
 
     auto emit_try_read_scalar_expr = [&](std::ostringstream& os) {
+      const std::string fn_prefix = is_oneof ? "::omnibuf::try_read_oneof_" : "::omnibuf::try_read_";
+      const std::string extra_arg = is_oneof ? (", " + oneof_group_ref) : "";
       switch (f.type) {
         case FieldType::Uint32:
         case FieldType::Uint64:
-          os << "::omnibuf::try_read_uint(raw(), " << fnum << "u)";
+          os << fn_prefix << "uint(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Int32:
         case FieldType::Sint32:
         case FieldType::Int64:
         case FieldType::Sint64:
         case FieldType::Enum:
-          os << "::omnibuf::try_read_sint(raw(), " << fnum << "u)";
+          os << fn_prefix << "sint(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Bool:
-          os << "::omnibuf::try_read_bool(raw(), " << fnum << "u)";
+          os << fn_prefix << "bool(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Fixed32:
-          os << "::omnibuf::try_read_fixed32(raw(), " << fnum << "u)";
+          os << fn_prefix << "fixed32(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Sfixed32:
-          os << "::omnibuf::try_read_sfixed32(raw(), " << fnum << "u)";
+          os << fn_prefix << "sfixed32(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Float:
-          os << "::omnibuf::try_read_float32(raw(), " << fnum << "u)";
+          os << fn_prefix << "float32(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Fixed64:
-          os << "::omnibuf::try_read_fixed64(raw(), " << fnum << "u)";
+          os << fn_prefix << "fixed64(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Sfixed64:
-          os << "::omnibuf::try_read_sfixed64(raw(), " << fnum << "u)";
+          os << fn_prefix << "sfixed64(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Double:
-          os << "::omnibuf::try_read_float64(raw(), " << fnum << "u)";
+          os << fn_prefix << "float64(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::String:
-          os << "::omnibuf::try_read_string_view(raw(), " << fnum << "u)";
+          os << fn_prefix << "string_view(raw(), " << fnum << "u" << extra_arg << ")";
           break;
         case FieldType::Bytes:
         default:
-          os << "::omnibuf::try_read_bytes_view(raw(), " << fnum << "u)";
+          os << fn_prefix << "bytes_view(raw(), " << fnum << "u" << extra_arg << ")";
+          break;
+      }
+    };
+
+    auto emit_dir_decode_scalar = [&](std::ostringstream& os, std::string_view ind, bool is_try) {
+      os << ind << "const auto pkt = raw();\n";
+      os << ind << "const size_t off = dir_offsets_[" << idx << "u];\n";
+      switch (f.type) {
+        case FieldType::Bool:
+          os << ind << "(void)pkt;\n";
+          os << ind << "return off != 0u;\n";
+          break;
+        case FieldType::Uint32:
+        case FieldType::Uint64:
+          os << ind << "const auto [v, vn] = ::omnibuf::decode_varint(pkt.subspan(off));\n";
+          if (is_try) {
+            os << ind << "if (vn == 0) return ::omnibuf::Error{\"omnibuf: truncated uint\"};\n";
+          } else {
+            os << ind << "if (vn == 0) return " << scalar_default_literal(f, catalog) << ";\n";
+          }
+          os << ind << "return static_cast<" << cpp_t << ">(v);\n";
+          break;
+        case FieldType::Int32:
+        case FieldType::Sint32:
+        case FieldType::Int64:
+        case FieldType::Sint64:
+          os << ind << "const auto [v, vn] = ::omnibuf::decode_varint(pkt.subspan(off));\n";
+          if (is_try) {
+            os << ind << "if (vn == 0) return ::omnibuf::Error{\"omnibuf: truncated sint\"};\n";
+          } else {
+            os << ind << "if (vn == 0) return " << scalar_default_literal(f, catalog) << ";\n";
+          }
+          os << ind << "return static_cast<" << cpp_t << ">(::omnibuf::decode_zigzag(v));\n";
+          break;
+        case FieldType::Enum:
+          os << ind << "const auto [v, vn] = ::omnibuf::decode_varint(pkt.subspan(off));\n";
+          if (is_try) {
+            os << ind << "if (vn == 0) return ::omnibuf::Error{\"omnibuf: truncated sint\"};\n";
+          } else {
+            os << ind << "if (vn == 0) return " << scalar_default_literal(f, catalog) << ";\n";
+          }
+          os << ind << "return static_cast<" << cpp_t
+             << ">(static_cast<int32_t>(::omnibuf::decode_zigzag(v)));\n";
+          break;
+        case FieldType::Fixed32:
+        case FieldType::Sfixed32:
+          os << ind << "if (pkt.size() - off < 4) return "
+             << (is_try ? "::omnibuf::Error{\"omnibuf: truncated 32-bit scalar\"}"
+                        : scalar_default_literal(f, catalog))
+             << ";\n";
+          os << ind << "return static_cast<" << cpp_t
+             << ">(::omnibuf::read_u32_le(pkt.data() + off));\n";
+          break;
+        case FieldType::Float:
+          os << ind << "if (pkt.size() - off < 4) return "
+             << (is_try ? "::omnibuf::Error{\"omnibuf: truncated float32\"}"
+                        : scalar_default_literal(f, catalog))
+             << ";\n";
+          os << ind << "return ::omnibuf::bits_to_float32(::omnibuf::read_u32_le(pkt.data() + off));\n";
+          break;
+        case FieldType::Fixed64:
+        case FieldType::Sfixed64:
+          os << ind << "if (pkt.size() - off < 8) return "
+             << (is_try ? "::omnibuf::Error{\"omnibuf: truncated 64-bit scalar\"}"
+                        : scalar_default_literal(f, catalog))
+             << ";\n";
+          os << ind << "return static_cast<" << cpp_t
+             << ">(::omnibuf::read_u64_le(pkt.data() + off));\n";
+          break;
+        case FieldType::Double:
+          os << ind << "if (pkt.size() - off < 8) return "
+             << (is_try ? "::omnibuf::Error{\"omnibuf: truncated float64\"}"
+                        : scalar_default_literal(f, catalog))
+             << ";\n";
+          os << ind << "return ::omnibuf::bits_to_float64(::omnibuf::read_u64_le(pkt.data() + off));\n";
+          break;
+        default:
           break;
       }
     };
@@ -2132,7 +2552,30 @@ void emit_opaque_class(std::ostringstream& cls_out,
     if (is_opt_scalar) {
       cls_out << "  [[nodiscard]] ::omnibuf::Result<std::optional<" << cpp_t << ">> try_get_"
               << f.name << "() const {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) return " << heap_ref << ";\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+      cls_out << "    const uint8_t ds = ensure_dir_();\n";
+      cls_out << "    if (ds == 3u) return ::omnibuf::Error{\"omnibuf: corrupt packet\"};\n";
+      cls_out << "    if (ds == 2u) {\n";
+      cls_out << "      if (!dir_has_(" << idx << "u)) return std::optional<" << cpp_t
+              << ">{std::nullopt};\n";
+      if (f.type == FieldType::String) {
+        cls_out << "      const auto sr = ::omnibuf::read_str_slice_fast(raw(), dir_offsets_["
+                << idx << "u]);\n";
+        cls_out << "      if (!sr) return ::omnibuf::Error{sr.err};\n";
+        cls_out << "      return std::optional<std::string>{std::string(reinterpret_cast<const char*>(sr.ptr), sr.len)};\n";
+      } else if (f.type == FieldType::Bytes) {
+        cls_out << "      const auto br = ::omnibuf::read_len_slice_fast(raw(), dir_offsets_["
+                << idx << "u], 0);\n";
+        cls_out << "      if (!br) return ::omnibuf::Error{br.err};\n";
+        cls_out << "      return std::optional<std::vector<uint8_t>>{std::vector<uint8_t>(br.ptr, br.ptr + br.len)};\n";
+      } else {
+        cls_out << "      auto dec = [&]() -> ::omnibuf::Result<" << cpp_t << "> {\n";
+        emit_dir_decode_scalar(cls_out, "        ", true);
+        cls_out << "      }();\n";
+        cls_out << "      if (!dec) return ::omnibuf::Error{dec.error()};\n";
+        cls_out << "      return std::optional<" << cpp_t << ">{dec.value()};\n";
+      }
+      cls_out << "    }\n";
       cls_out << "    auto r = ";
       emit_try_read_scalar_expr(cls_out);
       cls_out << ";\n";
@@ -2161,14 +2604,14 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
       cls_out << "  void set_" << f.name << "(std::optional<" << cpp_t << "> v) {\n";
       cls_out << "    " << heap_mut << " = std::move(v);\n";
-      cls_out << "    mark_dirty(" << fnum << "u);\n";
+      cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
       cls_out << "  }\n\n";
       continue;
     }
 
     if (f.type == FieldType::String) {
       cls_out << "  [[nodiscard]] std::string_view get_" << f.name << "_view() const noexcept {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) {\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
         cls_out << "      if (dirty_scalars_.oneof_" << ro.oneof_index << "_active_ != " << fnum
@@ -2176,14 +2619,27 @@ void emit_opaque_class(std::ostringstream& cls_out,
       }
       cls_out << "      return " << heap_ref << ";\n";
       cls_out << "    }\n";
-      cls_out << "    return ::omnibuf::read_string_view(raw(), " << fnum << "u).first;\n";
+      cls_out << "    const uint8_t ds = ensure_dir_();\n";
+      cls_out << "    if (ds == 3u) return {};\n";
+      cls_out << "    if (ds == 2u) {\n";
+      cls_out << "      if (!dir_has_(" << idx << "u)) return {};\n";
+      cls_out << "      const auto sr = ::omnibuf::read_str_slice_fast(raw(), dir_offsets_[" << idx
+              << "u]);\n";
+      cls_out << "      return sr ? std::string_view(reinterpret_cast<const char*>(sr.ptr), sr.len) : std::string_view{};\n";
+      cls_out << "    }\n";
+      if (is_oneof) {
+        cls_out << "    return ::omnibuf::read_oneof_string_view(raw(), " << fnum << "u, "
+                << oneof_group_ref << ").first;\n";
+      } else {
+        cls_out << "    return ::omnibuf::read_string_view(raw(), " << fnum << "u).first;\n";
+      }
       cls_out << "  }\n";
       cls_out << "  [[nodiscard]] std::string get_" << f.name << "() const {\n";
       cls_out << "    return std::string(get_" << f.name << "_view());\n";
       cls_out << "  }\n";
       cls_out << "  [[nodiscard]] ::omnibuf::Result<std::string_view> try_get_" << f.name
               << "_view() const {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) {\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
         cls_out << "      if (dirty_scalars_.oneof_" << ro.oneof_index << "_active_ != " << fnum
@@ -2193,7 +2649,18 @@ void emit_opaque_class(std::ostringstream& cls_out,
               << ")) return ::omnibuf::Error{\"omnibuf: invalid UTF-8 in WireString\"};\n";
       cls_out << "      return std::string_view(" << heap_ref << ");\n";
       cls_out << "    }\n";
-      cls_out << "    auto r = ::omnibuf::try_read_string_view(raw(), " << fnum << "u);\n";
+      cls_out << "    const uint8_t ds = ensure_dir_();\n";
+      cls_out << "    if (ds == 3u) return ::omnibuf::Error{\"omnibuf: corrupt packet\"};\n";
+      cls_out << "    if (ds == 2u) {\n";
+      cls_out << "      if (!dir_has_(" << idx << "u)) return std::string_view{};\n";
+      cls_out << "      const auto sr = ::omnibuf::read_str_slice_fast(raw(), dir_offsets_[" << idx
+              << "u]);\n";
+      cls_out << "      if (!sr) return ::omnibuf::Error{sr.err};\n";
+      cls_out << "      return std::string_view(reinterpret_cast<const char*>(sr.ptr), sr.len);\n";
+      cls_out << "    }\n";
+      cls_out << "    auto r = ";
+      emit_try_read_scalar_expr(cls_out);
+      cls_out << ";\n";
       cls_out << "    if (!r) return ::omnibuf::Error{r.error()};\n";
       cls_out << "    return r.value().value_or(std::string_view{});\n";
       cls_out << "  }\n";
@@ -2206,7 +2673,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
       cls_out << "  void set_" << f.name << "(std::string v) {\n";
       emit_dirty_oneof_siblings(cls_out, "    ");
       cls_out << "    " << heap_mut << " = std::move(v);\n";
-      cls_out << "    mark_dirty(" << fnum << "u);\n";
+      cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
       cls_out << "  }\n\n";
       continue;
     }
@@ -2214,7 +2681,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
     if (f.type == FieldType::Bytes) {
       cls_out << "  [[nodiscard]] std::span<const uint8_t> get_" << f.name
               << "_view() const noexcept {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) {\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
         cls_out << "      if (dirty_scalars_.oneof_" << ro.oneof_index << "_active_ != " << fnum
@@ -2222,7 +2689,20 @@ void emit_opaque_class(std::ostringstream& cls_out,
       }
       cls_out << "      return " << heap_ref << ";\n";
       cls_out << "    }\n";
-      cls_out << "    return ::omnibuf::read_bytes_view(raw(), " << fnum << "u).first;\n";
+      cls_out << "    const uint8_t ds = ensure_dir_();\n";
+      cls_out << "    if (ds == 3u) return {};\n";
+      cls_out << "    if (ds == 2u) {\n";
+      cls_out << "      if (!dir_has_(" << idx << "u)) return {};\n";
+      cls_out << "      const auto br = ::omnibuf::read_len_slice_fast(raw(), dir_offsets_[" << idx
+              << "u], 0);\n";
+      cls_out << "      return br ? br.span() : std::span<const uint8_t>{};\n";
+      cls_out << "    }\n";
+      if (is_oneof) {
+        cls_out << "    return ::omnibuf::read_oneof_bytes_view(raw(), " << fnum << "u, "
+                << oneof_group_ref << ").first;\n";
+      } else {
+        cls_out << "    return ::omnibuf::read_bytes_view(raw(), " << fnum << "u).first;\n";
+      }
       cls_out << "  }\n";
       cls_out << "  [[nodiscard]] std::vector<uint8_t> get_" << f.name << "() const {\n";
       cls_out << "    const auto sp = get_" << f.name << "_view();\n";
@@ -2230,7 +2710,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
       cls_out << "  }\n";
       cls_out << "  [[nodiscard]] ::omnibuf::Result<std::vector<uint8_t>> try_get_" << f.name
               << "() const {\n";
-      cls_out << "    if (is_dirty(" << fnum << "u)) {\n";
+      cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
         cls_out << "      if (dirty_scalars_.oneof_" << ro.oneof_index << "_active_ != " << fnum
@@ -2238,7 +2718,18 @@ void emit_opaque_class(std::ostringstream& cls_out,
       }
       cls_out << "      return " << heap_ref << ";\n";
       cls_out << "    }\n";
-      cls_out << "    auto r = ::omnibuf::try_read_bytes_view(raw(), " << fnum << "u);\n";
+      cls_out << "    const uint8_t ds = ensure_dir_();\n";
+      cls_out << "    if (ds == 3u) return ::omnibuf::Error{\"omnibuf: corrupt packet\"};\n";
+      cls_out << "    if (ds == 2u) {\n";
+      cls_out << "      if (!dir_has_(" << idx << "u)) return std::vector<uint8_t>{};\n";
+      cls_out << "      const auto br = ::omnibuf::read_len_slice_fast(raw(), dir_offsets_[" << idx
+              << "u], 0);\n";
+      cls_out << "      if (!br) return ::omnibuf::Error{br.err};\n";
+      cls_out << "      return std::vector<uint8_t>(br.ptr, br.ptr + br.len);\n";
+      cls_out << "    }\n";
+      cls_out << "    auto r = ";
+      emit_try_read_scalar_expr(cls_out);
+      cls_out << ";\n";
       cls_out << "    if (!r) return ::omnibuf::Error{r.error()};\n";
       cls_out << "    if (!r.value().has_value()) return std::vector<uint8_t>{};\n";
       cls_out << "    return std::vector<uint8_t>(r.value()->begin(), r.value()->end());\n";
@@ -2246,13 +2737,13 @@ void emit_opaque_class(std::ostringstream& cls_out,
       cls_out << "  void set_" << f.name << "(std::vector<uint8_t> v) {\n";
       emit_dirty_oneof_siblings(cls_out, "    ");
       cls_out << "    " << heap_mut << " = std::move(v);\n";
-      cls_out << "    mark_dirty(" << fnum << "u);\n";
+      cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
       cls_out << "  }\n\n";
       continue;
     }
 
     cls_out << "  [[nodiscard]] " << cpp_t << " get_" << f.name << "() const noexcept {\n";
-    cls_out << "    if (is_dirty(" << fnum << "u)) {\n";
+    cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
     if (is_oneof) {
       const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
       cls_out << "      if (dirty_scalars_.oneof_" << ro.oneof_index << "_active_ != " << fnum
@@ -2260,60 +2751,84 @@ void emit_opaque_class(std::ostringstream& cls_out,
     }
     cls_out << "      return " << scalar_ref << ";\n";
     cls_out << "    }\n";
-    switch (f.type) {
-      case FieldType::Uint32:
-      case FieldType::Uint64:
-        cls_out << "    return static_cast<" << cpp_t << ">(::omnibuf::read_uint(raw(), " << fnum
-                << "u).first);\n";
-        break;
-      case FieldType::Int32:
-      case FieldType::Sint32:
-      case FieldType::Int64:
-      case FieldType::Sint64:
-        cls_out << "    return static_cast<" << cpp_t << ">(::omnibuf::read_sint(raw(), " << fnum
-                << "u).first);\n";
-        break;
-      case FieldType::Enum:
-        cls_out << "    return static_cast<" << cpp_t
-                << ">(static_cast<int32_t>(::omnibuf::read_sint(raw(), " << fnum
-                << "u).first));\n";
-        break;
-      case FieldType::Bool:
-        cls_out << "    return ::omnibuf::read_bool(raw(), " << fnum << "u).first;\n";
-        break;
-      case FieldType::Fixed32:
-        cls_out << "    return ::omnibuf::read_fixed32(raw(), " << fnum << "u).first;\n";
-        break;
-      case FieldType::Sfixed32:
-        cls_out << "    return ::omnibuf::read_sfixed32(raw(), " << fnum << "u).first;\n";
-        break;
-      case FieldType::Float:
-        cls_out << "    return ::omnibuf::read_float32(raw(), " << fnum << "u).first;\n";
-        break;
-      case FieldType::Fixed64:
-        cls_out << "    return ::omnibuf::read_fixed64(raw(), " << fnum << "u).first;\n";
-        break;
-      case FieldType::Sfixed64:
-        cls_out << "    return ::omnibuf::read_sfixed64(raw(), " << fnum << "u).first;\n";
-        break;
-      case FieldType::Double:
-        cls_out << "    return ::omnibuf::read_float64(raw(), " << fnum << "u).first;\n";
-        break;
-      default:
-        cls_out << "    return " << scalar_default_literal(f, catalog) << ";\n";
-        break;
+    cls_out << "    const uint8_t ds = ensure_dir_();\n";
+    cls_out << "    if (ds == 3u) return " << scalar_default_literal(f, catalog) << ";\n";
+    cls_out << "    if (ds == 2u) {\n";
+    cls_out << "      if (!dir_has_(" << idx << "u)) return " << scalar_default_literal(f, catalog)
+            << ";\n";
+    emit_dir_decode_scalar(cls_out, "      ", false);
+    cls_out << "    }\n";
+    {
+      const std::string fn_prefix = is_oneof ? "::omnibuf::read_oneof_" : "::omnibuf::read_";
+      const std::string extra_arg = is_oneof ? (", " + oneof_group_ref) : "";
+      switch (f.type) {
+        case FieldType::Uint32:
+        case FieldType::Uint64:
+          cls_out << "    return static_cast<" << cpp_t << ">(" << fn_prefix << "uint(raw(), "
+                  << fnum << "u" << extra_arg << ").first);\n";
+          break;
+        case FieldType::Int32:
+        case FieldType::Sint32:
+        case FieldType::Int64:
+        case FieldType::Sint64:
+          cls_out << "    return static_cast<" << cpp_t << ">(" << fn_prefix << "sint(raw(), "
+                  << fnum << "u" << extra_arg << ").first);\n";
+          break;
+        case FieldType::Enum:
+          cls_out << "    return static_cast<" << cpp_t << ">(static_cast<int32_t>(" << fn_prefix
+                  << "sint(raw(), " << fnum << "u" << extra_arg << ").first));\n";
+          break;
+        case FieldType::Bool:
+          cls_out << "    return " << fn_prefix << "bool(raw(), " << fnum << "u" << extra_arg
+                  << ").first;\n";
+          break;
+        case FieldType::Fixed32:
+          cls_out << "    return " << fn_prefix << "fixed32(raw(), " << fnum << "u" << extra_arg
+                  << ").first;\n";
+          break;
+        case FieldType::Sfixed32:
+          cls_out << "    return " << fn_prefix << "sfixed32(raw(), " << fnum << "u" << extra_arg
+                  << ").first;\n";
+          break;
+        case FieldType::Float:
+          cls_out << "    return " << fn_prefix << "float32(raw(), " << fnum << "u" << extra_arg
+                  << ").first;\n";
+          break;
+        case FieldType::Fixed64:
+          cls_out << "    return " << fn_prefix << "fixed64(raw(), " << fnum << "u" << extra_arg
+                  << ").first;\n";
+          break;
+        case FieldType::Sfixed64:
+          cls_out << "    return " << fn_prefix << "sfixed64(raw(), " << fnum << "u" << extra_arg
+                  << ").first;\n";
+          break;
+        case FieldType::Double:
+          cls_out << "    return " << fn_prefix << "float64(raw(), " << fnum << "u" << extra_arg
+                  << ").first;\n";
+          break;
+        default:
+          cls_out << "    return " << scalar_default_literal(f, catalog) << ";\n";
+          break;
+      }
     }
     cls_out << "  }\n";
 
     cls_out << "  [[nodiscard]] ::omnibuf::Result<" << cpp_t << "> try_get_" << f.name
             << "() const {\n";
-    cls_out << "    if (is_dirty(" << fnum << "u)) {\n";
+    cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
     if (is_oneof) {
       const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
       cls_out << "      if (dirty_scalars_.oneof_" << ro.oneof_index << "_active_ != " << fnum
               << "u) return " << scalar_default_literal(f, catalog) << ";\n";
     }
     cls_out << "      return " << scalar_ref << ";\n";
+    cls_out << "    }\n";
+    cls_out << "    const uint8_t ds = ensure_dir_();\n";
+    cls_out << "    if (ds == 3u) return ::omnibuf::Error{\"omnibuf: corrupt packet\"};\n";
+    cls_out << "    if (ds == 2u) {\n";
+    cls_out << "      if (!dir_has_(" << idx << "u)) return " << scalar_default_literal(f, catalog)
+            << ";\n";
+    emit_dir_decode_scalar(cls_out, "      ", true);
     cls_out << "    }\n";
     cls_out << "    auto r = ";
     emit_try_read_scalar_expr(cls_out);
@@ -2331,48 +2846,64 @@ void emit_opaque_class(std::ostringstream& cls_out,
     cls_out << "  void set_" << f.name << "(" << cpp_t << " v) noexcept {\n";
     emit_dirty_oneof_siblings(cls_out, "    ");
     cls_out << "    " << scalar_ref << " = v;\n";
-    cls_out << "    mark_dirty(" << fnum << "u);\n";
+    cls_out << "    mark_dirty_ord_(" << idx << "u);\n";
     cls_out << "  }\n\n";
   }
 
-  // try_marshal_into, marshal_into, try_marshal, marshal_append, marshal
-  cls_out << "  [[nodiscard]] ::omnibuf::Result<void> try_marshal_into(std::vector<uint8_t>& dst) const {\n";
-  cls_out << "    dst.clear();\n";
-  cls_out << "    if (!any_dirty()) {\n";
+  // try_marshal_append_into, marshal_append_into, try_marshal_into, marshal_into, try_marshal,
+  // marshal_append, marshal
+  cls_out << "  [[nodiscard]] ::omnibuf::Result<void> try_marshal_append_into(std::vector<uint8_t>& dst) const {\n";
+  cls_out << "    detach_if_aliased_(dst);\n";
+  cls_out << "    if (!any_dirty_()) {\n";
   cls_out << "      auto vr = validate();\n";
   cls_out << "      if (!vr) return vr;\n";
   cls_out << "      ::omnibuf::copy_packet_append(dst, raw());\n";
   cls_out << "      return ::omnibuf::Result<void>::success();\n";
   cls_out << "    }\n";
-  cls_out << "    return ::omnibuf::try_splice_fields_into(\n";
-  cls_out << "        dst, raw(), std::span<const uint64_t>(dirty_), " << max_fnum << "u,\n";
-  cls_out << "        [this](std::vector<uint8_t>& b, uint32_t fnum) -> const char* {\n";
-  cls_out << "          return this->append_dirty_field_(b, fnum);\n";
+  cls_out << "    return ::omnibuf::detail::splice_fields_ordinal_into_impl<true>(\n";
+  cls_out << "        dst, raw(), std::span<const uint64_t>(dirty_), " << num_fields
+          << "u, &field_num_to_ordinal_,\n";
+  cls_out << "        [this](std::vector<uint8_t>& b, size_t ord) -> const char* {\n";
+  cls_out << "          return this->append_dirty_field_ord_(b, ord);\n";
   cls_out << "        });\n";
   cls_out << "  }\n\n";
 
-  cls_out << "  void marshal_into(std::vector<uint8_t>& dst) const {\n";
-  cls_out << "    dst.clear();\n";
-  cls_out << "    if (!any_dirty()) {\n";
+  cls_out << "  void marshal_append_into(std::vector<uint8_t>& dst) const {\n";
+  cls_out << "    detach_if_aliased_(dst);\n";
+  cls_out << "    if (!any_dirty_()) {\n";
   cls_out << "      ::omnibuf::copy_packet_append(dst, raw());\n";
   cls_out << "      return;\n";
   cls_out << "    }\n";
-  cls_out << "    ::omnibuf::splice_fields_into(\n";
-  cls_out << "        dst, raw(), std::span<const uint64_t>(dirty_), " << max_fnum << "u,\n";
-  cls_out << "        [this](std::vector<uint8_t>& b, uint32_t fnum) -> const char* {\n";
-  cls_out << "          return this->append_dirty_field_(b, fnum);\n";
+  cls_out << "    auto res = ::omnibuf::detail::splice_fields_ordinal_into_impl<false>(\n";
+  cls_out << "        dst, raw(), std::span<const uint64_t>(dirty_), " << num_fields
+          << "u, &field_num_to_ordinal_,\n";
+  cls_out << "        [this](std::vector<uint8_t>& b, size_t ord) -> const char* {\n";
+  cls_out << "          return this->append_dirty_field_ord_(b, ord);\n";
   cls_out << "        });\n";
+  cls_out << "    if (!res) throw std::invalid_argument(res.error());\n";
+  cls_out << "  }\n\n";
+
+  cls_out << "  [[nodiscard]] ::omnibuf::Result<void> try_marshal_into(std::vector<uint8_t>& dst) const {\n";
+  cls_out << "    detach_if_aliased_(dst);\n";
+  cls_out << "    dst.clear();\n";
+  cls_out << "    return try_marshal_append_into(dst);\n";
+  cls_out << "  }\n\n";
+
+  cls_out << "  void marshal_into(std::vector<uint8_t>& dst) const {\n";
+  cls_out << "    detach_if_aliased_(dst);\n";
+  cls_out << "    dst.clear();\n";
+  cls_out << "    marshal_append_into(dst);\n";
   cls_out << "  }\n\n";
 
   cls_out << "  [[nodiscard]] ::omnibuf::Result<std::vector<uint8_t>> try_marshal() const {\n";
   cls_out << "    std::vector<uint8_t> dst;\n";
-  cls_out << "    auto res = try_marshal_into(dst);\n";
+  cls_out << "    auto res = try_marshal_append_into(dst);\n";
   cls_out << "    if (!res) return ::omnibuf::Error{res.error()};\n";
   cls_out << "    return dst;\n";
   cls_out << "  }\n\n";
 
   cls_out << "  [[nodiscard]] std::vector<uint8_t> marshal_append(std::vector<uint8_t> dst = {}) const {\n";
-  cls_out << "    marshal_into(dst);\n";
+  cls_out << "    marshal_append_into(dst);\n";
   cls_out << "    return dst;\n";
   cls_out << "  }\n\n";
 
@@ -2381,16 +2912,51 @@ void emit_opaque_class(std::ostringstream& cls_out,
   cls_out << "  }\n\n";
 
   cls_out << " private:\n";
-  cls_out << "  [[nodiscard]] const char* append_dirty_field_(std::vector<uint8_t>& b, uint32_t fnum) const;\n\n";
+  cls_out << "  static constexpr int field_num_to_ordinal_(uint32_t fnum) noexcept {\n";
+  cls_out << "    switch (fnum) {\n";
+  for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
+    cls_out << "      case " << msg.fields[idx].number << "u: return " << idx << ";\n";
+  }
+  cls_out << "      default: return -1;\n";
+  cls_out << "    }\n";
+  cls_out << "  }\n\n";
+
+  if (num_fields > 0) {
+    cls_out << "  static constexpr std::array<::omnibuf::OpaqueFieldDirSpec, " << num_fields
+            << "> kDirSpecs_ = {{\n";
+    for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
+      const auto& f = msg.fields[idx];
+      const uint16_t mask = field_expected_wire_mask(f, catalog);
+      const int16_t og = is_real_oneof_field(f)
+                             ? static_cast<int16_t>(plan.oneof_idx_to_plan.at(*f.oneof_index))
+                             : static_cast<int16_t>(-1);
+      const bool is_b = (f.label != FieldLabel::Repeated && f.type == FieldType::Bool);
+      cls_out << "      {" << mask << "u, " << og << ", " << (is_b ? "true" : "false") << "},\n";
+    }
+    cls_out << "  }};\n\n";
+  }
+
+  for (size_t pi = 0; pi < plan.real_oneofs.size(); ++pi) {
+    const auto& ro = plan.real_oneofs[pi];
+    cls_out << "  static constexpr std::array<::omnibuf::OneofBranchSpec, "
+            << ro.field_indices.size() << "> kOneofGroup_" << pi << "_ = {{\n";
+    for (size_t fi : ro.field_indices) {
+      const auto& f = msg.fields[fi];
+      cls_out << "      {" << f.number << "u, " << field_expected_wire_mask(f, catalog) << "u},\n";
+    }
+    cls_out << "  }};\n\n";
+  }
+
+  cls_out << "  [[nodiscard]] const char* append_dirty_field_ord_(std::vector<uint8_t>& b, size_t ord) const;\n\n";
 
   out_of_line_out << "inline const char* " << cls
-                  << "::append_dirty_field_(std::vector<uint8_t>& b, uint32_t fnum) const {\n";
+                  << "::append_dirty_field_ord_(std::vector<uint8_t>& b, size_t ord) const {\n";
   out_of_line_out << "  (void)this;\n";
   out_of_line_out << "  ::omnibuf::FastWriter w(b, 128);\n";
-  out_of_line_out << "  switch (fnum) {\n";
+  out_of_line_out << "  switch (ord) {\n";
   for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
     const auto& f = msg.fields[idx];
-    const std::string dirty_var = "f_" + f.name + "_";
+    const std::string dirty_var = dirty_var_name(f);
     const bool use_heap = is_heap_dirty_field(idx);
     const std::string member_expr =
         use_heap ? ("dirty_heap_->" + dirty_var) : ("dirty_scalars_." + dirty_var);
@@ -2401,12 +2967,12 @@ void emit_opaque_class(std::ostringstream& cls_out,
       oneof_guard = "dirty_scalars_.oneof_" + std::to_string(ro.oneof_index) + "_active_ == " +
                     std::to_string(f.number) + "u";
     }
-    out_of_line_out << "    case " << f.number << "u: {\n";
+    out_of_line_out << "    case " << idx << "u: {\n";
     if (use_heap) {
       out_of_line_out << "      if (!dirty_heap_) break;\n";
     }
     emit_try_encode_field_fast(out_of_line_out, f, member_expr, is_opt_scalar, oneof_guard, catalog,
-                               "w", "      ");
+                               "w", "0", "      ");
     out_of_line_out << "      break;\n";
     out_of_line_out << "    }\n";
   }
@@ -2417,26 +2983,58 @@ void emit_opaque_class(std::ostringstream& cls_out,
   out_of_line_out << "  return nullptr;\n";
   out_of_line_out << "}\n\n";
 
-  cls_out << "  [[nodiscard]] bool is_dirty(uint32_t fnum) const noexcept {\n";
-  cls_out << "    const size_t w = fnum >> 6;\n";
-  cls_out << "    return w < dirty_.size() && ((dirty_[w] >> (fnum & 63u)) & 1u) != 0;\n";
+  cls_out << "  [[nodiscard]] bool is_dirty_ord_(size_t ord) const noexcept {\n";
+  cls_out << "    const size_t w = ord >> 6;\n";
+  cls_out << "    return w < dirty_.size() && ((dirty_[w] >> (ord & 63u)) & 1u) != 0;\n";
   cls_out << "  }\n";
-  cls_out << "  void mark_dirty(uint32_t fnum) noexcept {\n";
-  cls_out << "    const size_t w = fnum >> 6;\n";
-  cls_out << "    if (w < dirty_.size()) dirty_[w] |= (uint64_t{1} << (fnum & 63u));\n";
+  cls_out << "  void mark_dirty_ord_(size_t ord) noexcept {\n";
+  cls_out << "    const size_t w = ord >> 6;\n";
+  cls_out << "    if (w < dirty_.size()) dirty_[w] |= (uint64_t{1} << (ord & 63u));\n";
   cls_out << "  }\n";
-  cls_out << "  [[nodiscard]] bool any_dirty() const noexcept {\n";
+  cls_out << "  [[nodiscard]] bool any_dirty_() const noexcept {\n";
   cls_out << "    for (uint64_t w : dirty_) {\n";
   cls_out << "      if (w != 0) return true;\n";
   cls_out << "    }\n";
   cls_out << "    return false;\n";
+  cls_out << "  }\n";
+  cls_out << "  void detach_if_aliased_(const std::vector<uint8_t>& dst) const {\n";
+  cls_out << "    if (raw_view_.empty() || dst.capacity() == 0) return;\n";
+  cls_out << "    const uintptr_t ds = reinterpret_cast<uintptr_t>(dst.data());\n";
+  cls_out << "    const uintptr_t de = ds + dst.capacity();\n";
+  cls_out << "    const uintptr_t rs = reinterpret_cast<uintptr_t>(raw_view_.data());\n";
+  cls_out << "    const uintptr_t re = rs + raw_view_.size();\n";
+  cls_out << "    if (ds < re && rs < de) {\n";
+  cls_out << "      backing_ = std::make_shared<const std::vector<uint8_t>>(raw_view_.begin(), raw_view_.end());\n";
+  cls_out << "      raw_view_ = *backing_;\n";
+  cls_out << "    }\n";
+  cls_out << "  }\n";
+  cls_out << "  ::omnibuf::OpaqueArena& ensure_arena() const {\n";
+  cls_out << "    if (!arena_) arena_ = std::make_shared<::omnibuf::OpaqueArena>();\n";
+  cls_out << "    return *arena_;\n";
+  cls_out << "  }\n";
+  cls_out << "  [[nodiscard]] uint8_t ensure_dir_() const noexcept {\n";
+  if (num_fields > 0) {
+    cls_out << "    if (dir_state_ == 0u) {\n";
+    if (num_fields > 64) {
+      cls_out << "      dir_offsets_.resize(" << num_fields << "u);\n";
+    }
+    cls_out << "      dir_state_ = ::omnibuf::build_opaque_offset_dir(\n";
+    cls_out << "          raw(), kDirSpecs_, dir_present_, dir_offsets_, &field_num_to_ordinal_);\n";
+    cls_out << "    }\n";
+    cls_out << "    return dir_state_;\n";
+  } else {
+    cls_out << "    return 4u;\n";
+  }
+  cls_out << "  }\n";
+  cls_out << "  [[nodiscard]] bool dir_has_(size_t ord) const noexcept {\n";
+  cls_out << "    return ((dir_present_[ord >> 6] >> (ord & 63u)) & 1u) != 0;\n";
   cls_out << "  }\n\n";
 
   cls_out << "  struct DirtyScalars {\n";
   for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
     if (is_heap_dirty_field(idx)) continue;
     const auto& f = msg.fields[idx];
-    cls_out << "    " << scalar_cpp_type(f, catalog) << " f_" << f.name << "_ = "
+    cls_out << "    " << scalar_cpp_type(f, catalog) << " " << dirty_var_name(f) << " = "
             << scalar_default_literal(f, catalog) << ";\n";
   }
   for (const auto& ro : plan.real_oneofs) {
@@ -2448,7 +3046,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
   for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
     if (!is_heap_dirty_field(idx)) continue;
     const auto& f = msg.fields[idx];
-    const std::string dirty_var = "f_" + f.name + "_";
+    const std::string dirty_var = dirty_var_name(f);
     const bool is_repeated = (f.label == FieldLabel::Repeated);
     const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
     if (f.type == FieldType::Message) {
@@ -2484,11 +3082,305 @@ void emit_opaque_class(std::ostringstream& cls_out,
   cls_out << "    return *dirty_heap_;\n";
   cls_out << "  }\n\n";
 
-  cls_out << "  std::span<const uint8_t> raw_view_{};\n";
-  cls_out << "  std::unique_ptr<std::vector<uint8_t>> owned_raw_{};\n";
+  cls_out << "  mutable std::span<const uint8_t> raw_view_{};\n";
+  cls_out << "  mutable std::shared_ptr<const std::vector<uint8_t>> backing_{};\n";
+  cls_out << "  mutable std::shared_ptr<::omnibuf::OpaqueArena> arena_{};\n";
   cls_out << "  std::array<uint64_t, " << dirty_words << "> dirty_{};\n";
   cls_out << "  DirtyScalars dirty_scalars_{};\n";
   cls_out << "  std::unique_ptr<DirtyHeap> dirty_heap_{};\n";
+  cls_out << "  mutable uint8_t dir_state_ = 0u;\n";
+  cls_out << "  mutable std::array<uint64_t, " << dirty_words << "> dir_present_{};\n";
+  if (num_fields > 0 && num_fields <= 64) {
+    cls_out << "  mutable std::array<uint32_t, " << num_fields << "> dir_offsets_{};\n";
+  } else if (num_fields > 64) {
+    cls_out << "  mutable std::vector<uint32_t> dir_offsets_{};\n";
+  }
+  cls_out << "};\n\n";
+}
+
+void emit_view_struct(std::ostringstream& cls_out,
+                      std::ostringstream& out_of_line_out,
+                      const MessagePlan& plan,
+                      const TypeCatalog& catalog) {
+  const MessageRecord& rec = *plan.rec;
+  const DescriptorProto& msg = *rec.desc;
+  const std::string& cls = rec.view_ident;
+
+  cls_out << "struct " << cls << " {\n";
+  cls_out << "  constexpr " << cls << "() noexcept = default;\n";
+  cls_out << "  constexpr explicit " << cls << "(std::span<const uint8_t> raw) noexcept : raw_(raw) {}\n\n";
+  cls_out << "  [[nodiscard]] constexpr std::span<const uint8_t> raw() const noexcept { return raw_; }\n";
+  cls_out << "  [[nodiscard]] constexpr bool empty() const noexcept { return raw_.empty(); }\n";
+  cls_out << "  [[nodiscard]] ::omnibuf::Result<void> validate(::omnibuf::DecodeOptions opts = {}) const {\n";
+  cls_out << "    if (raw_.size() > opts.max_message_bytes) {\n";
+  cls_out << "      return ::omnibuf::Error{\"omnibuf: message exceeds max_message_bytes\"};\n";
+  cls_out << "    }\n";
+  cls_out << "    ::omnibuf::DecodeState state{opts, 0};\n";
+  cls_out << "    return ::omnibuf::validate_message_bytes(raw_, 0, state);\n";
+  cls_out << "  }\n\n";
+
+  for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
+    const auto& f = msg.fields[idx];
+    const uint32_t fnum = f.number;
+    const bool is_repeated = (f.label == FieldLabel::Repeated);
+    const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
+    const bool is_oneof = is_real_oneof_field(f);
+    const std::string oneof_group_ref =
+        is_oneof ? ("kOneofGroup_" + std::to_string(plan.oneof_idx_to_plan.at(*f.oneof_index)) + "_")
+                 : "";
+
+    if (f.type == FieldType::Message) {
+      const std::string target = trim_leading_dot(f.type_name);
+      auto map_it = catalog.map_entries.find(target);
+      if (map_it != catalog.map_entries.end()) {
+        const auto& mi = map_it->second;
+        const std::string k_cpp = scalar_cpp_type_for_kind(mi.key_type, "", catalog);
+        const std::string k_param =
+            (mi.key_type == FieldType::String) ? "std::string_view" : k_cpp;
+        if (mi.val_type == FieldType::Message) {
+          const std::string v_view = resolve_cpp_view(mi.val_type_name, catalog);
+          cls_out << "  [[nodiscard]] std::pair<" << v_view << ", bool> lookup_" << f.name << "("
+                  << k_param << " key) const;\n";
+          out_of_line_out << "inline std::pair<" << v_view << ", bool> " << cls << "::lookup_"
+                          << f.name << "(" << k_param << " key) const {\n";
+          out_of_line_out << "  const auto [sl, ok] = ::omnibuf::lookup_submsg_map_slice<"
+                          << wire_const_expr(mi.key_type) << ", " << k_cpp << ">(raw_, " << fnum
+                          << "u, key);\n";
+          out_of_line_out << "  return ok ? std::pair<" << v_view << ", bool>{" << v_view
+                          << "(sl), true} : std::pair<" << v_view << ", bool>{" << v_view
+                          << "{}, false};\n";
+          out_of_line_out << "}\n\n";
+        } else {
+          const std::string v_cpp =
+              scalar_cpp_type_for_kind(mi.val_type, mi.val_type_name, catalog);
+          cls_out << "  [[nodiscard]] std::pair<" << v_cpp << ", bool> lookup_" << f.name << "("
+                  << k_param << " key) const {\n";
+          cls_out << "    return ::omnibuf::lookup_scalar_map<" << wire_const_expr(mi.key_type)
+                  << ", " << wire_const_expr(mi.val_type) << ", " << k_cpp << ", " << v_cpp
+                  << ">(raw_, " << fnum << "u, key);\n";
+          cls_out << "  }\n";
+        }
+        continue;
+      }
+
+      const std::string sub_view = resolve_cpp_view(f.type_name, catalog);
+      if (is_repeated) {
+        cls_out << "  [[nodiscard]] size_t " << f.name << "_len() const noexcept {\n";
+        cls_out << "    return ::omnibuf::submsg_arr_len(raw_, " << fnum << "u);\n";
+        cls_out << "  }\n";
+        cls_out << "  [[nodiscard]] " << sub_view << " get_" << f.name
+                << "(size_t idx) const noexcept;\n";
+        out_of_line_out << "inline " << sub_view << " " << cls << "::get_" << f.name
+                        << "(size_t idx) const noexcept {\n";
+        out_of_line_out << "  const auto [elem, ok] = ::omnibuf::read_submsg_arr_elem(raw_, "
+                        << fnum << "u, idx);\n";
+        out_of_line_out << "  return ok ? " << sub_view << "(elem) : " << sub_view << "{};\n";
+        out_of_line_out << "}\n\n";
+        continue;
+      }
+
+      cls_out << "  [[nodiscard]] " << sub_view << " get_" << f.name << "() const noexcept;\n";
+      cls_out << "  [[nodiscard]] ::omnibuf::Result<std::optional<" << sub_view << ">> try_get_"
+              << f.name << "() const;\n";
+      out_of_line_out << "inline " << sub_view << " " << cls << "::get_" << f.name
+                      << "() const noexcept {\n";
+      if (is_oneof) {
+        out_of_line_out << "  const auto [sl, ok] = ::omnibuf::locate_last_oneof_submsg_slice(raw_, "
+                        << fnum << "u, " << oneof_group_ref << ");\n";
+      } else {
+        out_of_line_out << "  const auto [sl, ok] = ::omnibuf::locate_last_submsg_slice(raw_, "
+                        << fnum << "u);\n";
+      }
+      out_of_line_out << "  return ok ? " << sub_view << "(sl) : " << sub_view << "{};\n";
+      out_of_line_out << "}\n\n";
+
+      out_of_line_out << "inline ::omnibuf::Result<std::optional<" << sub_view << ">> " << cls
+                      << "::try_get_" << f.name << "() const {\n";
+      if (is_oneof) {
+        out_of_line_out << "  auto r = ::omnibuf::try_locate_last_oneof_submsg_slice(raw_, " << fnum
+                        << "u, " << oneof_group_ref << ");\n";
+      } else {
+        out_of_line_out << "  auto r = ::omnibuf::try_locate_last_submsg_slice(raw_, " << fnum
+                        << "u);\n";
+      }
+      out_of_line_out << "  if (!r) return ::omnibuf::Error{r.error()};\n";
+      out_of_line_out << "  if (!r.value().has_value()) return std::optional<" << sub_view
+                      << ">{std::nullopt};\n";
+      out_of_line_out << "  return std::optional<" << sub_view << ">{" << sub_view
+                      << "(*r.value())};\n";
+      out_of_line_out << "}\n\n";
+      continue;
+    }
+
+    if (is_repeated) {
+      const uint8_t elem_wt = scalar_wire_const(f.type);
+      cls_out << "  [[nodiscard]] size_t " << f.name << "_len() const noexcept {\n";
+      cls_out << "    return ::omnibuf::counted_arr_len(raw_, " << fnum << "u, "
+              << static_cast<uint32_t>(elem_wt) << "u);\n";
+      cls_out << "  }\n";
+      continue;
+    }
+
+    const std::string fn_prefix = is_oneof ? "::omnibuf::read_oneof_" : "::omnibuf::read_";
+    const std::string try_prefix = is_oneof ? "::omnibuf::try_read_oneof_" : "::omnibuf::try_read_";
+    const std::string extra_arg = is_oneof ? (", " + oneof_group_ref) : "";
+
+    if (f.type == FieldType::String) {
+      if (is_opt_scalar) {
+        cls_out << "  [[nodiscard]] std::optional<std::string_view> get_" << f.name
+                << "() const noexcept {\n";
+        cls_out << "    const auto [sv, ok] = " << fn_prefix << "string_view(raw_, " << fnum << "u"
+                << extra_arg << ");\n";
+        cls_out << "    return ok ? std::optional<std::string_view>{sv} : std::nullopt;\n";
+        cls_out << "  }\n";
+        cls_out << "  [[nodiscard]] ::omnibuf::Result<std::optional<std::string_view>> try_get_"
+                << f.name << "() const {\n";
+        cls_out << "    return " << try_prefix << "string_view(raw_, " << fnum << "u" << extra_arg
+                << ");\n";
+        cls_out << "  }\n";
+      } else {
+        cls_out << "  [[nodiscard]] std::string_view get_" << f.name << "() const noexcept {\n";
+        cls_out << "    return " << fn_prefix << "string_view(raw_, " << fnum << "u" << extra_arg
+                << ").first;\n";
+        cls_out << "  }\n";
+        cls_out << "  [[nodiscard]] ::omnibuf::Result<std::string_view> try_get_" << f.name
+                << "() const {\n";
+        cls_out << "    auto r = " << try_prefix << "string_view(raw_, " << fnum << "u" << extra_arg
+                << ");\n";
+        cls_out << "    if (!r) return ::omnibuf::Error{r.error()};\n";
+        cls_out << "    return r.value().value_or(std::string_view{});\n";
+        cls_out << "  }\n";
+      }
+      continue;
+    }
+
+    if (f.type == FieldType::Bytes) {
+      if (is_opt_scalar) {
+        cls_out << "  [[nodiscard]] std::optional<std::span<const uint8_t>> get_" << f.name
+                << "() const noexcept {\n";
+        cls_out << "    const auto [sp, ok] = " << fn_prefix << "bytes_view(raw_, " << fnum << "u"
+                << extra_arg << ");\n";
+        cls_out << "    return ok ? std::optional<std::span<const uint8_t>>{sp} : std::nullopt;\n";
+        cls_out << "  }\n";
+        cls_out << "  [[nodiscard]] ::omnibuf::Result<std::optional<std::span<const uint8_t>>> try_get_"
+                << f.name << "() const {\n";
+        cls_out << "    return " << try_prefix << "bytes_view(raw_, " << fnum << "u" << extra_arg
+                << ");\n";
+        cls_out << "  }\n";
+      } else {
+        cls_out << "  [[nodiscard]] std::span<const uint8_t> get_" << f.name
+                << "() const noexcept {\n";
+        cls_out << "    return " << fn_prefix << "bytes_view(raw_, " << fnum << "u" << extra_arg
+                << ").first;\n";
+        cls_out << "  }\n";
+        cls_out << "  [[nodiscard]] ::omnibuf::Result<std::span<const uint8_t>> try_get_" << f.name
+                << "() const {\n";
+        cls_out << "    auto r = " << try_prefix << "bytes_view(raw_, " << fnum << "u" << extra_arg
+                << ");\n";
+        cls_out << "    if (!r) return ::omnibuf::Error{r.error()};\n";
+        cls_out << "    return r.value().value_or(std::span<const uint8_t>{});\n";
+        cls_out << "  }\n";
+      }
+      continue;
+    }
+
+    const std::string cpp_t = scalar_cpp_type(f, catalog);
+    auto read_suffix = [&]() -> std::string_view {
+      switch (f.type) {
+        case FieldType::Uint32:
+        case FieldType::Uint64:
+          return "uint";
+        case FieldType::Int32:
+        case FieldType::Sint32:
+        case FieldType::Int64:
+        case FieldType::Sint64:
+        case FieldType::Enum:
+          return "sint";
+        case FieldType::Bool:
+          return "bool";
+        case FieldType::Fixed32:
+          return "fixed32";
+        case FieldType::Sfixed32:
+          return "sfixed32";
+        case FieldType::Float:
+          return "float32";
+        case FieldType::Fixed64:
+          return "fixed64";
+        case FieldType::Sfixed64:
+          return "sfixed64";
+        case FieldType::Double:
+        default:
+          return "float64";
+      }
+    };
+    const std::string_view rsuf = read_suffix();
+
+    if (is_opt_scalar) {
+      cls_out << "  [[nodiscard]] std::optional<" << cpp_t << "> get_" << f.name
+              << "() const noexcept {\n";
+      cls_out << "    const auto [v, ok] = " << fn_prefix << rsuf << "(raw_, " << fnum << "u"
+              << extra_arg << ");\n";
+      if (f.type == FieldType::Enum) {
+        cls_out << "    return ok ? std::optional<" << cpp_t << ">{static_cast<" << cpp_t
+                << ">(static_cast<int32_t>(v))} : std::nullopt;\n";
+      } else {
+        cls_out << "    return ok ? std::optional<" << cpp_t << ">{static_cast<" << cpp_t
+                << ">(v)} : std::nullopt;\n";
+      }
+      cls_out << "  }\n";
+      cls_out << "  [[nodiscard]] ::omnibuf::Result<std::optional<" << cpp_t << ">> try_get_"
+              << f.name << "() const {\n";
+      cls_out << "    auto r = " << try_prefix << rsuf << "(raw_, " << fnum << "u" << extra_arg
+              << ");\n";
+      cls_out << "    if (!r) return ::omnibuf::Error{r.error()};\n";
+      cls_out << "    if (!r.value().has_value()) return std::optional<" << cpp_t
+              << ">{std::nullopt};\n";
+      if (f.type == FieldType::Enum) {
+        cls_out << "    return std::optional<" << cpp_t << ">{static_cast<" << cpp_t
+                << ">(static_cast<int32_t>(*r.value()))};\n";
+      } else {
+        cls_out << "    return std::optional<" << cpp_t << ">{static_cast<" << cpp_t
+                << ">(*r.value())};\n";
+      }
+      cls_out << "  }\n";
+    } else {
+      cls_out << "  [[nodiscard]] " << cpp_t << " get_" << f.name << "() const noexcept {\n";
+      if (f.type == FieldType::Enum) {
+        cls_out << "    return static_cast<" << cpp_t << ">(static_cast<int32_t>(" << fn_prefix
+                << rsuf << "(raw_, " << fnum << "u" << extra_arg << ").first));\n";
+      } else {
+        cls_out << "    return static_cast<" << cpp_t << ">(" << fn_prefix << rsuf << "(raw_, "
+                << fnum << "u" << extra_arg << ").first);\n";
+      }
+      cls_out << "  }\n";
+      cls_out << "  [[nodiscard]] ::omnibuf::Result<" << cpp_t << "> try_get_" << f.name
+              << "() const {\n";
+      cls_out << "    auto r = " << try_prefix << rsuf << "(raw_, " << fnum << "u" << extra_arg
+              << ");\n";
+      cls_out << "    if (!r) return ::omnibuf::Error{r.error()};\n";
+      cls_out << "    if (!r.value().has_value()) return " << scalar_default_literal(f, catalog)
+              << ";\n";
+      if (f.type == FieldType::Enum) {
+        cls_out << "    return static_cast<" << cpp_t << ">(static_cast<int32_t>(*r.value()));\n";
+      } else {
+        cls_out << "    return static_cast<" << cpp_t << ">(*r.value());\n";
+      }
+      cls_out << "  }\n";
+    }
+  }
+
+  cls_out << "\n private:\n";
+  for (size_t pi = 0; pi < plan.real_oneofs.size(); ++pi) {
+    const auto& ro = plan.real_oneofs[pi];
+    cls_out << "  static constexpr std::array<::omnibuf::OneofBranchSpec, "
+            << ro.field_indices.size() << "> kOneofGroup_" << pi << "_ = {{\n";
+    for (size_t fi : ro.field_indices) {
+      const auto& f = msg.fields[fi];
+      cls_out << "      {" << f.number << "u, " << field_expected_wire_mask(f, catalog) << "u},\n";
+    }
+    cls_out << "  }};\n";
+  }
+  cls_out << "  std::span<const uint8_t> raw_{};\n";
   cls_out << "};\n\n";
 }
 
@@ -2556,6 +3448,9 @@ GeneratedFile generate_header_for_file(const FileDescriptorProto& file,
   for (const auto& plan : ordered_plans) {
     out << "class " << plan.rec->opaque_ident << ";\n";
   }
+  for (const auto& plan : ordered_plans) {
+    out << "struct " << plan.rec->view_ident << ";\n";
+  }
   if (!ordered_plans.empty()) {
     out << "\n";
   }
@@ -2567,6 +3462,14 @@ GeneratedFile generate_header_for_file(const FileDescriptorProto& file,
   }
   out << opaque_classes_out.str();
   out << opaque_methods_out.str();
+
+  std::ostringstream view_structs_out;
+  std::ostringstream view_methods_out;
+  for (const auto& plan : ordered_plans) {
+    emit_view_struct(view_structs_out, view_methods_out, plan, catalog);
+  }
+  out << view_structs_out.str();
+  out << view_methods_out.str();
 
   if (!cpp_ns.empty()) {
     out << "}  // namespace " << cpp_ns << "\n";
@@ -2654,24 +3557,41 @@ int main() {
 
   const TypeCatalog catalog = build_catalog(req);
 
-  // Messages from imported non-target files are already defined via #include headers.
-  std::unordered_set<std::string> defined_messages;
+  std::unordered_map<std::string, const FileDescriptorProto*> files_by_name;
   for (const auto& file : req.proto_files) {
-    if (targets.contains(file.name)) continue;
-    for (const auto& [full_name, _] : catalog.messages) {
-      if (file.package.empty() || full_name.rfind(file.package + ".", 0) == 0) {
-        defined_messages.insert(full_name);
-      }
-    }
+    files_by_name[file.name] = &file;
   }
 
   std::vector<GeneratedFile> outputs;
   outputs.reserve(req.files_to_generate.size());
   for (const auto& file : req.proto_files) {
     if (!targets.contains(file.name)) continue;
-    std::unordered_set<std::string> file_defined = defined_messages;
+
+    // Populate defined_messages only from transitive dependencies of this target file.
+    std::unordered_set<std::string> dep_files;
+    std::vector<std::string> worklist(file.dependencies.begin(), file.dependencies.end());
+    while (!worklist.empty()) {
+      std::string dep = std::move(worklist.back());
+      worklist.pop_back();
+      if (dep == file.name || !dep_files.insert(dep).second) continue;
+      auto it = files_by_name.find(dep);
+      if (it != files_by_name.end()) {
+        for (const auto& sub_dep : it->second->dependencies) {
+          if (!dep_files.contains(sub_dep) && sub_dep != file.name) {
+            worklist.push_back(sub_dep);
+          }
+        }
+      }
+    }
+
+    std::unordered_set<std::string> file_defined;
+    for (const auto& [full_name, rec] : catalog.messages) {
+      if (dep_files.contains(rec.source_file)) {
+        file_defined.insert(full_name);
+      }
+    }
+
     outputs.push_back(generate_header_for_file(file, catalog, file_defined));
-    defined_messages.insert(file_defined.begin(), file_defined.end());
   }
 
   const auto resp_bytes = omnibuf::proto::encode_code_generator_response(outputs);

@@ -108,8 +108,16 @@ inline void encode_fixed32_arr(std::vector<uint8_t>& dst,
   dst.push_back(0);
   dst.push_back(elem_wt);
   append_varint(dst, items.size());
-  for (T v : items) {
-    append_u32_le(dst, static_cast<uint32_t>(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(T) == 4) {
+    if (!items.empty()) {
+      const size_t pos = dst.size();
+      dst.resize(pos + items.size() * 4);
+      std::memcpy(dst.data() + pos, items.data(), items.size() * 4);
+    }
+  } else {
+    for (T v : items) {
+      append_u32_le(dst, static_cast<uint32_t>(v));
+    }
   }
   backpatch_container_len(dst, len_pos);
 }
@@ -126,8 +134,16 @@ inline void encode_fixed64_arr(std::vector<uint8_t>& dst,
   dst.push_back(0);
   dst.push_back(elem_wt);
   append_varint(dst, items.size());
-  for (T v : items) {
-    append_u64_le(dst, static_cast<uint64_t>(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(T) == 8) {
+    if (!items.empty()) {
+      const size_t pos = dst.size();
+      dst.resize(pos + items.size() * 8);
+      std::memcpy(dst.data() + pos, items.data(), items.size() * 8);
+    }
+  } else {
+    for (T v : items) {
+      append_u64_le(dst, static_cast<uint64_t>(v));
+    }
   }
   backpatch_container_len(dst, len_pos);
 }
@@ -141,8 +157,16 @@ inline void encode_float32_arr(std::vector<uint8_t>& dst, std::span<const float>
   dst.push_back(0);
   dst.push_back(WireFloat32);
   append_varint(dst, items.size());
-  for (float v : items) {
-    append_u32_le(dst, float32_to_bits(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(float) == 4) {
+    if (!items.empty()) {
+      const size_t pos = dst.size();
+      dst.resize(pos + items.size() * 4);
+      std::memcpy(dst.data() + pos, items.data(), items.size() * 4);
+    }
+  } else {
+    for (float v : items) {
+      append_u32_le(dst, float32_to_bits(v));
+    }
   }
   backpatch_container_len(dst, len_pos);
 }
@@ -156,8 +180,16 @@ inline void encode_float64_arr(std::vector<uint8_t>& dst, std::span<const double
   dst.push_back(0);
   dst.push_back(WireFloat64);
   append_varint(dst, items.size());
-  for (double v : items) {
-    append_u64_le(dst, float64_to_bits(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(double) == 8) {
+    if (!items.empty()) {
+      const size_t pos = dst.size();
+      dst.resize(pos + items.size() * 8);
+      std::memcpy(dst.data() + pos, items.data(), items.size() * 8);
+    }
+  } else {
+    for (double v : items) {
+      append_u64_le(dst, float64_to_bits(v));
+    }
   }
   backpatch_container_len(dst, len_pos);
 }
@@ -223,7 +255,12 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
 // FastWriter overloads for register-resident generated and struct encoding.
 [[nodiscard]] inline const char* try_encode_string_arr(FastWriter& w,
                                                        std::span<const std::string> items) {
-  const size_t len_pos = w.reserve_len_2b();
+  size_t body_hint = 1 + varint_size(items.size());
+  for (const auto& s : items) {
+    body_hint += varint_size(s.size()) + s.size();
+  }
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(WireString);
   w.write_varint(items.size());
   for (const auto& s : items) {
@@ -233,7 +270,7 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
     w.write_varint(s.size());
     w.write_bytes(s.data(), s.size());
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
   return nullptr;
 }
 
@@ -244,47 +281,58 @@ inline void encode_string_arr(FastWriter& w, std::span<const std::string> items)
 }
 
 inline void encode_bytes_arr(FastWriter& w, std::span<const std::vector<uint8_t>> items) {
-  const size_t len_pos = w.reserve_len_2b();
+  size_t body_hint = 1 + varint_size(items.size());
+  for (const auto& b : items) {
+    body_hint += varint_size(b.size()) + b.size();
+  }
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(WireBytes);
   w.write_varint(items.size());
   for (const auto& b : items) {
     w.write_varint(b.size());
     w.write_bytes(b.data(), b.size());
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 inline void encode_bool_arr(FastWriter& w, const std::vector<bool>& items) {
-  const size_t len_pos = w.reserve_len_2b();
+  const size_t body_hint = 1 + varint_size(items.size()) + items.size();
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(WireBoolFalse);
   w.write_varint(items.size());
   w.ensure(items.size());
   for (bool v : items) {
     w.write_byte(v ? uint8_t{1} : uint8_t{0});
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <detail::IntOrUint T>
 inline void encode_uint_arr(FastWriter& w, std::span<const T> items) {
-  const size_t len_pos = w.reserve_len_2b();
+  const size_t body_hint = 1 + varint_size(items.size()) + items.size();
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(WireUint);
   w.write_varint(items.size());
   for (T v : items) {
     w.write_varint(static_cast<uint64_t>(v));
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <detail::IntOrUint T>
 inline void encode_sint_arr(FastWriter& w, std::span<const T> items) {
-  const size_t len_pos = w.reserve_len_2b();
+  const size_t body_hint = 1 + varint_size(items.size()) + items.size();
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(WireSint);
   w.write_varint(items.size());
   for (T v : items) {
     w.write_varint(encode_zigzag(static_cast<int64_t>(v)));
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <detail::IntOrUint T>
@@ -294,14 +342,21 @@ inline void encode_fixed32_arr(FastWriter& w,
   if (items.size() > SIZE_MAX / 4) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
-  const size_t len_pos = w.reserve_len_2b();
+  const size_t byte_len = items.size() * 4;
+  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(elem_wt);
   w.write_varint(items.size());
-  w.ensure(items.size() * 4);
-  for (T v : items) {
-    w.write_u32_raw(static_cast<uint32_t>(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(T) == 4) {
+    w.write_bytes(items.data(), byte_len);
+  } else {
+    w.ensure(byte_len);
+    for (T v : items) {
+      w.write_u32_raw(static_cast<uint32_t>(v));
+    }
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <detail::IntOrUint T>
@@ -311,42 +366,63 @@ inline void encode_fixed64_arr(FastWriter& w,
   if (items.size() > SIZE_MAX / 8) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
-  const size_t len_pos = w.reserve_len_2b();
+  const size_t byte_len = items.size() * 8;
+  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(elem_wt);
   w.write_varint(items.size());
-  w.ensure(items.size() * 8);
-  for (T v : items) {
-    w.write_u64_raw(static_cast<uint64_t>(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(T) == 8) {
+    w.write_bytes(items.data(), byte_len);
+  } else {
+    w.ensure(byte_len);
+    for (T v : items) {
+      w.write_u64_raw(static_cast<uint64_t>(v));
+    }
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 inline void encode_float32_arr(FastWriter& w, std::span<const float> items) {
   if (items.size() > SIZE_MAX / 4) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
-  const size_t len_pos = w.reserve_len_2b();
+  const size_t byte_len = items.size() * 4;
+  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(WireFloat32);
   w.write_varint(items.size());
-  w.ensure(items.size() * 4);
-  for (float v : items) {
-    w.write_u32_raw(float32_to_bits(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(float) == 4) {
+    w.write_bytes(items.data(), byte_len);
+  } else {
+    w.ensure(byte_len);
+    for (float v : items) {
+      w.write_u32_raw(float32_to_bits(v));
+    }
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 inline void encode_float64_arr(FastWriter& w, std::span<const double> items) {
   if (items.size() > SIZE_MAX / 8) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
-  const size_t len_pos = w.reserve_len_2b();
+  const size_t byte_len = items.size() * 8;
+  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(WireFloat64);
   w.write_varint(items.size());
-  w.ensure(items.size() * 8);
-  for (double v : items) {
-    w.write_u64_raw(float64_to_bits(v));
+  if constexpr (std::endian::native == std::endian::little && sizeof(double) == 8) {
+    w.write_bytes(items.data(), byte_len);
+  } else {
+    w.ensure(byte_len);
+    for (double v : items) {
+      w.write_u64_raw(float64_to_bits(v));
+    }
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <uint8_t WT, typename T>
@@ -390,7 +466,31 @@ template <uint8_t WT, typename T>
 
 template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
 [[nodiscard]] inline const char* try_encode_scalar_map(FastWriter& w, const MapT& m) {
-  const size_t len_pos = w.reserve_len_2b();
+  size_t body_hint = 2 + varint_size(m.size());
+  for (const auto& [k, v] : m) {
+    (void)k;
+    (void)v;
+    if constexpr (KeyWT == WireString || KeyWT == WireBytes) {
+      body_hint += varint_size(k.size()) + k.size();
+    } else if constexpr (KeyWT == WireFixed32 || KeyWT == WireSfixed32) {
+      body_hint += 4;
+    } else if constexpr (KeyWT == WireFixed64 || KeyWT == WireSfixed64) {
+      body_hint += 8;
+    } else {
+      body_hint += 1;
+    }
+    if constexpr (ValWT == WireString || ValWT == WireBytes) {
+      body_hint += varint_size(v.size()) + v.size();
+    } else if constexpr (ValWT == WireFixed32 || ValWT == WireSfixed32 || ValWT == WireFloat32) {
+      body_hint += 4;
+    } else if constexpr (ValWT == WireFixed64 || ValWT == WireSfixed64 || ValWT == WireFloat64) {
+      body_hint += 8;
+    } else {
+      body_hint += 1;
+    }
+  }
+  const bool use_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(KeyWT);
   w.write_byte(ValWT);
   w.write_varint(m.size());
@@ -402,7 +502,7 @@ template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
       return err;
     }
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, use_4b);
   return nullptr;
 }
 
@@ -410,7 +510,28 @@ template <uint8_t KeyWT, typename MapT, typename SubEncodeFn>
 [[nodiscard]] inline const char* try_encode_submsg_map(FastWriter& w,
                                                        const MapT& m,
                                                        SubEncodeFn&& encode_sub) {
-  const size_t len_pos = w.reserve_len_2b();
+  size_t body_hint = 2 + varint_size(m.size());
+  for (const auto& [k, v] : m) {
+    (void)k;
+    (void)v;
+    if constexpr (KeyWT == WireString || KeyWT == WireBytes) {
+      body_hint += varint_size(k.size()) + k.size();
+    } else if constexpr (KeyWT == WireFixed32 || KeyWT == WireSfixed32) {
+      body_hint += 4;
+    } else if constexpr (KeyWT == WireFixed64 || KeyWT == WireSfixed64) {
+      body_hint += 8;
+    } else {
+      body_hint += 1;
+    }
+    if constexpr (requires { { v.min_wire_size(1) } -> std::convertible_to<size_t>; }) {
+      const size_t sh = v.min_wire_size(1);
+      body_hint += (sh > 16383u ? 4u : 2u) + sh;
+    } else {
+      body_hint += 2;
+    }
+  }
+  const bool map_4b = body_hint > 16383u;
+  const size_t len_pos = w.reserve_len_hint(body_hint);
   w.write_byte(KeyWT);
   w.write_byte(WireSubMsg);
   w.write_varint(m.size());
@@ -418,13 +539,20 @@ template <uint8_t KeyWT, typename MapT, typename SubEncodeFn>
     if (const char* err = try_encode_container_scalar<KeyWT>(w, k)) [[unlikely]] {
       return err;
     }
-    const size_t sub_len_pos = w.reserve_len_2b();
+    size_t sh = 0;
+    if constexpr (requires { { v.min_wire_size(1) } -> std::convertible_to<size_t>; }) {
+      if (map_4b) {
+        sh = v.min_wire_size(1);
+      }
+    }
+    const bool sub_4b = sh > 16383u;
+    const size_t sub_len_pos = w.reserve_len_hint(sh);
     if (const char* err = encode_sub(w, v)) [[unlikely]] {
       return err;
     }
-    w.backpatch_len(sub_len_pos);
+    w.backpatch_len_hint(sub_len_pos, sub_4b);
   }
-  w.backpatch_len(len_pos);
+  w.backpatch_len_hint(len_pos, map_4b);
   return nullptr;
 }
 

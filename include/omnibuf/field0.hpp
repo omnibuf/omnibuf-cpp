@@ -5,7 +5,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -23,15 +25,25 @@ struct SchemaMeta {
   std::map<uint32_t, std::shared_ptr<SchemaMeta>> children;
 };
 
-inline std::shared_ptr<SchemaMeta> merge_schema_meta(const std::shared_ptr<SchemaMeta>& base,
-                                                     const std::shared_ptr<SchemaMeta>& next) {
-  if (!next) return base;
+namespace detail {
+
+inline std::shared_ptr<SchemaMeta> merge_schema_meta_impl(const std::shared_ptr<SchemaMeta>& base,
+                                                          const std::shared_ptr<SchemaMeta>& next,
+                                                          int depth,
+                                                          std::set<const SchemaMeta*>& active) {
+  if (!next || depth > MAX_CONTAINER_DEPTH) return base;
+  if (!active.insert(next.get()).second) {
+    return base;
+  }
+  const bool inserted_base = base ? active.insert(base.get()).second : false;
   auto out = std::make_shared<SchemaMeta>();
   if (base) {
     out->type_name = base->type_name;
     out->fields = base->fields;
-    for (const auto& [k, c] : base->children) {
-      out->children[k] = merge_schema_meta(nullptr, c);
+    if (inserted_base && depth + 2 <= MAX_CONTAINER_DEPTH) {
+      for (const auto& [k, c] : base->children) {
+        if (c) out->children[k] = merge_schema_meta_impl(nullptr, c, depth + 2, active);
+      }
     }
   }
   if (!next->type_name.empty()) {
@@ -40,18 +52,38 @@ inline std::shared_ptr<SchemaMeta> merge_schema_meta(const std::shared_ptr<Schem
   for (const auto& [k, name] : next->fields) {
     out->fields[k] = name;
   }
-  for (const auto& [k, c] : next->children) {
-    auto it = out->children.find(k);
-    if (it != out->children.end()) {
-      it->second = merge_schema_meta(it->second, c);
-    } else {
-      out->children[k] = merge_schema_meta(nullptr, c);
+  if (depth + 2 <= MAX_CONTAINER_DEPTH) {
+    for (const auto& [k, c] : next->children) {
+      if (!c) continue;
+      auto it = out->children.find(k);
+      if (it != out->children.end()) {
+        it->second = merge_schema_meta_impl(it->second, c, depth + 2, active);
+      } else {
+        out->children[k] = merge_schema_meta_impl(nullptr, c, depth + 2, active);
+      }
     }
   }
+  if (inserted_base) active.erase(base.get());
+  active.erase(next.get());
   return out;
 }
 
-inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta& meta) {
+inline void append_schema_meta_body_impl(std::vector<uint8_t>& dst,
+                                         const SchemaMeta& meta,
+                                         int depth,
+                                         std::set<const SchemaMeta*>& active) {
+  if (depth > MAX_CONTAINER_DEPTH) {
+    throw std::invalid_argument("omnibuf: SchemaMeta nesting depth exceeds MAX_CONTAINER_DEPTH");
+  }
+  if (!active.insert(&meta).second) {
+    throw std::invalid_argument("omnibuf: cyclic SchemaMeta graph");
+  }
+  struct ActiveGuard {
+    std::set<const SchemaMeta*>& set;
+    const SchemaMeta* ptr;
+    ~ActiveGuard() { set.erase(ptr); }
+  } guard{active, &meta};
+
   // Field #1: type_name (WireString = 10 -> Tag (1 << 4) | 10 = 26 -> 0x35)
   if (!meta.type_name.empty()) {
     dst.push_back(0x35u);
@@ -60,6 +92,9 @@ inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta&
   }
   // Field #2: fields map<uint32, string> (WireMap = 14 -> Tag (2 << 4) | 14 = 46 -> 0x5D)
   if (!meta.fields.empty()) {
+    if (depth + 1 > MAX_CONTAINER_DEPTH) {
+      throw std::invalid_argument("omnibuf: SchemaMeta fields map exceeds MAX_CONTAINER_DEPTH");
+    }
     dst.push_back(0x5Du);
     const size_t len_pos = dst.size();
     dst.push_back(0);
@@ -68,6 +103,9 @@ inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta&
     dst.push_back(WireString);
     append_varint(dst, meta.fields.size());
     for (const auto& [k, name] : meta.fields) {
+      if (k == 0 || k > MAX_FIELD_NUMBER) {
+        throw std::invalid_argument("omnibuf: SchemaMeta field number out of range");
+      }
       append_varint(dst, k);
       append_varint(dst, name.size());
       dst.insert(dst.end(), name.begin(), name.end());
@@ -76,6 +114,9 @@ inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta&
   }
   // Field #3: children map<uint32, SchemaMeta> (WireMap = 14 -> Tag (3 << 4) | 14 = 62 -> 0x7D)
   if (!meta.children.empty()) {
+    if (depth + 1 > MAX_CONTAINER_DEPTH) {
+      throw std::invalid_argument("omnibuf: SchemaMeta children map exceeds MAX_CONTAINER_DEPTH");
+    }
     dst.push_back(0x7Du);
     const size_t len_pos = dst.size();
     dst.push_back(0);
@@ -84,12 +125,15 @@ inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta&
     dst.push_back(WireSubMsg);
     append_varint(dst, meta.children.size());
     for (const auto& [k, child] : meta.children) {
+      if (k == 0 || k > MAX_FIELD_NUMBER) {
+        throw std::invalid_argument("omnibuf: SchemaMeta child field number out of range");
+      }
       append_varint(dst, k);
       const size_t c_len_pos = dst.size();
       dst.push_back(0);
       dst.push_back(0);
       if (child) {
-        append_schema_meta_body(dst, *child);
+        append_schema_meta_body_impl(dst, *child, depth + 2, active);
       }
       backpatch_container_len(dst, c_len_pos);
     }
@@ -97,14 +141,33 @@ inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta&
   }
 }
 
+}  // namespace detail
+
+inline std::shared_ptr<SchemaMeta> merge_schema_meta(const std::shared_ptr<SchemaMeta>& base,
+                                                     const std::shared_ptr<SchemaMeta>& next) {
+  std::set<const SchemaMeta*> active;
+  return detail::merge_schema_meta_impl(base, next, 1, active);
+}
+
+inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta& meta) {
+  std::set<const SchemaMeta*> active;
+  detail::append_schema_meta_body_impl(dst, meta, 1, active);
+}
+
 inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMeta& meta) {
-  // Tag = (0 << 4) | WireSubMsg(12) = 12 -> (12 << 1) | 1 = 0x19
-  dst.push_back(0x19u);
-  const size_t len_pos = dst.size();
-  dst.push_back(0);
-  dst.push_back(0);
-  append_schema_meta_body(dst, meta);
-  backpatch_container_len(dst, len_pos);
+  const size_t orig_size = dst.size();
+  try {
+    // Tag = (0 << 4) | WireSubMsg(12) = 12 -> (12 << 1) | 1 = 0x19
+    dst.push_back(0x19u);
+    const size_t len_pos = dst.size();
+    dst.push_back(0);
+    dst.push_back(0);
+    append_schema_meta_body(dst, meta);
+    backpatch_container_len(dst, len_pos);
+  } catch (...) {
+    dst.resize(orig_size);
+    throw;
+  }
 }
 
 [[nodiscard]] inline std::vector<uint8_t> encode_field0_schema_meta(const SchemaMeta& meta) {

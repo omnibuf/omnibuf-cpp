@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -9,7 +13,8 @@
 
 namespace omnibuf {
 
-// Strict RFC 3629 UTF-8 validator with fast 8-byte ASCII scanning.
+// Strict RFC 3629 UTF-8 validator with NEON 64B/16B and 64-bit word ASCII fast paths.
+// Resumes vectorized ASCII scanning immediately after every valid multi-byte code point.
 // Rejects overlong sequences, UTF-16 surrogates (U+D800..U+DFFF), code points > U+10FFFF,
 // stray continuation bytes, and truncated multi-byte sequences.
 [[nodiscard]] inline bool is_valid_utf8(std::span<const uint8_t> b) noexcept {
@@ -17,16 +22,51 @@ namespace omnibuf {
   const size_t n = b.size();
   size_t i = 0;
 
-  while (i + 8 <= n) {
-    const uint64_t w = read_u64_le(p + i);
-    if ((w & 0x8080808080808080ULL) == 0) {
-      i += 8;
-      continue;
-    }
-    break;
-  }
-
   while (i < n) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    while (i + 64 <= n) {
+      const uint8x16_t v0 = vld1q_u8(p + i);
+      const uint8x16_t v1 = vld1q_u8(p + i + 16);
+      const uint8x16_t v2 = vld1q_u8(p + i + 32);
+      const uint8x16_t v3 = vld1q_u8(p + i + 48);
+      const uint8x16_t ored = vorrq_u8(vorrq_u8(v0, v1), vorrq_u8(v2, v3));
+      if (vmaxvq_u8(ored) < 0x80u) {
+        i += 64;
+        continue;
+      }
+      break;
+    }
+    while (i + 16 <= n) {
+      const uint8x16_t v = vld1q_u8(p + i);
+      if (vmaxvq_u8(v) < 0x80u) {
+        i += 16;
+        continue;
+      }
+      break;
+    }
+#else
+    while (i + 32 <= n) {
+      const uint64_t w0 = read_u64_le(p + i);
+      const uint64_t w1 = read_u64_le(p + i + 8);
+      const uint64_t w2 = read_u64_le(p + i + 16);
+      const uint64_t w3 = read_u64_le(p + i + 24);
+      if (((w0 | w1 | w2 | w3) & 0x8080808080808080ULL) == 0) {
+        i += 32;
+        continue;
+      }
+      break;
+    }
+#endif
+    while (i + 8 <= n) {
+      const uint64_t w = read_u64_le(p + i);
+      if ((w & 0x8080808080808080ULL) == 0) {
+        i += 8;
+        continue;
+      }
+      break;
+    }
+    if (i >= n) break;
+
     const uint8_t b0 = p[i];
     if (b0 < 0x80u) {
       ++i;

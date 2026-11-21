@@ -819,6 +819,101 @@ void test_fast_writer_aliasing() {
   CHECK(bytes == (std::vector<uint8_t>{1, 2, 3, 4, 2, 3}));
 }
 
+void test_zero_copy_view_and_perf_upgrades() {
+  // 1. Lightweight <Msg>View zero-copy getters
+  static_assert(sizeof(omnibuf::bench::PeerUpdateView) == sizeof(std::span<const uint8_t>));
+  static_assert(std::is_trivially_copyable_v<omnibuf::bench::PeerUpdateView>);
+
+  omnibuf::bench::PeerUpdate peer;
+  peer.asn = 65001;
+  peer.router_id = "edge-fra-01";
+  peer.sequence = 4242;
+  peer.active = true;
+  peer.prefixes = {10u, 20u, 30u};
+  peer.location = omnibuf::bench::Location{.region = "eu-central", .city = "Frankfurt"};
+  const std::vector<uint8_t> wire = peer.marshal_omnibuf();
+
+  const omnibuf::bench::PeerUpdateView view(wire);
+  CHECK(view.validate().ok());
+  CHECK(view.get_asn() == 65001u);
+  CHECK(view.get_sequence() == 4242u);
+  CHECK(view.get_active());
+  CHECK(view.prefixes_len() == 3u);
+
+  const std::string_view rid = view.get_router_id();
+  CHECK(rid == "edge-fra-01");
+  CHECK(reinterpret_cast<const uint8_t*>(rid.data()) >= wire.data() &&
+        reinterpret_cast<const uint8_t*>(rid.data()) < wire.data() + wire.size());
+
+  const omnibuf::bench::LocationView loc = view.get_location();
+  CHECK(!loc.empty());
+  CHECK(loc.get_region() == "eu-central");
+  const std::string_view city = loc.get_city();
+  CHECK(city == "Frankfurt");
+  CHECK(reinterpret_cast<const uint8_t*>(city.data()) >= wire.data() &&
+        reinterpret_cast<const uint8_t*>(city.data()) < wire.data() + wire.size());
+
+  const auto try_loc = view.try_get_location();
+  CHECK(try_loc.ok() && try_loc.value().has_value());
+  CHECK(try_loc.value()->get_city() == "Frankfurt");
+
+  // Oneof mutual exclusion on View over concatenated packets
+  omnibuf::test::EdgeShowcase es1;
+  es1.set_action_code(77);
+  omnibuf::test::EdgeShowcase es2;
+  es2.set_action_name("run");
+  std::vector<uint8_t> concat = es1.marshal_omnibuf();
+  const auto es2_wire = es2.marshal_omnibuf();
+  concat.insert(concat.end(), es2_wire.begin(), es2_wire.end());
+
+  const omnibuf::test::EdgeShowcaseView ev(concat);
+  CHECK(ev.get_action_code() == 0);
+  CHECK(ev.get_action_name() == "run");
+
+  // 2. Capacity-preserving clear_unseen reuse on decode_omnibuf_raw
+  omnibuf::bench::PeerUpdate big_peer;
+  big_peer.asn = 65100;
+  big_peer.router_id = std::string(1024, 'R');
+  big_peer.prefixes.assign(256, 9u);
+  big_peer.location = omnibuf::bench::Location{.region = "us", .city = std::string(512, 'C')};
+  const auto big_wire = big_peer.marshal_omnibuf();
+
+  omnibuf::bench::PeerUpdate reuse;
+  CHECK(reuse.unmarshal_omnibuf(big_wire).ok());
+  const size_t rid_cap = reuse.router_id.capacity();
+  const size_t pref_cap = reuse.prefixes.capacity();
+  const size_t city_cap = reuse.location->city.capacity();
+
+  omnibuf::bench::PeerUpdate small_peer;
+  small_peer.asn = 12;
+  small_peer.router_id = "ok";
+  small_peer.location = omnibuf::bench::Location{.region = "ap"};
+  const auto small_wire = small_peer.marshal_omnibuf();
+
+  CHECK(reuse.unmarshal_omnibuf(small_wire).ok());
+  CHECK(reuse.asn == 12u);
+  CHECK(reuse.router_id == "ok");
+  CHECK(reuse.router_id.capacity() >= rid_cap);
+  CHECK(reuse.prefixes.empty());
+  CHECK(reuse.prefixes.capacity() >= pref_cap);
+  CHECK(reuse.location.has_value() && reuse.location->region == "ap" &&
+        reuse.location->city.empty());
+  CHECK(reuse.location->city.capacity() >= city_cap);
+
+  // 3. >16 KiB container backpatch heuristic wire equivalence
+  omnibuf::bench::PeerUpdate huge_peer;
+  huge_peer.asn = 65200;
+  huge_peer.location = omnibuf::bench::Location{
+      .region = "eu",
+      .city = std::string(24000, 'A'),
+  };
+  CHECK(huge_peer.location->min_wire_size() > 16383u);
+  const auto huge_wire = huge_peer.marshal_omnibuf();
+  omnibuf::bench::PeerUpdate huge_dec;
+  CHECK(huge_dec.unmarshal_omnibuf(huge_wire).ok());
+  CHECK(huge_dec == huge_peer);
+}
+
 int main() {
   RUN_TEST(test_fast_writer_aliasing);
   RUN_TEST(test_prefix_varint_and_zigzag);
@@ -830,6 +925,7 @@ int main() {
   RUN_TEST(test_edge_showcase_and_wide_message);
   RUN_TEST(test_large_container_shift_and_limits);
   RUN_TEST(test_recursive_struct_unordered_map_and_descriptors);
+  RUN_TEST(test_zero_copy_view_and_perf_upgrades);
 
   std::printf("\nSummary: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
