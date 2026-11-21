@@ -22,7 +22,7 @@ namespace omnibuf {
 namespace detail {
 
 template <typename T>
-concept IntOrUint = std::integral<T> && !std::same_as<T, bool>;
+concept IntOrUint = (std::integral<T> && !std::same_as<T, bool>) || std::is_enum_v<T>;
 
 }  // namespace detail
 
@@ -253,24 +253,49 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
 }
 
 // FastWriter overloads for register-resident generated and struct encoding.
+template <typename StrT = std::string>
 [[nodiscard]] inline const char* try_encode_string_arr(FastWriter& w,
-                                                       std::span<const std::string> items) {
-  size_t body_hint = 1 + varint_size(items.size());
+                                                       std::span<const StrT> items) {
+  size_t body_len = 1 + varint_size(items.size());
   for (const auto& s : items) {
-    body_hint += varint_size(s.size()) + s.size();
+    const size_t elem_wire = varint_size(s.size()) + s.size();
+    if (elem_wire < s.size() || elem_wire > SIZE_MAX - body_len) [[unlikely]] {
+      throw std::length_error("omnibuf: array byte size overflow");
+    }
+    body_len += elem_wire;
   }
-  const bool use_4b = body_hint > 16383u;
-  const size_t len_pos = w.reserve_len_hint(body_hint);
+  if (body_len <= 512u) [[likely]] {
+    w.ensure(2 + body_len);
+    uint8_t* p = w.raw_cur();
+    write_u16_le(p, static_cast<uint16_t>((body_len << 2) | 2u));
+    p[2] = WireString;
+    p = write_varint_raw(p + 3, items.size());
+    for (const auto& s : items) {
+      if (!is_valid_utf8(s)) [[unlikely]] {
+        return "omnibuf: invalid UTF-8 in WireString";
+      }
+      p = write_varint_raw(p, s.size());
+      if (!s.empty()) {
+        std::memcpy(p, s.data(), s.size());
+        p += s.size();
+      }
+    }
+    w.set_raw_cur(p);
+    return nullptr;
+  }
+  if (body_len > 16383u) {
+    const size_t pad = (body_len <= SIZE_MAX - 512u) ? (body_len + 512u) : body_len;
+    w.reserve_capacity(pad);
+  }
+  w.write_container_len_header(body_len);
   w.write_byte(WireString);
   w.write_varint(items.size());
   for (const auto& s : items) {
     if (!is_valid_utf8(s)) [[unlikely]] {
       return "omnibuf: invalid UTF-8 in WireString";
     }
-    w.write_varint(s.size());
-    w.write_bytes_noalias(s.data(), s.size());
+    w.write_len_bytes_noalias(s.data(), s.size());
   }
-  w.backpatch_len_hint(len_pos, use_4b);
   return nullptr;
 }
 
@@ -280,37 +305,87 @@ inline void encode_string_arr(FastWriter& w, std::span<const std::string> items)
   }
 }
 
-inline void encode_bytes_arr(FastWriter& w, std::span<const std::vector<uint8_t>> items) {
-  size_t body_hint = 1 + varint_size(items.size());
+template <typename BytesT = std::vector<uint8_t>>
+inline void encode_bytes_arr(FastWriter& w, std::span<const BytesT> items) {
+  size_t body_len = 1 + varint_size(items.size());
   for (const auto& b : items) {
-    body_hint += varint_size(b.size()) + b.size();
+    const size_t elem_wire = varint_size(b.size()) + b.size();
+    if (elem_wire < b.size() || elem_wire > SIZE_MAX - body_len) [[unlikely]] {
+      throw std::length_error("omnibuf: array byte size overflow");
+    }
+    body_len += elem_wire;
   }
-  const bool use_4b = body_hint > 16383u;
-  const size_t len_pos = w.reserve_len_hint(body_hint);
+  if (body_len <= 512u) [[likely]] {
+    w.ensure(2 + body_len);
+    uint8_t* p = w.raw_cur();
+    write_u16_le(p, static_cast<uint16_t>((body_len << 2) | 2u));
+    p[2] = WireBytes;
+    p = write_varint_raw(p + 3, items.size());
+    for (const auto& b : items) {
+      p = write_varint_raw(p, b.size());
+      if (!b.empty()) {
+        std::memcpy(p, b.data(), b.size());
+        p += b.size();
+      }
+    }
+    w.set_raw_cur(p);
+    return;
+  }
+  if (body_len > 16383u) {
+    const size_t pad = (body_len <= SIZE_MAX - 512u) ? (body_len + 512u) : body_len;
+    w.reserve_capacity(pad);
+  }
+  w.write_container_len_header(body_len);
   w.write_byte(WireBytes);
   w.write_varint(items.size());
   for (const auto& b : items) {
-    w.write_varint(b.size());
-    w.write_bytes_noalias(b.data(), b.size());
+    w.write_len_bytes_noalias(b.data(), b.size());
   }
-  w.backpatch_len_hint(len_pos, use_4b);
 }
 
-inline void encode_bool_arr(FastWriter& w, const std::vector<bool>& items) {
-  const size_t body_hint = 1 + varint_size(items.size()) + items.size();
-  const bool use_4b = body_hint > 16383u;
-  const size_t len_pos = w.reserve_len_hint(body_hint);
+template <typename BoolVecT>
+inline void encode_bool_arr(FastWriter& w, const BoolVecT& items) {
+  if (items.size() > SIZE_MAX - 10) [[unlikely]] {
+    throw std::length_error("omnibuf: array byte size overflow");
+  }
+  const size_t body_len = 1 + varint_size(items.size()) + items.size();
+  if (body_len <= 512u) [[likely]] {
+    w.ensure(2 + body_len);
+    uint8_t* p = w.raw_cur();
+    write_u16_le(p, static_cast<uint16_t>((body_len << 2) | 2u));
+    p[2] = WireBoolFalse;
+    p = write_varint_raw(p + 3, items.size());
+    for (bool v : items) {
+      *p++ = v ? uint8_t{1} : uint8_t{0};
+    }
+    w.set_raw_cur(p);
+    return;
+  }
+  w.write_container_len_header(body_len);
   w.write_byte(WireBoolFalse);
   w.write_varint(items.size());
-  w.ensure(items.size());
   for (bool v : items) {
     w.write_byte(v ? uint8_t{1} : uint8_t{0});
   }
-  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <detail::IntOrUint T>
 inline void encode_uint_arr(FastWriter& w, std::span<const T> items) {
+  constexpr size_t kMaxElemBytes = 9;
+  if (items.size() <= 96u) [[likely]] {
+    w.ensure(4 + items.size() * kMaxElemBytes);
+    uint8_t* const start = w.raw_cur();
+    uint8_t* p = start + 2;
+    *p++ = WireUint;
+    p = write_varint_raw(p, items.size());
+    for (T v : items) {
+      p = write_varint_raw(p, static_cast<uint64_t>(v));
+    }
+    const size_t body_len = static_cast<size_t>(p - (start + 2));
+    write_u16_le(start, static_cast<uint16_t>((body_len << 2) | 2u));
+    w.set_raw_cur(p);
+    return;
+  }
   const size_t body_hint = 1 + varint_size(items.size()) + items.size();
   const bool use_4b = body_hint > 16383u;
   const size_t len_pos = w.reserve_len_hint(body_hint);
@@ -324,6 +399,21 @@ inline void encode_uint_arr(FastWriter& w, std::span<const T> items) {
 
 template <detail::IntOrUint T>
 inline void encode_sint_arr(FastWriter& w, std::span<const T> items) {
+  constexpr size_t kMaxElemBytes = 9;
+  if (items.size() <= 96u) [[likely]] {
+    w.ensure(4 + items.size() * kMaxElemBytes);
+    uint8_t* const start = w.raw_cur();
+    uint8_t* p = start + 2;
+    *p++ = WireSint;
+    p = write_varint_raw(p, items.size());
+    for (T v : items) {
+      p = write_varint_raw(p, encode_zigzag(static_cast<int64_t>(v)));
+    }
+    const size_t body_len = static_cast<size_t>(p - (start + 2));
+    write_u16_le(start, static_cast<uint16_t>((body_len << 2) | 2u));
+    w.set_raw_cur(p);
+    return;
+  }
   const size_t body_hint = 1 + varint_size(items.size()) + items.size();
   const bool use_4b = body_hint > 16383u;
   const size_t len_pos = w.reserve_len_hint(body_hint);
@@ -339,13 +429,16 @@ template <detail::IntOrUint T>
 inline void encode_fixed32_arr(FastWriter& w,
                                std::span<const T> items,
                                uint8_t elem_wt = WireFixed32) {
-  if (items.size() > SIZE_MAX / 4) [[unlikely]] {
+  if (items.size() > (SIZE_MAX - 10) / 4) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
   const size_t byte_len = items.size() * 4;
-  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
-  const bool use_4b = body_hint > 16383u;
-  const size_t len_pos = w.reserve_len_hint(body_hint);
+  const size_t body_len = 1 + varint_size(items.size()) + byte_len;
+  if (body_len > 16383u) {
+    const size_t pad = (body_len <= SIZE_MAX - 512u) ? (body_len + 512u) : body_len;
+    w.reserve_capacity(pad);
+  }
+  w.write_container_len_header(body_len);
   w.write_byte(elem_wt);
   w.write_varint(items.size());
   if constexpr (std::endian::native == std::endian::little && sizeof(T) == 4) {
@@ -356,20 +449,22 @@ inline void encode_fixed32_arr(FastWriter& w,
       w.write_u32_raw(static_cast<uint32_t>(v));
     }
   }
-  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <detail::IntOrUint T>
 inline void encode_fixed64_arr(FastWriter& w,
                                std::span<const T> items,
                                uint8_t elem_wt = WireFixed64) {
-  if (items.size() > SIZE_MAX / 8) [[unlikely]] {
+  if (items.size() > (SIZE_MAX - 10) / 8) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
   const size_t byte_len = items.size() * 8;
-  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
-  const bool use_4b = body_hint > 16383u;
-  const size_t len_pos = w.reserve_len_hint(body_hint);
+  const size_t body_len = 1 + varint_size(items.size()) + byte_len;
+  if (body_len > 16383u) {
+    const size_t pad = (body_len <= SIZE_MAX - 512u) ? (body_len + 512u) : body_len;
+    w.reserve_capacity(pad);
+  }
+  w.write_container_len_header(body_len);
   w.write_byte(elem_wt);
   w.write_varint(items.size());
   if constexpr (std::endian::native == std::endian::little && sizeof(T) == 8) {
@@ -380,17 +475,19 @@ inline void encode_fixed64_arr(FastWriter& w,
       w.write_u64_raw(static_cast<uint64_t>(v));
     }
   }
-  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 inline void encode_float32_arr(FastWriter& w, std::span<const float> items) {
-  if (items.size() > SIZE_MAX / 4) [[unlikely]] {
+  if (items.size() > (SIZE_MAX - 10) / 4) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
   const size_t byte_len = items.size() * 4;
-  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
-  const bool use_4b = body_hint > 16383u;
-  const size_t len_pos = w.reserve_len_hint(body_hint);
+  const size_t body_len = 1 + varint_size(items.size()) + byte_len;
+  if (body_len > 16383u) {
+    const size_t pad = (body_len <= SIZE_MAX - 512u) ? (body_len + 512u) : body_len;
+    w.reserve_capacity(pad);
+  }
+  w.write_container_len_header(body_len);
   w.write_byte(WireFloat32);
   w.write_varint(items.size());
   if constexpr (std::endian::native == std::endian::little && sizeof(float) == 4) {
@@ -401,17 +498,19 @@ inline void encode_float32_arr(FastWriter& w, std::span<const float> items) {
       w.write_u32_raw(float32_to_bits(v));
     }
   }
-  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 inline void encode_float64_arr(FastWriter& w, std::span<const double> items) {
-  if (items.size() > SIZE_MAX / 8) [[unlikely]] {
+  if (items.size() > (SIZE_MAX - 10) / 8) [[unlikely]] {
     throw std::length_error("omnibuf: array byte size overflow");
   }
   const size_t byte_len = items.size() * 8;
-  const size_t body_hint = 1 + varint_size(items.size()) + byte_len;
-  const bool use_4b = body_hint > 16383u;
-  const size_t len_pos = w.reserve_len_hint(body_hint);
+  const size_t body_len = 1 + varint_size(items.size()) + byte_len;
+  if (body_len > 16383u) {
+    const size_t pad = (body_len <= SIZE_MAX - 512u) ? (body_len + 512u) : body_len;
+    w.reserve_capacity(pad);
+  }
+  w.write_container_len_header(body_len);
   w.write_byte(WireFloat64);
   w.write_varint(items.size());
   if constexpr (std::endian::native == std::endian::little && sizeof(double) == 8) {
@@ -422,7 +521,6 @@ inline void encode_float64_arr(FastWriter& w, std::span<const double> items) {
       w.write_u64_raw(float64_to_bits(v));
     }
   }
-  w.backpatch_len_hint(len_pos, use_4b);
 }
 
 template <uint8_t WT, typename T>

@@ -2,6 +2,8 @@
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
+#include <immintrin.h>
 #endif
 
 #include <cstddef>
@@ -13,28 +15,44 @@
 
 namespace omnibuf {
 
-// Strict RFC 3629 UTF-8 validator with NEON 64B/16B and 64-bit word ASCII fast paths.
-// Resumes vectorized ASCII scanning immediately after every valid multi-byte code point.
-// Rejects overlong sequences, UTF-16 surrogates (U+D800..U+DFFF), code points > U+10FFFF,
-// stray continuation bytes, and truncated multi-byte sequences.
-[[nodiscard]] inline bool is_valid_utf8(std::span<const uint8_t> b) noexcept {
-  const uint8_t* p = b.data();
-  const size_t n = b.size();
-  size_t i = 0;
+namespace detail {
 
-  // Fast path for short strings (< 16 bytes): avoid checking 64B/16B SIMD loops.
-  if (n < 16) {
-    if (n >= 8) {
-      if ((read_u64_le(p) & 0x8080808080808080ULL) == 0) {
-        i = 8;
+[[nodiscard]] OMNIBUF_NOINLINE inline bool is_valid_utf8_long(const uint8_t* p,
+                                                              size_t n) noexcept {
+  if (n <= 64) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (n > 32) {
+      const uint8x16_t v0 = vld1q_u8(p);
+      const uint8x16_t v1 = vld1q_u8(p + 16);
+      const uint8x16_t v2 = vld1q_u8(p + n - 32);
+      const uint8x16_t v3 = vld1q_u8(p + n - 16);
+      if (vmaxvq_u8(vorrq_u8(vorrq_u8(v0, v1), vorrq_u8(v2, v3))) < 0x80u) [[likely]] {
+        return true;
       }
     }
-    while (i < n && p[i] < 0x80u) {
-      ++i;
+#elif defined(__AVX2__)
+    if (n > 32) {
+      const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+      const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + n - 32));
+      if (_mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0) [[likely]] {
+        return true;
+      }
     }
-    if (i >= n) return true;
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
+    if (n > 32) {
+      const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+      const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16));
+      const __m128i v2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + n - 32));
+      const __m128i v3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + n - 16));
+      const __m128i ored = _mm_or_si128(_mm_or_si128(v0, v1), _mm_or_si128(v2, v3));
+      if (_mm_movemask_epi8(ored) == 0) [[likely]] {
+        return true;
+      }
+    }
+#endif
   }
 
+  size_t i = 0;
   while (i < n) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     while (i + 64 <= n) {
@@ -52,6 +70,53 @@ namespace omnibuf {
     while (i + 16 <= n) {
       const uint8x16_t v = vld1q_u8(p + i);
       if (vmaxvq_u8(v) < 0x80u) {
+        i += 16;
+        continue;
+      }
+      break;
+    }
+#elif defined(__AVX2__)
+    while (i + 64 <= n) {
+      const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i));
+      const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i + 32));
+      if (_mm256_movemask_epi8(_mm256_or_si256(v0, v1)) == 0) {
+        i += 64;
+        continue;
+      }
+      break;
+    }
+    while (i + 32 <= n) {
+      const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i));
+      if (_mm256_movemask_epi8(v) == 0) {
+        i += 32;
+        continue;
+      }
+      break;
+    }
+    while (i + 16 <= n) {
+      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+      if (_mm_movemask_epi8(v) == 0) {
+        i += 16;
+        continue;
+      }
+      break;
+    }
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
+    while (i + 64 <= n) {
+      const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+      const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i + 16));
+      const __m128i v2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i + 32));
+      const __m128i v3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i + 48));
+      const __m128i ored = _mm_or_si128(_mm_or_si128(v0, v1), _mm_or_si128(v2, v3));
+      if (_mm_movemask_epi8(ored) == 0) {
+        i += 64;
+        continue;
+      }
+      break;
+    }
+    while (i + 16 <= n) {
+      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+      if (_mm_movemask_epi8(v) == 0) {
         i += 16;
         continue;
       }
@@ -129,6 +194,42 @@ namespace omnibuf {
     return false;
   }
   return true;
+}
+
+}  // namespace detail
+
+// Strict RFC 3629 UTF-8 validator with inline overlapping-word pure-ASCII fast paths
+// up to 32 bytes and out-of-line SIMD/multi-byte validation for longer or non-ASCII inputs.
+[[nodiscard]] inline bool is_valid_utf8(std::span<const uint8_t> b) noexcept {
+  const uint8_t* p = b.data();
+  const size_t n = b.size();
+  if (n <= 16) [[likely]] {
+    if (n >= 8) {
+      if (((read_u64_le(p) | read_u64_le(p + n - 8)) & 0x8080808080808080ULL) == 0) [[likely]] {
+        return true;
+      }
+    } else if (n >= 4) {
+      if (((read_u32_le(p) | read_u32_le(p + n - 4)) & 0x80808080U) == 0) [[likely]] {
+        return true;
+      }
+    } else {
+      if (n == 0) return true;
+      if (((p[0] | p[n >> 1] | p[n - 1]) & 0x80u) == 0) [[likely]] {
+        return true;
+      }
+    }
+    return detail::is_valid_utf8_long(p, n);
+  }
+  if (n <= 32) [[likely]] {
+    const uint64_t w0 = read_u64_le(p);
+    const uint64_t w1 = read_u64_le(p + 8);
+    const uint64_t w2 = read_u64_le(p + n - 16);
+    const uint64_t w3 = read_u64_le(p + n - 8);
+    if (((w0 | w1 | w2 | w3) & 0x8080808080808080ULL) == 0) [[likely]] {
+      return true;
+    }
+  }
+  return detail::is_valid_utf8_long(p, n);
 }
 
 [[nodiscard]] inline bool is_valid_utf8(std::string_view s) noexcept {

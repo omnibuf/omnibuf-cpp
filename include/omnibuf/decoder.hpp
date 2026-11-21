@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <span>
 #include <string>
@@ -287,6 +288,7 @@ struct DecodeOptions {
 struct DecodeState {
   DecodeOptions opts{};
   size_t total_elements = 0;
+  std::pmr::memory_resource* mr = nullptr;
 
   [[nodiscard]] bool charge_elements(size_t n) noexcept {
     if (n > opts.max_total_elements || total_elements > opts.max_total_elements - n) {
@@ -759,7 +761,8 @@ struct SliceStep {
 }
 
 // Array body decoders for generated and reflection-driven codecs.
-[[nodiscard]] inline bool append_string_arr_body(std::vector<std::string>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_string_arr_body(VecT& dst,
                                                  std::span<const uint8_t> body,
                                                  DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
@@ -776,7 +779,8 @@ struct SliceStep {
   return p == body.size();
 }
 
-[[nodiscard]] inline bool append_bytes_arr_body(std::vector<std::vector<uint8_t>>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_bytes_arr_body(VecT& dst,
                                                 std::span<const uint8_t> body,
                                                 DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
@@ -793,7 +797,8 @@ struct SliceStep {
   return p == body.size();
 }
 
-[[nodiscard]] inline bool append_bool_arr_body(std::vector<bool>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_bool_arr_body(VecT& dst,
                                                std::span<const uint8_t> body,
                                                DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
@@ -808,7 +813,8 @@ struct SliceStep {
   return true;
 }
 
-[[nodiscard]] inline bool append_string_view_arr_body(std::vector<std::string_view>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_string_view_arr_body(VecT& dst,
                                                       std::span<const uint8_t> body,
                                                       DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
@@ -825,7 +831,8 @@ struct SliceStep {
   return p == body.size();
 }
 
-[[nodiscard]] inline bool append_bytes_view_arr_body(std::vector<std::span<const uint8_t>>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_bytes_view_arr_body(VecT& dst,
                                                      std::span<const uint8_t> body,
                                                      DecodeState* state = nullptr) {
   const auto hdr = parse_array_header(body);
@@ -842,55 +849,104 @@ struct SliceStep {
   return p == body.size();
 }
 
-template <typename T>
-[[nodiscard]] inline bool append_uint_arr_body(std::vector<T>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_uint_arr_body(VecT& dst,
                                                std::span<const uint8_t> body,
                                                DecodeState* state = nullptr) {
+  using T = typename VecT::value_type;
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != WireUint) return false;
   if (state && !state->charge_elements(hdr.count)) return false;
+  const uint8_t* const base = body.data();
+  const size_t n = body.size();
   size_t p = hdr.pos;
+  if (hdr.count <= 256u) [[likely]] {
+    const size_t old_sz = dst.size();
+    dst.resize(old_sz + hdr.count);
+    T* out = dst.data() + old_sz;
+    for (size_t i = 0; i < hdr.count; ++i) {
+      uint64_t v = 0;
+      if (!read_varint_fast(base, n, p, v)) [[unlikely]] {
+        dst.resize(old_sz);
+        return false;
+      }
+      if constexpr (std::is_enum_v<T>) {
+        out[i] = static_cast<T>(static_cast<std::underlying_type_t<T>>(v));
+      } else {
+        out[i] = static_cast<T>(v);
+      }
+    }
+    if (p != n) [[unlikely]] {
+      dst.resize(old_sz);
+      return false;
+    }
+    return true;
+  }
   dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
-    const auto [v, vn] = decode_varint(body.subspan(p));
-    if (vn == 0) return false;
-    p += vn;
+    uint64_t v = 0;
+    if (!read_varint_fast(base, n, p, v)) [[unlikely]] return false;
     if constexpr (std::is_enum_v<T>) {
       dst.push_back(static_cast<T>(static_cast<std::underlying_type_t<T>>(v)));
     } else {
       dst.push_back(static_cast<T>(v));
     }
   }
-  return p == body.size();
+  return p == n;
 }
 
-template <typename T>
-[[nodiscard]] inline bool append_sint_arr_body(std::vector<T>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_sint_arr_body(VecT& dst,
                                                std::span<const uint8_t> body,
                                                DecodeState* state = nullptr) {
+  using T = typename VecT::value_type;
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != WireSint) return false;
   if (state && !state->charge_elements(hdr.count)) return false;
+  const uint8_t* const base = body.data();
+  const size_t n = body.size();
   size_t p = hdr.pos;
+  if (hdr.count <= 256u) [[likely]] {
+    const size_t old_sz = dst.size();
+    dst.resize(old_sz + hdr.count);
+    T* out = dst.data() + old_sz;
+    for (size_t i = 0; i < hdr.count; ++i) {
+      uint64_t v = 0;
+      if (!read_varint_fast(base, n, p, v)) [[unlikely]] {
+        dst.resize(old_sz);
+        return false;
+      }
+      if constexpr (std::is_enum_v<T>) {
+        out[i] = static_cast<T>(static_cast<std::underlying_type_t<T>>(decode_zigzag(v)));
+      } else {
+        out[i] = static_cast<T>(decode_zigzag(v));
+      }
+    }
+    if (p != n) [[unlikely]] {
+      dst.resize(old_sz);
+      return false;
+    }
+    return true;
+  }
   dst.reserve(bounded_reserve_target(dst.capacity(), dst.size(), hdr.count));
   for (size_t i = 0; i < hdr.count; ++i) {
-    const auto [v, vn] = decode_varint(body.subspan(p));
-    if (vn == 0) return false;
-    p += vn;
+    uint64_t v = 0;
+    if (!read_varint_fast(base, n, p, v)) [[unlikely]] return false;
     if constexpr (std::is_enum_v<T>) {
       dst.push_back(static_cast<T>(static_cast<std::underlying_type_t<T>>(decode_zigzag(v))));
     } else {
       dst.push_back(static_cast<T>(decode_zigzag(v)));
     }
   }
-  return p == body.size();
+  return p == n;
 }
 
-template <typename T>
-[[nodiscard]] inline bool append_fixed32_arr_body(std::vector<T>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_fixed32_arr_body(VecT& dst,
                                                   std::span<const uint8_t> body,
                                                   uint8_t expected_wt,
                                                   DecodeState* state = nullptr) {
+  using T = typename VecT::value_type;
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != expected_wt) return false;
   if (state && !state->charge_elements(hdr.count)) return false;
@@ -920,11 +976,12 @@ template <typename T>
   }
 }
 
-template <typename T>
-[[nodiscard]] inline bool append_fixed64_arr_body(std::vector<T>& dst,
+template <typename VecT>
+[[nodiscard]] inline bool append_fixed64_arr_body(VecT& dst,
                                                   std::span<const uint8_t> body,
                                                   uint8_t expected_wt,
                                                   DecodeState* state = nullptr) {
+  using T = typename VecT::value_type;
   const auto hdr = parse_array_header(body);
   if (!hdr.ok || hdr.elem_wt != expected_wt) return false;
   if (state && !state->charge_elements(hdr.count)) return false;
@@ -959,15 +1016,13 @@ template <uint8_t WT, typename T>
                                                   size_t& p,
                                                   T& out) {
   if constexpr (WT == WireUint) {
-    const auto [v, vn] = decode_varint(body.subspan(p));
-    if (vn == 0) return false;
-    p += vn;
+    uint64_t v = 0;
+    if (!read_varint_fast(body.data(), body.size(), p, v)) return false;
     out = static_cast<T>(v);
     return true;
   } else if constexpr (WT == WireSint) {
-    const auto [v, vn] = decode_varint(body.subspan(p));
-    if (vn == 0) return false;
-    p += vn;
+    uint64_t v = 0;
+    if (!read_varint_fast(body.data(), body.size(), p, v)) return false;
     if constexpr (std::is_enum_v<T>) {
       out = static_cast<T>(static_cast<std::underlying_type_t<T>>(decode_zigzag(v)));
     } else {

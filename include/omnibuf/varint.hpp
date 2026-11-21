@@ -97,26 +97,38 @@ inline constexpr uint32_t MAX_FIELD_NUMBER = 536870911u;
 }
 
 inline void write_u16_le(uint8_t* dst, uint16_t v) noexcept {
-  dst[0] = static_cast<uint8_t>(v);
-  dst[1] = static_cast<uint8_t>(v >> 8);
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(dst, &v, sizeof(v));
+  } else {
+    dst[0] = static_cast<uint8_t>(v);
+    dst[1] = static_cast<uint8_t>(v >> 8);
+  }
 }
 
 inline void write_u32_le(uint8_t* dst, uint32_t v) noexcept {
-  dst[0] = static_cast<uint8_t>(v);
-  dst[1] = static_cast<uint8_t>(v >> 8);
-  dst[2] = static_cast<uint8_t>(v >> 16);
-  dst[3] = static_cast<uint8_t>(v >> 24);
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(dst, &v, sizeof(v));
+  } else {
+    dst[0] = static_cast<uint8_t>(v);
+    dst[1] = static_cast<uint8_t>(v >> 8);
+    dst[2] = static_cast<uint8_t>(v >> 16);
+    dst[3] = static_cast<uint8_t>(v >> 24);
+  }
 }
 
 inline void write_u64_le(uint8_t* dst, uint64_t v) noexcept {
-  dst[0] = static_cast<uint8_t>(v);
-  dst[1] = static_cast<uint8_t>(v >> 8);
-  dst[2] = static_cast<uint8_t>(v >> 16);
-  dst[3] = static_cast<uint8_t>(v >> 24);
-  dst[4] = static_cast<uint8_t>(v >> 32);
-  dst[5] = static_cast<uint8_t>(v >> 40);
-  dst[6] = static_cast<uint8_t>(v >> 48);
-  dst[7] = static_cast<uint8_t>(v >> 56);
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(dst, &v, sizeof(v));
+  } else {
+    dst[0] = static_cast<uint8_t>(v);
+    dst[1] = static_cast<uint8_t>(v >> 8);
+    dst[2] = static_cast<uint8_t>(v >> 16);
+    dst[3] = static_cast<uint8_t>(v >> 24);
+    dst[4] = static_cast<uint8_t>(v >> 32);
+    dst[5] = static_cast<uint8_t>(v >> 40);
+    dst[6] = static_cast<uint8_t>(v >> 48);
+    dst[7] = static_cast<uint8_t>(v >> 56);
+  }
 }
 
 inline void append_u32_le(std::vector<uint8_t>& dst, uint32_t v) {
@@ -198,6 +210,78 @@ struct VarintResult {
   if (v <= 16383u) return 2;
   if (v <= 536870911u) return 4;
   return 9;
+}
+
+// Fast pointer-based Prefix-Varint reader avoiding std::span::subspan construction
+// and prioritizing 1-byte and 2-byte payloads before 4-byte and 9-byte payloads.
+[[nodiscard]] inline bool read_varint_fast(const uint8_t* base,
+                                           size_t n,
+                                           size_t& pos,
+                                           uint64_t& out) noexcept {
+  if (pos >= n) [[unlikely]] return false;
+  const uint8_t b0 = base[pos];
+  if ((b0 & 1u) != 0) [[likely]] {
+    out = static_cast<uint64_t>(b0 >> 1);
+    ++pos;
+    return true;
+  }
+  if ((b0 & 2u) != 0) [[likely]] {
+    if (n - pos < 2) [[unlikely]] return false;
+    out = static_cast<uint64_t>(read_u16_le(base + pos) >> 2);
+    pos += 2;
+    return true;
+  }
+  if ((b0 & 4u) != 0) {
+    if (n - pos < 4) [[unlikely]] return false;
+    out = static_cast<uint64_t>(read_u32_le(base + pos) >> 3);
+    pos += 4;
+    return true;
+  }
+  if (b0 == 0) {
+    if (n - pos < 9) [[unlikely]] return false;
+    out = read_u64_le(base + pos + 1);
+    pos += 9;
+    return true;
+  }
+  return false;
+}
+
+// Writes a Prefix-Varint directly into a pre-ensured buffer (requires >= 9 bytes capacity)
+// and returns the advanced cursor pointer.
+[[nodiscard]] inline uint8_t* write_varint_raw(uint8_t* dst, uint64_t v) noexcept {
+  if (v <= 127u) [[likely]] {
+    *dst = static_cast<uint8_t>((v << 1) | 1u);
+    return dst + 1;
+  }
+  if (v <= 16383u) [[likely]] {
+    write_u16_le(dst, static_cast<uint16_t>((v << 2) | 2u));
+    return dst + 2;
+  }
+  if (v <= 536870911u) {
+    write_u32_le(dst, static_cast<uint32_t>((v << 3) | 4u));
+    return dst + 4;
+  }
+  dst[0] = 0x00;
+  write_u64_le(dst + 1, v);
+  return dst + 9;
+}
+
+template <uint64_t TagVal>
+inline uint8_t* write_const_varint_raw(uint8_t* dst) noexcept {
+  if constexpr (TagVal <= 127u) {
+    *dst = static_cast<uint8_t>((TagVal << 1) | 1u);
+    return dst + 1;
+  } else if constexpr (TagVal <= 16383u) {
+    write_u16_le(dst, static_cast<uint16_t>((TagVal << 2) | 2u));
+    return dst + 2;
+  } else if constexpr (TagVal <= 536870911u) {
+    write_u32_le(dst, static_cast<uint32_t>((TagVal << 3) | 4u));
+    return dst + 4;
+  } else {
+    dst[0] = 0x00;
+    write_u64_le(dst + 1, TagVal);
+    return dst + 9;
+  }
 }
 
 inline void append_varint_multi(std::vector<uint8_t>& dst, uint64_t v) {
@@ -441,11 +525,152 @@ class FastWriter {
     write_varint(tag);
   }
 
+  template <uint32_t FieldNum, uint8_t WireType>
+  void write_tag_const() {
+    constexpr uint64_t kTag =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireType & 0x0Fu);
+    constexpr size_t kTagLen = varint_size(kTag);
+    ensure(kTagLen);
+    write_const_varint_raw<kTag>(data_ + pos_);
+    pos_ += kTagLen;
+  }
+
+  template <uint32_t FieldNum>
+  void write_tagged_bool(bool v) {
+    constexpr uint64_t kTagFalse =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireBoolFalse);
+    constexpr uint64_t kTagTrue =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireBoolTrue);
+    constexpr size_t kTagLen = varint_size(kTagTrue);
+    ensure(kTagLen);
+    if constexpr (kTagLen == 1) {
+      data_[pos_++] = static_cast<uint8_t>(((v ? kTagTrue : kTagFalse) << 1) | 1u);
+    } else if constexpr (kTagLen == 2) {
+      write_u16_le(data_ + pos_, static_cast<uint16_t>(((v ? kTagTrue : kTagFalse) << 2) | 2u));
+      pos_ += 2;
+    } else {
+      if (v) {
+        write_const_varint_raw<kTagTrue>(data_ + pos_);
+      } else {
+        write_const_varint_raw<kTagFalse>(data_ + pos_);
+      }
+      pos_ += kTagLen;
+    }
+  }
+
+  template <uint32_t FieldNum, uint8_t WireType>
+  void write_tagged_varint(uint64_t v) {
+    constexpr uint64_t kTag =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireType & 0x0Fu);
+    constexpr size_t kTagLen = varint_size(kTag);
+    ensure(kTagLen + 9);
+    uint8_t* p = write_const_varint_raw<kTag>(data_ + pos_);
+    if (v <= 127u) {
+      *p = static_cast<uint8_t>((v << 1) | 1u);
+      pos_ += kTagLen + 1;
+    } else if (v <= 16383u) {
+      write_u16_le(p, static_cast<uint16_t>((v << 2) | 2u));
+      pos_ += kTagLen + 2;
+    } else if (v <= 536870911u) {
+      write_u32_le(p, static_cast<uint32_t>((v << 3) | 4u));
+      pos_ += kTagLen + 4;
+    } else {
+      *p = 0x00;
+      write_u64_le(p + 1, v);
+      pos_ += kTagLen + 9;
+    }
+  }
+
+  template <uint32_t FieldNum, uint8_t WireType>
+  void write_tagged_u32(uint32_t v) {
+    constexpr uint64_t kTag =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireType & 0x0Fu);
+    constexpr size_t kTagLen = varint_size(kTag);
+    ensure(kTagLen + 4);
+    uint8_t* p = write_const_varint_raw<kTag>(data_ + pos_);
+    write_u32_le(p, v);
+    pos_ += kTagLen + 4;
+  }
+
+  template <uint32_t FieldNum, uint8_t WireType>
+  void write_tagged_u64(uint64_t v) {
+    constexpr uint64_t kTag =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireType & 0x0Fu);
+    constexpr size_t kTagLen = varint_size(kTag);
+    ensure(kTagLen + 8);
+    uint8_t* p = write_const_varint_raw<kTag>(data_ + pos_);
+    write_u64_le(p, v);
+    pos_ += kTagLen + 8;
+  }
+
+  template <uint32_t FieldNum, uint8_t WireType>
+  void write_tagged_bytes_noalias(const void* src, size_t len) {
+    constexpr uint64_t kTag =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireType & 0x0Fu);
+    constexpr size_t kTagLen = varint_size(kTag);
+    if (len <= 127u && limit_ - pos_ >= kTagLen + 1 + len) [[likely]] {
+      uint8_t* p = write_const_varint_raw<kTag>(data_ + pos_);
+      *p++ = static_cast<uint8_t>((len << 1) | 1u);
+      if (len > 0) {
+        std::memcpy(p, src, len);
+      }
+      pos_ += kTagLen + 1 + len;
+      return;
+    }
+    write_tag_const<FieldNum, WireType>();
+    write_varint(len);
+    write_bytes_noalias(src, len);
+  }
+
+  template <uint32_t FieldNum, uint8_t WireType>
+  void write_tagged_bytes(const void* src, size_t len) {
+    constexpr uint64_t kTag =
+        (static_cast<uint64_t>(FieldNum) << 4) | static_cast<uint64_t>(WireType & 0x0Fu);
+    constexpr size_t kTagLen = varint_size(kTag);
+    if (!direct_mode_ && len <= 127u && limit_ - pos_ >= kTagLen + 1 + len) [[likely]] {
+      uint8_t* p = write_const_varint_raw<kTag>(data_ + pos_);
+      *p++ = static_cast<uint8_t>((len << 1) | 1u);
+      if (len > 0) {
+        std::memcpy(p, src, len);
+      }
+      pos_ += kTagLen + 1 + len;
+      return;
+    }
+    write_tag_const<FieldNum, WireType>();
+    write_varint(len);
+    write_bytes(src, len);
+  }
+
+  void write_len_bytes_noalias(const void* src, size_t len) {
+    if (len <= 127u && limit_ - pos_ >= 1 + len) [[likely]] {
+      uint8_t* p = data_ + pos_;
+      *p++ = static_cast<uint8_t>((len << 1) | 1u);
+      if (len > 0) {
+        std::memcpy(p, src, len);
+      }
+      pos_ += 1 + len;
+      return;
+    }
+    write_varint(len);
+    write_bytes_noalias(src, len);
+  }
+
+  void write_container_len_header(size_t body_len) {
+    if (body_len <= 16383u) [[likely]] {
+      write_u16_raw(static_cast<uint16_t>((body_len << 2) | 2u));
+    } else if (body_len <= 536870911u) [[likely]] {
+      write_u32_raw(static_cast<uint32_t>((body_len << 3) | 4u));
+    } else {
+      ensure(9);
+      data_[pos_] = 0x00;
+      write_u64_le(data_ + pos_ + 1, static_cast<uint64_t>(body_len));
+      pos_ += 9;
+    }
+  }
+
   [[nodiscard]] size_t reserve_len_2b() {
     ensure(2);
     const size_t p = flushed_ + pos_;
-    data_[pos_] = 0;
-    data_[pos_ + 1] = 0;
     pos_ += 2;
     return p;
   }
@@ -453,7 +678,6 @@ class FastWriter {
   [[nodiscard]] size_t reserve_len_4b() {
     ensure(4);
     const size_t p = flushed_ + pos_;
-    write_u32_le(data_ + pos_, 0);
     pos_ += 4;
     return p;
   }

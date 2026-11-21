@@ -770,64 +770,60 @@ void emit_try_encode_scalar_value_fast(std::ostringstream& out,
   switch (f.type) {
     case FieldType::Uint32:
     case FieldType::Uint64:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireUint);\n";
-      out << indent << w_var << ".write_varint(static_cast<uint64_t>(" << val_expr << "));\n";
+      out << indent << w_var << ".write_tagged_varint<" << fnum
+          << "u, ::omnibuf::WireUint>(static_cast<uint64_t>(" << val_expr << "));\n";
       break;
     case FieldType::Int32:
     case FieldType::Sint32:
     case FieldType::Int64:
     case FieldType::Sint64:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSint);\n";
-      out << indent << w_var << ".write_varint(::omnibuf::encode_zigzag(static_cast<int64_t>("
-          << val_expr << ")));\n";
+      out << indent << w_var << ".write_tagged_varint<" << fnum
+          << "u, ::omnibuf::WireSint>(::omnibuf::encode_zigzag(static_cast<int64_t>(" << val_expr
+          << ")));\n";
       break;
     case FieldType::Enum:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSint);\n";
-      out << indent << w_var
-          << ".write_varint(::omnibuf::encode_zigzag(static_cast<int64_t>(static_cast<int32_t>("
+      out << indent << w_var << ".write_tagged_varint<" << fnum
+          << "u, ::omnibuf::WireSint>(::omnibuf::encode_zigzag(static_cast<int64_t>(static_cast<int32_t>("
           << val_expr << "))));\n";
       break;
     case FieldType::Bool:
-      out << indent << w_var << ".write_tag(" << fnum << "u, (" << val_expr
-          << ") ? ::omnibuf::WireBoolTrue : ::omnibuf::WireBoolFalse);\n";
+      out << indent << w_var << ".write_tagged_bool<" << fnum << "u>(" << val_expr << ");\n";
       break;
     case FieldType::Fixed32:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFixed32);\n";
-      out << indent << w_var << ".write_u32_raw(" << val_expr << ");\n";
+      out << indent << w_var << ".write_tagged_u32<" << fnum << "u, ::omnibuf::WireFixed32>("
+          << val_expr << ");\n";
       break;
     case FieldType::Sfixed32:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSfixed32);\n";
-      out << indent << w_var << ".write_u32_raw(static_cast<uint32_t>(" << val_expr << "));\n";
+      out << indent << w_var << ".write_tagged_u32<" << fnum
+          << "u, ::omnibuf::WireSfixed32>(static_cast<uint32_t>(" << val_expr << "));\n";
       break;
     case FieldType::Float:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFloat32);\n";
-      out << indent << w_var << ".write_u32_raw(::omnibuf::float32_to_bits(" << val_expr << "));\n";
+      out << indent << w_var << ".write_tagged_u32<" << fnum
+          << "u, ::omnibuf::WireFloat32>(::omnibuf::float32_to_bits(" << val_expr << "));\n";
       break;
     case FieldType::Fixed64:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFixed64);\n";
-      out << indent << w_var << ".write_u64_raw(" << val_expr << ");\n";
+      out << indent << w_var << ".write_tagged_u64<" << fnum << "u, ::omnibuf::WireFixed64>("
+          << val_expr << ");\n";
       break;
     case FieldType::Sfixed64:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSfixed64);\n";
-      out << indent << w_var << ".write_u64_raw(static_cast<uint64_t>(" << val_expr << "));\n";
+      out << indent << w_var << ".write_tagged_u64<" << fnum
+          << "u, ::omnibuf::WireSfixed64>(static_cast<uint64_t>(" << val_expr << "));\n";
       break;
     case FieldType::Double:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireFloat64);\n";
-      out << indent << w_var << ".write_u64_raw(::omnibuf::float64_to_bits(" << val_expr << "));\n";
+      out << indent << w_var << ".write_tagged_u64<" << fnum
+          << "u, ::omnibuf::WireFloat64>(::omnibuf::float64_to_bits(" << val_expr << "));\n";
       break;
     case FieldType::String:
       out << indent << "if (!::omnibuf::is_valid_utf8(" << val_expr << ")) [[unlikely]] {\n";
       out << indent << "  return \"omnibuf: invalid UTF-8 in WireString\";\n";
       out << indent << "}\n";
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireString);\n";
-      out << indent << w_var << ".write_varint((" << val_expr << ").size());\n";
-      out << indent << w_var << ".write_bytes_noalias((" << val_expr << ").data(), (" << val_expr
+      out << indent << w_var << ".write_tagged_bytes_noalias<" << fnum
+          << "u, ::omnibuf::WireString>((" << val_expr << ").data(), (" << val_expr
           << ").size());\n";
       break;
     case FieldType::Bytes:
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireBytes);\n";
-      out << indent << w_var << ".write_varint((" << val_expr << ").size());\n";
-      out << indent << w_var << ".write_bytes_noalias((" << val_expr << ").data(), (" << val_expr
+      out << indent << w_var << ".write_tagged_bytes_noalias<" << fnum
+          << "u, ::omnibuf::WireBytes>((" << val_expr << ").data(), (" << val_expr
           << ").size());\n";
       break;
     default:
@@ -843,6 +839,7 @@ void emit_try_encode_field_fast(std::ostringstream& out,
                                 const TypeCatalog& catalog,
                                 std::string_view w_var,
                                 std::string_view depth_expr,
+                                std::string_view check_large_expr,
                                 std::string_view indent) {
   const uint32_t fnum = f.number;
   const bool is_repeated = (f.label == FieldLabel::Repeated);
@@ -856,17 +853,25 @@ void emit_try_encode_field_fast(std::ostringstream& out,
           << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
       out << inner_indent << "    return \"omnibuf: max nesting depth exceeded\";\n";
       out << inner_indent << "  }\n";
-      out << inner_indent << "  " << w_var << ".write_tag(" << fnum
-          << "u, ::omnibuf::WireSubMsg);\n";
-      out << inner_indent << "  const size_t body_hint = " << member_expr
-          << "->min_wire_size((" << depth_expr << ") + 1);\n";
-      out << inner_indent << "  const bool use_4b = body_hint > 16383u;\n";
-      out << inner_indent << "  const size_t len_pos = " << w_var
-          << ".reserve_len_hint(body_hint);\n";
-      out << inner_indent << "  if (const char* err = " << member_expr
+      out << inner_indent << "  " << w_var << ".write_tag_const<" << fnum
+          << "u, ::omnibuf::WireSubMsg>();\n";
+      out << inner_indent << "  if (!(" << check_large_expr << ")) [[likely]] {\n";
+      out << inner_indent << "    const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+      out << inner_indent << "    if (const char* err = " << member_expr
           << "->try_marshal_omnibuf_fast(" << w_var << ", (" << depth_expr
-          << ") + 1)) [[unlikely]] return err;\n";
-      out << inner_indent << "  " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
+          << ") + 1, false)) [[unlikely]] return err;\n";
+      out << inner_indent << "    " << w_var << ".backpatch_len(len_pos);\n";
+      out << inner_indent << "  } else {\n";
+      out << inner_indent << "    const size_t body_hint = " << member_expr
+          << "->min_wire_size((" << depth_expr << ") + 1);\n";
+      out << inner_indent << "    const bool use_4b = body_hint > 16383u;\n";
+      out << inner_indent << "    const size_t len_pos = " << w_var
+          << ".reserve_len_hint(body_hint);\n";
+      out << inner_indent << "    if (const char* err = " << member_expr
+          << "->try_marshal_omnibuf_fast(" << w_var << ", (" << depth_expr
+          << ") + 1, use_4b)) [[unlikely]] return err;\n";
+      out << inner_indent << "    " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
+      out << inner_indent << "  }\n";
       out << inner_indent << "}\n";
     } else {
       emit_try_encode_scalar_value_fast(out, f, member_expr, w_var, inner_indent);
@@ -884,12 +889,13 @@ void emit_try_encode_field_fast(std::ostringstream& out,
           << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
       out << indent << "  return \"omnibuf: max nesting depth exceeded\";\n";
       out << indent << "}\n";
-      out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireMap);\n";
+      out << indent << w_var << ".write_tag_const<" << fnum << "u, ::omnibuf::WireMap>();\n";
       if (mi.val_type == FieldType::Message) {
         out << indent << "if (const char* err = ::omnibuf::try_encode_submsg_map<"
             << wire_const_expr(mi.key_type) << ">(" << w_var << ", " << member_expr
             << ", [&](::omnibuf::FastWriter& sw, const auto& sv) {\n";
-        out << indent << "  return sv.try_marshal_omnibuf_fast(sw, (" << depth_expr << ") + 2);\n";
+        out << indent << "  return sv.try_marshal_omnibuf_fast(sw, (" << depth_expr
+            << ") + 2, " << check_large_expr << ");\n";
         out << indent << "})) [[unlikely]] return err;\n";
       } else {
         out << indent << "if (const char* err = ::omnibuf::try_encode_scalar_map<"
@@ -904,28 +910,42 @@ void emit_try_encode_field_fast(std::ostringstream& out,
           << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
       out << indent << "    return \"omnibuf: max nesting depth exceeded\";\n";
       out << indent << "  }\n";
-      out << indent << "  " << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireArray);\n";
-      out << indent << "  size_t arr_hint = 2u;\n";
-      out << indent << "  for (const auto& elem : " << member_expr << ") {\n";
-      out << indent << "    const size_t eh = elem.min_wire_size((" << depth_expr << ") + 2);\n";
-      out << indent << "    arr_hint += (eh > 16383u ? 4u : 2u) + eh;\n";
-      out << indent << "    if (arr_hint > 16383u) break;\n";
-      out << indent << "  }\n";
-      out << indent << "  const bool arr_4b = arr_hint > 16383u;\n";
-      out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_hint(arr_hint);\n";
-      out << indent << "  " << w_var << ".write_byte(::omnibuf::WireSubMsg);\n";
-      out << indent << "  " << w_var << ".write_varint(" << member_expr << ".size());\n";
-      out << indent << "  for (const auto& elem : " << member_expr << ") {\n";
-      out << indent << "    const size_t elem_hint = arr_4b ? elem.min_wire_size((" << depth_expr
-          << ") + 2) : 0u;\n";
-      out << indent << "    const bool elem_4b = elem_hint > 16383u;\n";
-      out << indent << "    const size_t elem_pos = " << w_var
+      out << indent << "  " << w_var << ".write_tag_const<" << fnum
+          << "u, ::omnibuf::WireArray>();\n";
+      out << indent << "  if (!(" << check_large_expr << ")) [[likely]] {\n";
+      out << indent << "    const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+      out << indent << "    " << w_var << ".write_byte(::omnibuf::WireSubMsg);\n";
+      out << indent << "    " << w_var << ".write_varint(" << member_expr << ".size());\n";
+      out << indent << "    for (const auto& elem : " << member_expr << ") {\n";
+      out << indent << "      const size_t elem_pos = " << w_var << ".reserve_len_2b();\n";
+      out << indent << "      if (const char* err = elem.try_marshal_omnibuf_fast(" << w_var
+          << ", (" << depth_expr << ") + 2, false)) [[unlikely]] return err;\n";
+      out << indent << "      " << w_var << ".backpatch_len(elem_pos);\n";
+      out << indent << "    }\n";
+      out << indent << "    " << w_var << ".backpatch_len(len_pos);\n";
+      out << indent << "  } else {\n";
+      out << indent << "    size_t arr_hint = 2u;\n";
+      out << indent << "    for (const auto& elem : " << member_expr << ") {\n";
+      out << indent << "      const size_t eh = elem.min_wire_size((" << depth_expr << ") + 2);\n";
+      out << indent << "      arr_hint += (eh > 16383u ? 4u : 2u) + eh;\n";
+      out << indent << "      if (arr_hint > 16383u) break;\n";
+      out << indent << "    }\n";
+      out << indent << "    const bool arr_4b = arr_hint > 16383u;\n";
+      out << indent << "    const size_t len_pos = " << w_var << ".reserve_len_hint(arr_hint);\n";
+      out << indent << "    " << w_var << ".write_byte(::omnibuf::WireSubMsg);\n";
+      out << indent << "    " << w_var << ".write_varint(" << member_expr << ".size());\n";
+      out << indent << "    for (const auto& elem : " << member_expr << ") {\n";
+      out << indent << "      const size_t elem_hint = arr_4b ? elem.min_wire_size(("
+          << depth_expr << ") + 2) : 0u;\n";
+      out << indent << "      const bool elem_4b = elem_hint > 16383u;\n";
+      out << indent << "      const size_t elem_pos = " << w_var
           << ".reserve_len_hint(elem_hint);\n";
-      out << indent << "    if (const char* err = elem.try_marshal_omnibuf_fast(" << w_var << ", ("
-          << depth_expr << ") + 2)) [[unlikely]] return err;\n";
-      out << indent << "    " << w_var << ".backpatch_len_hint(elem_pos, elem_4b);\n";
+      out << indent << "      if (const char* err = elem.try_marshal_omnibuf_fast(" << w_var
+          << ", (" << depth_expr << ") + 2, elem_4b)) [[unlikely]] return err;\n";
+      out << indent << "      " << w_var << ".backpatch_len_hint(elem_pos, elem_4b);\n";
+      out << indent << "    }\n";
+      out << indent << "    " << w_var << ".backpatch_len_hint(len_pos, arr_4b);\n";
       out << indent << "  }\n";
-      out << indent << "  " << w_var << ".backpatch_len_hint(len_pos, arr_4b);\n";
       out << indent << "}\n";
       return;
     }
@@ -934,14 +954,24 @@ void emit_try_encode_field_fast(std::ostringstream& out,
         << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
     out << indent << "    return \"omnibuf: max nesting depth exceeded\";\n";
     out << indent << "  }\n";
-    out << indent << "  " << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireSubMsg);\n";
-    out << indent << "  const size_t body_hint = " << member_expr << "->min_wire_size(("
+    out << indent << "  " << w_var << ".write_tag_const<" << fnum
+        << "u, ::omnibuf::WireSubMsg>();\n";
+    out << indent << "  if (!(" << check_large_expr << ")) [[likely]] {\n";
+    out << indent << "    const size_t len_pos = " << w_var << ".reserve_len_2b();\n";
+    out << indent << "    if (const char* err = " << member_expr
+        << "->try_marshal_omnibuf_fast(" << w_var << ", (" << depth_expr
+        << ") + 1, false)) [[unlikely]] return err;\n";
+    out << indent << "    " << w_var << ".backpatch_len(len_pos);\n";
+    out << indent << "  } else {\n";
+    out << indent << "    const size_t body_hint = " << member_expr << "->min_wire_size(("
         << depth_expr << ") + 1);\n";
-    out << indent << "  const bool use_4b = body_hint > 16383u;\n";
-    out << indent << "  const size_t len_pos = " << w_var << ".reserve_len_hint(body_hint);\n";
-    out << indent << "  if (const char* err = " << member_expr << "->try_marshal_omnibuf_fast("
-        << w_var << ", (" << depth_expr << ") + 1)) [[unlikely]] return err;\n";
-    out << indent << "  " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
+    out << indent << "    const bool use_4b = body_hint > 16383u;\n";
+    out << indent << "    const size_t len_pos = " << w_var << ".reserve_len_hint(body_hint);\n";
+    out << indent << "    if (const char* err = " << member_expr
+        << "->try_marshal_omnibuf_fast(" << w_var << ", (" << depth_expr
+        << ") + 1, use_4b)) [[unlikely]] return err;\n";
+    out << indent << "    " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
+    out << indent << "  }\n";
     out << indent << "}\n";
     return;
   }
@@ -951,14 +981,16 @@ void emit_try_encode_field_fast(std::ostringstream& out,
         << ") + 1 > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
     out << indent << "  return \"omnibuf: max nesting depth exceeded\";\n";
     out << indent << "}\n";
-    out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireArray);\n";
+    out << indent << w_var << ".write_tag_const<" << fnum << "u, ::omnibuf::WireArray>();\n";
     switch (f.type) {
       case FieldType::String:
-        out << indent << "if (const char* err = ::omnibuf::try_encode_string_arr(" << w_var << ", "
-            << member_expr << ")) [[unlikely]] return err;\n";
+        out << indent << "if (const char* err = ::omnibuf::try_encode_string_arr(" << w_var
+            << ", std::span<const std::string>(" << member_expr
+            << "))) [[unlikely]] return err;\n";
         break;
       case FieldType::Bytes:
-        out << indent << "::omnibuf::encode_bytes_arr(" << w_var << ", " << member_expr << ");\n";
+        out << indent << "::omnibuf::encode_bytes_arr(" << w_var
+            << ", std::span<const std::vector<uint8_t>>(" << member_expr << "));\n";
         break;
       case FieldType::Bool:
         out << indent << "::omnibuf::encode_bool_arr(" << w_var << ", " << member_expr << ");\n";
@@ -972,6 +1004,7 @@ void emit_try_encode_field_fast(std::ostringstream& out,
       case FieldType::Sint32:
       case FieldType::Int64:
       case FieldType::Sint64:
+      case FieldType::Enum:
         out << indent << "::omnibuf::encode_sint_arr(" << w_var << ", std::span<const "
             << scalar_cpp_type(f, catalog) << ">(" << member_expr << "));\n";
         break;
@@ -996,21 +1029,6 @@ void emit_try_encode_field_fast(std::ostringstream& out,
         break;
       case FieldType::Double:
         out << indent << "::omnibuf::encode_float64_arr(" << w_var << ", " << member_expr << ");\n";
-        break;
-      case FieldType::Enum:
-        out << indent << "{\n";
-        out << indent << "  const size_t body_hint = 2u + " << member_expr << ".size();\n";
-        out << indent << "  const bool use_4b = body_hint > 16383u;\n";
-        out << indent << "  const size_t len_pos = " << w_var
-            << ".reserve_len_hint(body_hint);\n";
-        out << indent << "  " << w_var << ".write_byte(::omnibuf::WireSint);\n";
-        out << indent << "  " << w_var << ".write_varint(" << member_expr << ".size());\n";
-        out << indent << "  for (auto ev : " << member_expr << ") {\n";
-        out << indent << "    " << w_var
-            << ".write_varint(::omnibuf::encode_zigzag(static_cast<int64_t>(static_cast<int32_t>(ev))));\n";
-        out << indent << "  }\n";
-        out << indent << "  " << w_var << ".backpatch_len_hint(len_pos, use_4b);\n";
-        out << indent << "}\n";
         break;
       default:
         break;
@@ -1172,7 +1190,7 @@ void emit_struct_declaration_recursive(std::ostringstream& out,
   out << inner
       << "[[nodiscard]] size_t min_wire_size(int depth = 0) const noexcept;\n";
   out << inner
-      << "[[nodiscard]] const char* try_marshal_omnibuf_fast(::omnibuf::FastWriter& w, int depth = 0) const;\n";
+      << "[[nodiscard]] const char* try_marshal_omnibuf_fast(::omnibuf::FastWriter& w, int depth = 0, bool check_large = true) const;\n";
   out << inner << "void marshal_omnibuf_fast(::omnibuf::FastWriter& w) const;\n";
   out << inner << "void marshal_omnibuf_append(std::vector<uint8_t>& dst) const;\n";
   out << inner
@@ -1459,8 +1477,9 @@ void emit_struct_methods(std::ostringstream& out,
 
   // try_marshal_omnibuf_fast & marshal wrappers
   out << "inline const char* " << qname
-      << "::try_marshal_omnibuf_fast(::omnibuf::FastWriter& w, int depth) const {\n";
+      << "::try_marshal_omnibuf_fast(::omnibuf::FastWriter& w, int depth, bool check_large) const {\n";
   out << "  (void)w;\n";
+  out << "  (void)check_large;\n";
   out << "  if (depth > ::omnibuf::MAX_CONTAINER_DEPTH) [[unlikely]] {\n";
   out << "    return \"omnibuf: max nesting depth exceeded\";\n";
   out << "  }\n";
@@ -1473,7 +1492,7 @@ void emit_struct_methods(std::ostringstream& out,
       oneof_guard = ro.member_var + " == " + ro.enum_name + "::k" + to_pascal_case(f.name);
     }
     emit_try_encode_field_fast(out, f, plan.field_idents[i], is_opt_scalar, oneof_guard, catalog,
-                               "w", "depth", "  ");
+                               "w", "depth", "check_large", "  ");
   }
   out << "  return nullptr;\n";
   out << "}\n\n";
@@ -1485,8 +1504,20 @@ void emit_struct_methods(std::ostringstream& out,
   out << "}\n\n";
 
   out << "inline void " << qname << "::marshal_omnibuf_append(std::vector<uint8_t>& dst) const {\n";
-  out << "  ::omnibuf::FastWriter w(dst, 0u);\n";
-  out << "  marshal_omnibuf_fast(w);\n";
+  out << "  const size_t root_hint = min_wire_size(0);\n";
+  out << "  if (root_hint <= 14000u) [[likely]] {\n";
+  out << "    ::omnibuf::FastWriter w(dst, 0u);\n";
+  out << "    if (const char* err = try_marshal_omnibuf_fast(w, 0, false)) [[unlikely]] {\n";
+  out << "      throw std::invalid_argument(err);\n";
+  out << "    }\n";
+  out << "    w.finish();\n";
+  out << "    return;\n";
+  out << "  }\n";
+  out << "  const size_t pad = (root_hint <= SIZE_MAX - 512u) ? (root_hint + 512u) : root_hint;\n";
+  out << "  ::omnibuf::FastWriter w(dst, pad);\n";
+  out << "  if (const char* err = try_marshal_omnibuf_fast(w, 0, true)) [[unlikely]] {\n";
+  out << "    throw std::invalid_argument(err);\n";
+  out << "  }\n";
   out << "  w.finish();\n";
   out << "}\n\n";
 
@@ -1505,8 +1536,18 @@ void emit_struct_methods(std::ostringstream& out,
   out << "      ::omnibuf::append_field0_schema_meta(dst, *meta);\n";
   out << "    }\n";
   out << "  }\n";
-  out << "  ::omnibuf::FastWriter w(dst, 0u);\n";
-  out << "  if (const char* err = try_marshal_omnibuf_fast(w)) [[unlikely]] {\n";
+  out << "  const size_t root_hint = min_wire_size(0);\n";
+  out << "  if (root_hint <= 14000u) [[likely]] {\n";
+  out << "    ::omnibuf::FastWriter w(dst, 0u);\n";
+  out << "    if (const char* err = try_marshal_omnibuf_fast(w, 0, false)) [[unlikely]] {\n";
+  out << "      return ::omnibuf::Error{err};\n";
+  out << "    }\n";
+  out << "    w.finish();\n";
+  out << "    return dst;\n";
+  out << "  }\n";
+  out << "  const size_t pad = (root_hint <= SIZE_MAX - 512u) ? (root_hint + 512u) : root_hint;\n";
+  out << "  ::omnibuf::FastWriter w(dst, pad);\n";
+  out << "  if (const char* err = try_marshal_omnibuf_fast(w, 0, true)) [[unlikely]] {\n";
   out << "    return ::omnibuf::Error{err};\n";
   out << "  }\n";
   out << "  w.finish();\n";
@@ -1672,16 +1713,29 @@ void emit_struct_methods(std::ostringstream& out,
         out << "          " << ident << ".clear();\n";
         out << "        }\n";
         out << "        seen_words[" << word_idx << "] |= " << bit_mask << "ULL;\n";
-        out << "        " << ident << ".reserve(::omnibuf::bounded_reserve_target(" << ident
-            << ".capacity(), " << ident << ".size(), hdr.count));\n";
         out << "        size_t p = hdr.pos;\n";
-        out << "        for (size_t i = 0; i < hdr.count; ++i) {\n";
-        out << "          const auto es = ::omnibuf::read_len_slice_fast(body, p, 0);\n";
-        out << "          if (!es) [[unlikely]] return es.err;\n";
-        out << "          auto& elem = " << ident << ".emplace_back();\n";
-        out << "          const char* dr = elem.decode_omnibuf_raw(es.span(), depth + 2, false, true, state);\n";
-        out << "          if (dr != nullptr) [[unlikely]] return dr;\n";
-        out << "          p = es.next_pos;\n";
+        out << "        if (hdr.count <= 64u) [[likely]] {\n";
+        out << "          const size_t old_sz = " << ident << ".size();\n";
+        out << "          " << ident << ".resize(old_sz + hdr.count);\n";
+        out << "          auto* out_elems = " << ident << ".data() + old_sz;\n";
+        out << "          for (size_t i = 0; i < hdr.count; ++i) {\n";
+        out << "            const auto es = ::omnibuf::read_len_slice_fast(body, p, 0);\n";
+        out << "            if (!es) [[unlikely]] return es.err;\n";
+        out << "            const char* dr = out_elems[i].decode_omnibuf_raw(es.span(), depth + 2, false, true, state);\n";
+        out << "            if (dr != nullptr) [[unlikely]] return dr;\n";
+        out << "            p = es.next_pos;\n";
+        out << "          }\n";
+        out << "        } else {\n";
+        out << "          " << ident << ".reserve(::omnibuf::bounded_reserve_target(" << ident
+            << ".capacity(), " << ident << ".size(), hdr.count));\n";
+        out << "          for (size_t i = 0; i < hdr.count; ++i) {\n";
+        out << "            const auto es = ::omnibuf::read_len_slice_fast(body, p, 0);\n";
+        out << "            if (!es) [[unlikely]] return es.err;\n";
+        out << "            auto& elem = " << ident << ".emplace_back();\n";
+        out << "            const char* dr = elem.decode_omnibuf_raw(es.span(), depth + 2, false, true, state);\n";
+        out << "            if (dr != nullptr) [[unlikely]] return dr;\n";
+        out << "            p = es.next_pos;\n";
+        out << "          }\n";
         out << "        }\n";
         out << "        if (p != body.size()) [[unlikely]] {\n";
         out << "          return \"omnibuf: trailing bytes in submsg array\";\n";
@@ -1749,6 +1803,7 @@ void emit_struct_methods(std::ostringstream& out,
         case FieldType::Sint32:
         case FieldType::Int64:
         case FieldType::Sint64:
+        case FieldType::Enum:
           out << "        if (!::omnibuf::append_sint_arr_body(" << ident
               << ", ar.span(), &state)) [[unlikely]] return \"omnibuf: invalid sint array\";\n";
           break;
@@ -1775,18 +1830,6 @@ void emit_struct_methods(std::ostringstream& out,
         case FieldType::Double:
           out << "        if (!::omnibuf::append_fixed64_arr_body(" << ident
               << ", ar.span(), ::omnibuf::WireFloat64, &state)) [[unlikely]] return \"omnibuf: invalid float64 array\";\n";
-          break;
-        case FieldType::Enum:
-          out << "        {\n";
-          out << "          std::vector<int32_t> tmp;\n";
-          out << "          if (!::omnibuf::append_sint_arr_body(tmp, ar.span(), &state)) [[unlikely]] {\n";
-          out << "            return \"omnibuf: invalid enum array\";\n";
-          out << "          }\n";
-          out << "          for (int32_t ev : tmp) {\n";
-          out << "            " << ident << ".push_back(static_cast<" << scalar_cpp_type(f, catalog)
-              << ">(ev));\n";
-          out << "          }\n";
-          out << "        }\n";
           break;
         default:
           break;
@@ -1824,18 +1867,12 @@ void emit_struct_methods(std::ostringstream& out,
     switch (f.type) {
       case FieldType::Uint32:
       case FieldType::Uint64:
-        out << "        " << cpp_t << " parsed{};\n";
-        out << "        if (pos < n && (base[pos] & 1u) != 0) [[likely]] {\n";
-        out << "          parsed = static_cast<" << cpp_t << ">(base[pos] >> 1);\n";
-        out << "          ++pos;\n";
-        out << "        } else {\n";
-        out << "          const auto [v, vn] = ::omnibuf::decode_varint(data.subspan(pos));\n";
-        out << "          if (vn == 0) [[unlikely]] return \"omnibuf: truncated uint\";\n";
-        out << "          pos += vn;\n";
-        out << "          parsed = static_cast<" << cpp_t << ">(v);\n";
+        out << "        uint64_t v = 0;\n";
+        out << "        if (!::omnibuf::read_varint_fast(base, n, pos, v)) [[unlikely]] {\n";
+        out << "          return \"omnibuf: truncated uint\";\n";
         out << "        }\n";
         emit_oneof_activate(idx, "        ");
-        out << "        " << ident << " = parsed;\n";
+        out << "        " << ident << " = static_cast<" << cpp_t << ">(v);\n";
         break;
       case FieldType::Int32:
       case FieldType::Sint32:
@@ -1843,14 +1880,8 @@ void emit_struct_methods(std::ostringstream& out,
       case FieldType::Sint64:
       case FieldType::Enum:
         out << "        uint64_t v = 0;\n";
-        out << "        if (pos < n && (base[pos] & 1u) != 0) [[likely]] {\n";
-        out << "          v = static_cast<uint64_t>(base[pos] >> 1);\n";
-        out << "          ++pos;\n";
-        out << "        } else {\n";
-        out << "          const auto [v64, vn] = ::omnibuf::decode_varint(data.subspan(pos));\n";
-        out << "          if (vn == 0) [[unlikely]] return \"omnibuf: truncated sint\";\n";
-        out << "          v = v64;\n";
-        out << "          pos += vn;\n";
+        out << "        if (!::omnibuf::read_varint_fast(base, n, pos, v)) [[unlikely]] {\n";
+        out << "          return \"omnibuf: truncated sint\";\n";
         out << "        }\n";
         emit_oneof_activate(idx, "        ");
         if (f.type == FieldType::Enum) {
@@ -1942,7 +1973,14 @@ void emit_struct_methods(std::ostringstream& out,
   out << "    }\n";
   out << "  }\n";
   if (!msg.fields.empty() || !plan.real_oneofs.empty()) {
-    out << "  if (clear_unseen) {\n";
+    if (!msg.fields.empty() && msg.fields.size() <= 64) {
+      const uint64_t all_mask =
+          (msg.fields.size() == 64) ? ~uint64_t{0} : ((uint64_t{1} << msg.fields.size()) - 1u);
+      out << "  if (clear_unseen && (seen_words[0] & " << all_mask << "ULL) != " << all_mask
+          << "ULL) {\n";
+    } else {
+      out << "  if (clear_unseen) {\n";
+    }
     for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
       const auto& f = msg.fields[idx];
       const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
@@ -2369,15 +2407,8 @@ void emit_opaque_class(std::ostringstream& cls_out,
           case FieldType::Sint32:
           case FieldType::Int64:
           case FieldType::Sint64:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_sint_arr_body(v, b); }";
-            break;
           case FieldType::Enum:
-            os << "[](auto& v, auto b) {\n"
-               << "      std::vector<int32_t> tmp;\n"
-               << "      if (!::omnibuf::append_sint_arr_body(tmp, b)) return false;\n"
-               << "      for (int32_t ev : tmp) v.push_back(static_cast<" << cpp_t << ">(ev));\n"
-               << "      return true;\n"
-               << "    }";
+            os << "[](auto& v, auto b) { return ::omnibuf::append_sint_arr_body(v, b); }";
             break;
           case FieldType::Fixed32:
           case FieldType::Sfixed32:
@@ -2968,7 +2999,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
       out_of_line_out << "      if (!dirty_heap_) break;\n";
     }
     emit_try_encode_field_fast(out_of_line_out, f, member_expr, is_opt_scalar, oneof_guard, catalog,
-                               "w", "0", "      ");
+                               "w", "0", "true", "      ");
     out_of_line_out << "      break;\n";
     out_of_line_out << "    }\n";
   }

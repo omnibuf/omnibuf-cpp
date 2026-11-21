@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -804,6 +805,72 @@ void test_recursive_struct_unordered_map_and_descriptors() {
 
 }  // namespace
 
+struct OwnedPacket {
+  std::string name;
+  std::vector<uint8_t> payload;
+  std::vector<std::string> tags;
+  std::vector<std::vector<uint8_t>> chunks;
+  std::map<std::string, uint64_t> counters;
+};
+
+struct ZeroCopyPacket {
+  std::string_view name;
+  std::span<const uint8_t> payload;
+  std::vector<std::string_view> tags;
+  std::vector<std::span<const uint8_t>> chunks;
+  std::map<std::string_view, uint64_t> counters;
+};
+
+struct PmrPacket {
+  std::pmr::string name;
+  std::pmr::vector<uint8_t> payload;
+  std::pmr::vector<std::pmr::string> tags;
+  std::pmr::vector<uint32_t> numbers;
+  std::pmr::map<std::pmr::string, uint64_t> counters;
+  uint32_t seq = 0;
+};
+
+namespace omnibuf {
+
+template <>
+struct StructTraits<OwnedPacket> {
+  static constexpr std::string_view type_name = "OwnedPacket";
+  static constexpr auto fields() {
+    return std::make_tuple(field<1, &OwnedPacket::name>("name"),
+                           field<2, &OwnedPacket::payload>("payload"),
+                           field<3, &OwnedPacket::tags>("tags"),
+                           field<4, &OwnedPacket::chunks>("chunks"),
+                           field<5, &OwnedPacket::counters>("counters"));
+  }
+};
+
+template <>
+struct StructTraits<ZeroCopyPacket> {
+  static constexpr std::string_view type_name = "ZeroCopyPacket";
+  static constexpr auto fields() {
+    return std::make_tuple(field<1, &ZeroCopyPacket::name>("name"),
+                           field<2, &ZeroCopyPacket::payload>("payload"),
+                           field<3, &ZeroCopyPacket::tags>("tags"),
+                           field<4, &ZeroCopyPacket::chunks>("chunks"),
+                           field<5, &ZeroCopyPacket::counters>("counters"));
+  }
+};
+
+template <>
+struct StructTraits<PmrPacket> {
+  static constexpr std::string_view type_name = "PmrPacket";
+  static constexpr auto fields() {
+    return std::make_tuple(field<1, &PmrPacket::name>("name"),
+                           field<2, &PmrPacket::payload>("payload"),
+                           field<3, &PmrPacket::tags>("tags"),
+                           field<4, &PmrPacket::numbers>("numbers"),
+                           field<5, &PmrPacket::counters>("counters"),
+                           field<6, &PmrPacket::seq>("seq"));
+  }
+};
+
+}  // namespace omnibuf
+
 void test_fast_writer_aliasing() {
   for (size_t headroom : {size_t{0}, size_t{64}}) {
     std::vector<uint8_t> bytes{1, 2, 3, 4};
@@ -912,6 +979,105 @@ void test_zero_copy_view_and_perf_upgrades() {
   omnibuf::bench::PeerUpdate huge_dec;
   CHECK(huge_dec.unmarshal_omnibuf(huge_wire).ok());
   CHECK(huge_dec == huge_peer);
+
+  // 4. Zero-copy StructTraits fields (std::string_view and std::span<const uint8_t>)
+  OwnedPacket src_pkt;
+  src_pkt.name = "zero-copy-endpoint";
+  src_pkt.payload = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
+  src_pkt.tags = {"fast", "zero-copy", "simd"};
+  src_pkt.chunks = {{1, 2, 3}, {4, 5}};
+  src_pkt.counters = {{"rx", 1001}, {"tx", 2002}};
+
+  const auto pkt_wire_res = omnibuf::marshal(src_pkt, {.deterministic = true});
+  CHECK(pkt_wire_res.ok());
+  const auto& pkt_wire = pkt_wire_res.value();
+
+  ZeroCopyPacket zc_pkt;
+  CHECK(omnibuf::unmarshal(pkt_wire, zc_pkt).ok());
+  CHECK(zc_pkt.name == "zero-copy-endpoint");
+  CHECK(reinterpret_cast<const uint8_t*>(zc_pkt.name.data()) >= pkt_wire.data() &&
+        reinterpret_cast<const uint8_t*>(zc_pkt.name.data()) < pkt_wire.data() + pkt_wire.size());
+  CHECK(zc_pkt.payload.size() == 5u && zc_pkt.payload[0] == 0xDE && zc_pkt.payload[4] == 0x42);
+  CHECK(zc_pkt.payload.data() >= pkt_wire.data() &&
+        zc_pkt.payload.data() < pkt_wire.data() + pkt_wire.size());
+  CHECK(zc_pkt.tags.size() == 3u && zc_pkt.tags[1] == "zero-copy");
+  CHECK(reinterpret_cast<const uint8_t*>(zc_pkt.tags[1].data()) >= pkt_wire.data() &&
+        reinterpret_cast<const uint8_t*>(zc_pkt.tags[1].data()) <
+            pkt_wire.data() + pkt_wire.size());
+  CHECK(zc_pkt.chunks.size() == 2u && zc_pkt.chunks[0].size() == 3u);
+  CHECK(zc_pkt.chunks[0].data() >= pkt_wire.data() &&
+        zc_pkt.chunks[0].data() < pkt_wire.data() + pkt_wire.size());
+  CHECK(zc_pkt.counters.size() == 2u && zc_pkt.counters.at("rx") == 1001u);
+
+  const auto zc_remarshal = omnibuf::marshal(zc_pkt, {.deterministic = true});
+  CHECK(zc_remarshal.ok());
+  CHECK(zc_remarshal.value() == pkt_wire);
+
+  // 5. Arena / std::pmr::monotonic_buffer_resource decoding via omnibuf::unmarshal_pmr
+  alignas(64) std::array<std::byte, 8192> arena_buf{};
+  std::pmr::monotonic_buffer_resource arena(arena_buf.data(), arena_buf.size(),
+                                            std::pmr::null_memory_resource());
+  PmrPacket pmr_src{
+      std::pmr::string("pmr-service-node-identifier-longer-than-sso-threshold", &arena),
+      std::pmr::vector<uint8_t>({9, 8, 7, 6, 5, 4}, &arena),
+      std::pmr::vector<std::pmr::string>(&arena),
+      std::pmr::vector<uint32_t>(96, std::numeric_limits<uint32_t>::max(), &arena),
+      std::pmr::map<std::pmr::string, uint64_t>(&arena),
+      777u,
+  };
+  pmr_src.tags.emplace_back("alpha-tag-longer-than-small-string-buffer");
+  pmr_src.tags.emplace_back("beta-tag-longer-than-small-string-buffer");
+  pmr_src.counters.emplace("packets_in", 99999u);
+
+  const auto pmr_wire_res = omnibuf::marshal(pmr_src, {.deterministic = true});
+  CHECK(pmr_wire_res.ok());
+
+  alignas(64) std::array<std::byte, 8192> decode_arena_buf{};
+  std::pmr::monotonic_buffer_resource decode_arena(
+      decode_arena_buf.data(), decode_arena_buf.size(), std::pmr::null_memory_resource());
+  PmrPacket pmr_dec;
+  CHECK(omnibuf::unmarshal_pmr(pmr_wire_res.value(), pmr_dec, &decode_arena).ok());
+  CHECK(pmr_dec.name == pmr_src.name);
+  CHECK(pmr_dec.payload == pmr_src.payload);
+  CHECK(pmr_dec.tags == pmr_src.tags);
+  CHECK(pmr_dec.numbers == pmr_src.numbers);
+  CHECK(pmr_dec.counters == pmr_src.counters);
+  CHECK(pmr_dec.seq == 777u);
+  const auto* name_bytes = reinterpret_cast<const std::byte*>(pmr_dec.name.data());
+  CHECK(name_bytes >= decode_arena_buf.data() &&
+        name_bytes < decode_arena_buf.data() + decode_arena_buf.size());
+
+  const auto pmr_remarshal = omnibuf::marshal(pmr_dec, {.deterministic = true});
+  CHECK(pmr_remarshal.ok());
+  CHECK(pmr_remarshal.value() == pmr_wire_res.value());
+
+  // Reusing pmr_dec on an empty packet must clear unseen scalar seq while preserving decode_arena
+  CHECK(omnibuf::unmarshal_pmr(std::span<const uint8_t>{}, pmr_dec, &decode_arena).ok());
+  CHECK(pmr_dec.seq == 0u);
+  CHECK(pmr_dec.name.empty());
+  CHECK(pmr_dec.name.get_allocator().resource() == &decode_arena);
+
+  // 6. Exhaustive SIMD / overlapping-load UTF-8 validation across lengths 0..128
+  for (size_t len = 0; len <= 128; ++len) {
+    std::string s(len, 'x');
+    CHECK(omnibuf::is_valid_utf8(s));
+    for (size_t pos = 0; pos < len; ++pos) {
+      s[pos] = static_cast<char>(0x80);
+      CHECK(!omnibuf::is_valid_utf8(s));
+      s[pos] = static_cast<char>(0xFF);
+      CHECK(!omnibuf::is_valid_utf8(s));
+      s[pos] = 'x';
+    }
+    if (len >= 2) {
+      for (size_t pos = 0; pos + 1 < len; ++pos) {
+        s[pos] = static_cast<char>(0xC3);
+        s[pos + 1] = static_cast<char>(0xA9);  // U+00E9
+        CHECK(omnibuf::is_valid_utf8(s));
+        s[pos] = 'x';
+        s[pos + 1] = 'x';
+      }
+    }
+  }
 }
 
 int main() {
