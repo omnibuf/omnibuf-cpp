@@ -38,5 +38,5 @@ jobs:
       - name: Run ASan & UBSan unit test suite
         run: |
           cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DOMNIBUF_ENABLE_SANITIZERS=ON
-          cmake --build build-san --target omnibuf_tests -j
+          cmake --build build-san --target omnibuf_tests audit_regressions protoc-gen-omnibuf-cpp -j
           ctest --test-dir build-san --output-on-failure
