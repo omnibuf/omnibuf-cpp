@@ -1240,6 +1240,16 @@ template <WireOverride Override,
           decode_struct_body(sub_res.span(), *field_ref, depth + 1, already_seen, state, fresh);
       if (err != nullptr) [[unlikely]] return {0, err};
       return {sub_res.next_pos, nullptr};
+    } else if constexpr (IsArrayVectorV<Inner> || IsAnyMapV<Inner>) {
+      constexpr uint8_t exp_wt = IsArrayVectorV<Inner> ? WireArray : WireMap;
+      if (wt != exp_wt) [[unlikely]] {
+        return validate_value_step(data, pos, wt, depth, state);
+      }
+      if (!field_ref.has_value()) {
+        field_ref.emplace(make_with_mr<Inner>(state.mr));
+      }
+      return decode_matched_struct_field<Override, KeyOverride>(
+          data, pos, wt, *field_ref, depth, already_seen, mark_seen, state);
     } else {
       Inner tmp = make_with_mr<Inner>(state.mr);
       bool inner_seen = false;
@@ -1584,8 +1594,18 @@ inline void rebind_pmr_member(FieldT& field_ref, std::pmr::memory_resource* mr) 
   } else if constexpr (PmrAllocatorAwareContainer<FieldT>) {
     if (field_ref.get_allocator().resource() != mr) {
       using Alloc = typename FieldT::allocator_type;
+      FieldT fresh(Alloc{mr});
       std::destroy_at(std::addressof(field_ref));
-      std::construct_at(std::addressof(field_ref), Alloc(mr));
+      if constexpr (std::is_nothrow_move_constructible_v<FieldT>) {
+        std::construct_at(std::addressof(field_ref), std::move(fresh));
+      } else {
+        try {
+          std::construct_at(std::addressof(field_ref), std::move(fresh));
+        } catch (...) {
+          std::construct_at(std::addressof(field_ref));
+          throw;
+        }
+      }
     } else {
       field_ref.clear();
     }
@@ -1614,7 +1634,8 @@ template <RegisteredStruct T>
       meta = detail::build_struct_value_schema_meta(msg, 1);
     }
     if (meta) {
-      append_field0_schema_meta(dst, *meta);
+      auto f0_res = try_append_field0_schema_meta(dst, *meta);
+      if (!f0_res) return Error{f0_res.error()};
     }
   }
   MarshalOptions body_opts = opts;

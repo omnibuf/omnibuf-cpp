@@ -461,10 +461,13 @@ struct NextContainerResult {
   std::vector<uint8_t> merged;
   bool found = false;
   size_t pos = 0;
+  DecodeState state{};
   while (true) {
-    const auto res = next_container_field_fast(packet, pos, field_num, WireSubMsg, 0);
+    const auto res = next_container_field(packet, pos, field_num, WireSubMsg, 0);
     if (!res.valid) return {{}, false};
     if (!res.matched) return {std::move(merged), found};
+    auto vr = validate_message_bytes(res.body, 1, state);
+    if (!vr) return {{}, false};
     merged.insert(merged.end(), res.body.begin(), res.body.end());
     found = true;
     pos = res.next_pos;
@@ -705,8 +708,16 @@ template <typename MapOrdFn>
         res.count = 1;
       } else {
         if (res.count == 1) {
+          if (!deep_validate) {
+            auto vr0 = validate_message_bytes(res.single, 1, f0_state);
+            if (!vr0) return {};
+          }
           res.merged.assign(res.single.begin(), res.single.end());
           res.single = {};
+        }
+        if (!deep_validate) {
+          auto vr_cur = validate_message_bytes(sl.span(), 1, f0_state);
+          if (!vr_cur) return {};
         }
         res.merged.insert(res.merged.end(), sl.ptr, sl.ptr + sl.len);
         ++res.count;
@@ -803,7 +814,7 @@ template <typename MapOrdFn>
 [[nodiscard]] inline std::pair<std::span<const uint8_t>, bool> read_submsg_arr_elem(
     std::span<const uint8_t> packet,
     uint32_t field_num,
-    size_t index) noexcept {
+    size_t index) {
   size_t rem_idx = index;
   std::span<const uint8_t> found_elem{};
   bool found = false;
@@ -1328,7 +1339,10 @@ template <uint8_t KeyWT, typename K, typename TargetK>
 
 template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
 [[nodiscard]] inline std::pair<MapT, bool> read_scalar_map(std::span<const uint8_t> packet,
-                                                           uint32_t field_num) {
+                                                           uint32_t field_num,
+                                                           DecodeState* state = nullptr) {
+  DecodeState local_state{};
+  DecodeState* st = state ? state : &local_state;
   MapT out;
   bool found = false;
   size_t pos = 0;
@@ -1337,14 +1351,17 @@ template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
     if (!res.valid) return {MapT{}, false};
     if (!res.matched) return {std::move(out), found};
     pos = res.next_pos;
-    if (!decode_scalar_map_body<KeyWT, ValWT>(out, res.body)) return {MapT{}, false};
+    if (!decode_scalar_map_body<KeyWT, ValWT>(out, res.body, st)) return {MapT{}, false};
     found = true;
   }
 }
 
 template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
 [[nodiscard]] inline Result<MapT> try_read_scalar_map(std::span<const uint8_t> packet,
-                                                      uint32_t field_num) {
+                                                      uint32_t field_num,
+                                                      DecodeState* state = nullptr) {
+  DecodeState local_state{};
+  DecodeState* st = state ? state : &local_state;
   MapT out;
   size_t pos = 0;
   while (true) {
@@ -1352,7 +1369,7 @@ template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
     if (!res.valid) return Error{"omnibuf: corrupt packet while reading WireMap"};
     if (!res.matched) return out;
     pos = res.next_pos;
-    if (!decode_scalar_map_body<KeyWT, ValWT>(out, res.body)) {
+    if (!decode_scalar_map_body<KeyWT, ValWT>(out, res.body, st)) {
       return Error{"omnibuf: invalid WireMap payload"};
     }
   }
@@ -1361,7 +1378,10 @@ template <uint8_t KeyWT, uint8_t ValWT, typename MapT>
 template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
 [[nodiscard]] inline std::pair<MapT, bool> read_submsg_map(std::span<const uint8_t> packet,
                                                            uint32_t field_num,
-                                                           SubDecodeFn&& decode_sub) {
+                                                           SubDecodeFn&& decode_sub,
+                                                           DecodeState* state = nullptr) {
+  DecodeState local_state{};
+  DecodeState* st = state ? state : &local_state;
   MapT out;
   bool found = false;
   size_t pos = 0;
@@ -1370,7 +1390,7 @@ template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
     if (!res.valid) return {MapT{}, false};
     if (!res.matched) return {std::move(out), found};
     pos = res.next_pos;
-    if (!decode_submsg_map_body<KeyWT>(out, res.body, decode_sub)) return {MapT{}, false};
+    if (!decode_submsg_map_body<KeyWT>(out, res.body, decode_sub, st)) return {MapT{}, false};
     found = true;
   }
 }
@@ -1378,7 +1398,10 @@ template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
 template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
 [[nodiscard]] inline Result<MapT> try_read_submsg_map(std::span<const uint8_t> packet,
                                                       uint32_t field_num,
-                                                      SubDecodeFn&& decode_sub) {
+                                                      SubDecodeFn&& decode_sub,
+                                                      DecodeState* state = nullptr) {
+  DecodeState local_state{};
+  DecodeState* st = state ? state : &local_state;
   MapT out;
   size_t pos = 0;
   while (true) {
@@ -1386,7 +1409,7 @@ template <uint8_t KeyWT, typename MapT, typename SubDecodeFn>
     if (!res.valid) return Error{"omnibuf: corrupt packet while reading WireMap"};
     if (!res.matched) return out;
     pos = res.next_pos;
-    if (!decode_submsg_map_body<KeyWT>(out, res.body, decode_sub)) {
+    if (!decode_submsg_map_body<KeyWT>(out, res.body, decode_sub, st)) {
       return Error{"omnibuf: invalid WireMap submessage payload"};
     }
   }

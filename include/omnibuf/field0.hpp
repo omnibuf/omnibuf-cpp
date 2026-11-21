@@ -68,6 +68,39 @@ inline std::shared_ptr<SchemaMeta> merge_schema_meta_impl(const std::shared_ptr<
   return out;
 }
 
+inline void merge_schema_meta_in_place_impl(SchemaMeta& dst,
+                                            SchemaMeta& next,
+                                            int depth,
+                                            std::set<const SchemaMeta*>& active) {
+  if (&dst == &next || depth > MAX_CONTAINER_DEPTH) return;
+  if (!active.insert(&next).second) {
+    return;
+  }
+  struct ActiveGuard {
+    std::set<const SchemaMeta*>& set;
+    const SchemaMeta* ptr;
+    ~ActiveGuard() { set.erase(ptr); }
+  } next_guard{active, &next};
+
+  if (!next.type_name.empty()) {
+    dst.type_name = std::move(next.type_name);
+  }
+  for (auto& [k, name] : next.fields) {
+    dst.fields[k] = std::move(name);
+  }
+  if (depth + 2 <= MAX_CONTAINER_DEPTH) {
+    for (auto& [k, c] : next.children) {
+      if (!c) continue;
+      auto it = dst.children.find(k);
+      if (it != dst.children.end() && it->second) {
+        merge_schema_meta_in_place_impl(*it->second, *c, depth + 2, active);
+      } else {
+        dst.children[k] = std::move(c);
+      }
+    }
+  }
+}
+
 inline void append_schema_meta_body_impl(std::vector<uint8_t>& dst,
                                          const SchemaMeta& meta,
                                          int depth,
@@ -86,6 +119,9 @@ inline void append_schema_meta_body_impl(std::vector<uint8_t>& dst,
 
   // Field #1: type_name (WireString = 10 -> Tag (1 << 4) | 10 = 26 -> 0x35)
   if (!meta.type_name.empty()) {
+    if (!is_valid_utf8(meta.type_name)) {
+      throw std::invalid_argument("omnibuf: invalid UTF-8 in SchemaMeta type_name");
+    }
     dst.push_back(0x35u);
     append_varint(dst, meta.type_name.size());
     dst.insert(dst.end(), meta.type_name.begin(), meta.type_name.end());
@@ -105,6 +141,9 @@ inline void append_schema_meta_body_impl(std::vector<uint8_t>& dst,
     for (const auto& [k, name] : meta.fields) {
       if (k == 0 || k > MAX_FIELD_NUMBER) {
         throw std::invalid_argument("omnibuf: SchemaMeta field number out of range");
+      }
+      if (!is_valid_utf8(name)) {
+        throw std::invalid_argument("omnibuf: invalid UTF-8 in SchemaMeta field name");
       }
       append_varint(dst, k);
       append_varint(dst, name.size());
@@ -149,6 +188,18 @@ inline std::shared_ptr<SchemaMeta> merge_schema_meta(const std::shared_ptr<Schem
   return detail::merge_schema_meta_impl(base, next, 1, active);
 }
 
+inline void merge_schema_meta_in_place(std::shared_ptr<SchemaMeta>& dst,
+                                       std::shared_ptr<SchemaMeta> next) {
+  if (!next) return;
+  if (!dst) {
+    dst = std::move(next);
+    return;
+  }
+  if (dst.get() == next.get()) return;
+  std::set<const SchemaMeta*> active;
+  detail::merge_schema_meta_in_place_impl(*dst, *next, 1, active);
+}
+
 inline void append_schema_meta_body(std::vector<uint8_t>& dst, const SchemaMeta& meta) {
   std::set<const SchemaMeta*> active;
   detail::append_schema_meta_body_impl(dst, meta, 1, active);
@@ -167,6 +218,16 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
   } catch (...) {
     dst.resize(orig_size);
     throw;
+  }
+}
+
+[[nodiscard]] inline Result<void> try_append_field0_schema_meta(std::vector<uint8_t>& dst,
+                                                                const SchemaMeta& meta) {
+  try {
+    append_field0_schema_meta(dst, meta);
+    return Result<void>::success();
+  } catch (const std::invalid_argument& e) {
+    return Error{e.what()};
   }
 }
 
@@ -287,12 +348,7 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
           return Error{"omnibuf: SchemaMeta children map trailing bytes"};
         }
         for (auto& [key_num, child_meta] : map_children) {
-          auto it = meta->children.find(key_num);
-          if (it != meta->children.end()) {
-            it->second = merge_schema_meta(it->second, child_meta);
-          } else {
-            meta->children[key_num] = std::move(child_meta);
-          }
+          meta->children[key_num] = std::move(child_meta);
         }
         break;
       }
@@ -402,7 +458,7 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
       if (!body_res) return std::nullopt;
       auto meta_res = decode_schema_meta(body_res.value().slice, 1, state);
       if (!meta_res) return std::nullopt;
-      merged = merge_schema_meta(merged, meta_res.value());
+      merge_schema_meta_in_place(merged, std::move(meta_res.value()));
       pos = body_res.value().next_pos;
       continue;
     }

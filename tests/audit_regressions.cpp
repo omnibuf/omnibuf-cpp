@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -14,12 +15,14 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "omnibuf/bench/peer.omnibuf.pb.hpp"
@@ -38,6 +41,7 @@
 namespace {
 
 std::atomic<std::ptrdiff_t> g_live_heap_bytes{0};
+std::atomic<bool> g_fail_allocs{false};
 
 struct AllocPrefix {
   void* base;
@@ -48,6 +52,9 @@ struct AllocPrefix {
 constexpr std::size_t kAllocMagic = 0x4F4D4E4942554631ULL;
 
 void* tracked_alloc_aligned(std::size_t size, std::size_t alignment) noexcept {
+  if (g_fail_allocs.load(std::memory_order_relaxed)) {
+    return nullptr;
+  }
   const std::size_t align =
       std::max<std::size_t>(alignment, alignof(std::max_align_t));
   if ((align & (align - 1)) != 0) {
@@ -933,9 +940,20 @@ void test_cpp10_opaque_oneof_mutual_exclusion_and_unmarshal_dirty() {
 void test_cpp11_opaque_try_get_skips_corrupt_field0() {
   omnibuf::SchemaMeta bad_meta;
   bad_meta.type_name = "PeerUpdate";
-  bad_meta.fields[1] = std::string("\xC3\x28", 2);  // invalid UTF-8 2-byte sequence
+  bad_meta.fields[1] = "XX";
 
   std::vector<uint8_t> pkt = omnibuf::encode_field0_schema_meta(bad_meta);
+  // Corrupt the 2-byte ASCII field name "XX" in-place to an invalid UTF-8 sequence (\xC3\x28).
+  bool patched = false;
+  for (size_t i = 0; i + 1 < pkt.size(); ++i) {
+    if (pkt[i] == 'X' && pkt[i + 1] == 'X') {
+      pkt[i] = 0xC3u;
+      pkt[i + 1] = 0x28u;
+      patched = true;
+      break;
+    }
+  }
+  EXPECT(patched);
   omnibuf::append_tag(pkt, 1, omnibuf::WireUint);
   omnibuf::append_varint(pkt, 123);
 
@@ -1028,6 +1046,392 @@ void test_cpp14_reused_unmarshal_no_capacity_explosion() {
   EXPECT_MSG(reused.neighbors.capacity() <= 64, "neighbors capacity grew unbounded across reused unmarshal");
 }
 
+// ---------------------------------------------------------------------------
+// CPP-15: Linear O(N) Field #0 SchemaMeta merging on repeated empty blocks
+// ---------------------------------------------------------------------------
+void test_cpp15_repeated_field0_linear_merge() {
+  omnibuf::SchemaMeta base;
+  base.type_name = "demo.Large";
+  for (uint32_t i = 1; i <= 50; ++i) {
+    base.fields[i] = "field_name_" + std::to_string(i);
+  }
+  std::vector<uint8_t> pkt = omnibuf::encode_field0_schema_meta(base);
+  // Append 25,000 empty 2-byte Field #0 blocks (Tag 0x19, ByteLen 0 -> 0x01).
+  constexpr size_t kEmptyBlocks = 25000;
+  pkt.reserve(pkt.size() + kEmptyBlocks * 2 + 4);
+  for (size_t i = 0; i < kEmptyBlocks; ++i) {
+    pkt.push_back(0x19u);
+    pkt.push_back(0x01u);
+  }
+  // Append one data field #1 = 42.
+  omnibuf::append_tag(pkt, 1, omnibuf::WireUint);
+  omnibuf::append_varint(pkt, 42);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto meta = omnibuf::read_field0_schema_meta(pkt);
+  const auto blind = omnibuf::decode_blind(pkt);
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+
+  EXPECT(meta.has_value());
+  EXPECT(meta->type_name == "demo.Large");
+  EXPECT(meta->fields.size() == 50);
+  EXPECT_MSG(blind.ok(), blind.error().c_str());
+  EXPECT(blind.value().contains("field_name_1"));
+  EXPECT(std::get<uint64_t>(blind.value().at("field_name_1").v) == 42u);
+  EXPECT_MSG(elapsed_ms < 2000, "Repeated Field #0 merge took too long (possible O(N^2))");
+}
+
+// ---------------------------------------------------------------------------
+// CPP-16: Opaque/View getters must not be noexcept over throwing allocation paths
+// ---------------------------------------------------------------------------
+void test_cpp16_opaque_view_getters_not_noexcept() {
+  static_assert(!noexcept(std::declval<const omnibuf::bench::OpaquePeerUpdate&>().get_asn()));
+  static_assert(!noexcept(std::declval<const omnibuf::bench::OpaquePeerUpdate&>().get_router_id_view()));
+  static_assert(!noexcept(std::declval<const omnibuf::bench::PeerUpdateView&>().get_asn()));
+  static_assert(!noexcept(std::declval<const omnibuf::bench::PeerUpdateView&>().get_router_id()));
+  static_assert(!noexcept(std::declval<const omnibuf::test::OpaqueWideMessage&>().get_f1()));
+  static_assert(!noexcept(omnibuf::read_submsg_arr_elem(std::span<const uint8_t>{}, 1u, 0u)));
+
+#if OMNIBUF_TRACK_HEAP
+  // Build a WideMessage (>64 fields so ensure_dir_() allocates dir_offsets_) with Field #0.
+  omnibuf::test::WideMessage wm;
+  wm.f1 = 77;
+  const std::vector<uint8_t> pkt = wm.marshal_omnibuf({.self_describing = true});
+  omnibuf::test::OpaqueWideMessage opaque(pkt);
+
+  bool caught_bad_alloc = false;
+  g_fail_allocs.store(true, std::memory_order_relaxed);
+  try {
+    (void)opaque.get_f1();
+  } catch (const std::bad_alloc&) {
+    caught_bad_alloc = true;
+  }
+  g_fail_allocs.store(false, std::memory_order_relaxed);
+  EXPECT_MSG(caught_bad_alloc, "OpaqueWideMessage::get_f1() did not propagate std::bad_alloc");
+
+  // Also test View getter when Field #0 validation allocates.
+  omnibuf::test::WideMessageView view(pkt);
+  bool view_caught = false;
+  g_fail_allocs.store(true, std::memory_order_relaxed);
+  try {
+    (void)view.get_f1();
+  } catch (const std::bad_alloc&) {
+    view_caught = true;
+  }
+  g_fail_allocs.store(false, std::memory_order_relaxed);
+  EXPECT_MSG(view_caught, "ViewWideMessage::get_f1() did not propagate std::bad_alloc");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// CPP-17: Opaque container getters enforce max_total_elements & map<K,SubMsg> depth
+// ---------------------------------------------------------------------------
+void test_cpp17_opaque_container_limits_and_map_depth() {
+  // 1) map<int32, InnerPayload> depth check: root(0) -> map(1) -> InnerPayload(2) -> 31 nested = 33 > 32.
+  std::vector<uint8_t> inner_bytes;
+  // Build 31 nested next_inner (field #3, WireSubMsg) layers inside InnerPayload.
+  for (int i = 0; i < 31; ++i) {
+    std::vector<uint8_t> wrap;
+    omnibuf::append_tag(wrap, 3, omnibuf::WireSubMsg);
+    omnibuf::append_varint(wrap, inner_bytes.size());
+    wrap.insert(wrap.end(), inner_bytes.begin(), inner_bytes.end());
+    inner_bytes = std::move(wrap);
+  }
+  // Wrap inner_bytes as a single map<int32, InnerPayload> entry in EdgeShowcase.by_id (field #7).
+  std::vector<uint8_t> map_body;
+  map_body.push_back(omnibuf::WireSint);
+  map_body.push_back(omnibuf::WireSubMsg);
+  omnibuf::append_varint(map_body, 1);  // count = 1
+  omnibuf::append_varint(map_body, omnibuf::encode_zigzag(1));
+  omnibuf::append_varint(map_body, inner_bytes.size());
+  map_body.insert(map_body.end(), inner_bytes.begin(), inner_bytes.end());
+
+  std::vector<uint8_t> pkt;
+  omnibuf::append_tag(pkt, 7, omnibuf::WireMap);
+  omnibuf::append_varint(pkt, map_body.size());
+  pkt.insert(pkt.end(), map_body.begin(), map_body.end());
+
+  omnibuf::test::OpaqueEdgeShowcase opaque(pkt);
+  const auto res = opaque.try_get_by_id();
+  EXPECT_MSG(!res.ok(), "OpaqueEdgeShowcase::try_get_by_id() bypassed max_depth on map<K, SubMsg>");
+
+  // 2) read_scalar_map / try_read_scalar_map enforce DecodeState max_total_elements.
+  std::vector<uint8_t> smap_body;
+  smap_body.push_back(omnibuf::WireUint);
+  smap_body.push_back(omnibuf::WireUint);
+  omnibuf::append_varint(smap_body, 10);
+  for (uint32_t i = 0; i < 10; ++i) {
+    omnibuf::append_varint(smap_body, i);
+    omnibuf::append_varint(smap_body, i * 2);
+  }
+  std::vector<uint8_t> smap_pkt;
+  omnibuf::append_tag(smap_pkt, 1, omnibuf::WireMap);
+  omnibuf::append_varint(smap_pkt, smap_body.size());
+  smap_pkt.insert(smap_pkt.end(), smap_body.begin(), smap_body.end());
+
+  omnibuf::DecodeState small_state{omnibuf::DecodeOptions{.max_total_elements = 5}, 0};
+  const auto mres = omnibuf::try_read_scalar_map<omnibuf::WireUint, omnibuf::WireUint,
+                                                 std::map<uint32_t, uint32_t>>(
+      smap_pkt, 1, &small_state);
+  EXPECT_MSG(!mres.ok(), "try_read_scalar_map bypassed max_total_elements");
+
+  // 3) Opaque repeated scalar getter enforces DecodeOptions::max_total_elements (16M) across
+  // concatenated arrays on PeerUpdate.prefixes (field #8).
+  constexpr size_t kHalfPlusOne = (omnibuf::DecodeOptions{}.max_total_elements / 2u) + 1u;
+  std::vector<uint8_t> big_arr_body;
+  big_arr_body.reserve(kHalfPlusOne + 16);
+  big_arr_body.push_back(omnibuf::WireUint);
+  omnibuf::append_varint(big_arr_body, kHalfPlusOne);
+  big_arr_body.insert(big_arr_body.end(), kHalfPlusOne, 0x01u);
+
+  std::vector<uint8_t> big_pkt;
+  big_pkt.reserve(big_arr_body.size() * 2 + 32);
+  for (int seg = 0; seg < 2; ++seg) {
+    omnibuf::append_tag(big_pkt, 8, omnibuf::WireArray);  // PeerUpdate.prefixes = field #8
+    omnibuf::append_varint(big_pkt, big_arr_body.size());
+    big_pkt.insert(big_pkt.end(), big_arr_body.begin(), big_arr_body.end());
+  }
+  omnibuf::bench::OpaquePeerUpdate big_opaque(big_pkt);
+  const auto arr_res = big_opaque.try_get_prefixes();
+  EXPECT_MSG(!arr_res.ok(), "OpaquePeerUpdate::try_get_prefixes() bypassed max_total_elements");
+}
+
+// ---------------------------------------------------------------------------
+// CPP-18: std::optional<Container> appends/merges concatenated fields
+// ---------------------------------------------------------------------------
+struct OptContainerStruct {
+  std::optional<std::vector<uint32_t>> nums;
+  std::optional<std::map<std::string, uint32_t>> kv;
+};
+
+}  // namespace
+
+template <>
+struct omnibuf::StructTraits<OptContainerStruct> {
+  static constexpr std::string_view type_name = "audit.OptContainerStruct";
+  static constexpr auto fields() {
+    return std::make_tuple(
+        omnibuf::field<1, &OptContainerStruct::nums>("nums"),
+        omnibuf::field<2, &OptContainerStruct::kv>("kv"));
+  }
+};
+
+struct BadUtf8NameStruct {
+  uint32_t x = 0;
+};
+
+template <>
+struct omnibuf::StructTraits<BadUtf8NameStruct> {
+  static constexpr std::string_view type_name = "audit.Bad\xC3\x28Name";
+  static constexpr auto fields() {
+    return std::make_tuple(omnibuf::field<1, &BadUtf8NameStruct::x>("x"));
+  }
+};
+
+struct PmrMapStruct {
+  std::pmr::unordered_map<std::pmr::string, uint32_t> items;
+};
+
+template <>
+struct omnibuf::StructTraits<PmrMapStruct> {
+  static constexpr std::string_view type_name = "audit.PmrMapStruct";
+  static constexpr auto fields() {
+    return std::make_tuple(omnibuf::field<1, &PmrMapStruct::items>("items"));
+  }
+};
+
+namespace {
+
+void test_cpp18_optional_container_concatenation() {
+  std::vector<uint8_t> pkt;
+  // Two concatenated field #1 WireArray(WireUint): [10, 20] then [30].
+  {
+    omnibuf::append_tag(pkt, 1, omnibuf::WireArray);
+    const std::vector<uint32_t> a1 = {10u, 20u};
+    omnibuf::encode_uint_arr(pkt, std::span<const uint32_t>(a1));
+    omnibuf::append_tag(pkt, 1, omnibuf::WireArray);
+    const std::vector<uint32_t> a2 = {30u};
+    omnibuf::encode_uint_arr(pkt, std::span<const uint32_t>(a2));
+  }
+  // Two concatenated field #2 WireMap(WireString, WireUint): {"a":1,"b":2} then {"b":20,"c":3}.
+  auto append_kv_map = [&](const std::vector<std::pair<std::string, uint32_t>>& entries) {
+    std::vector<uint8_t> body;
+    body.push_back(omnibuf::WireString);
+    body.push_back(omnibuf::WireUint);
+    omnibuf::append_varint(body, entries.size());
+    for (const auto& [k, v] : entries) {
+      omnibuf::append_varint(body, k.size());
+      body.insert(body.end(), k.begin(), k.end());
+      omnibuf::append_varint(body, v);
+    }
+    omnibuf::append_tag(pkt, 2, omnibuf::WireMap);
+    omnibuf::append_varint(pkt, body.size());
+    pkt.insert(pkt.end(), body.begin(), body.end());
+  };
+  append_kv_map({{"a", 1u}, {"b", 2u}});
+  append_kv_map({{"b", 20u}, {"c", 3u}});
+
+  OptContainerStruct decoded;
+  const auto res = omnibuf::unmarshal(pkt, decoded);
+  EXPECT_MSG(res.ok(), res.error().c_str());
+  EXPECT(decoded.nums.has_value());
+  EXPECT(*decoded.nums == (std::vector<uint32_t>{10u, 20u, 30u}));
+  EXPECT(decoded.kv.has_value());
+  EXPECT(decoded.kv->size() == 3);
+  EXPECT(decoded.kv->at("a") == 1u);
+  EXPECT(decoded.kv->at("b") == 20u);
+  EXPECT(decoded.kv->at("c") == 3u);
+}
+
+// ---------------------------------------------------------------------------
+// CPP-19: SchemaMeta UTF-8 validation & Result-returning marshal APIs don't throw
+// ---------------------------------------------------------------------------
+void test_cpp19_schema_meta_utf8_and_result_marshal() {
+  omnibuf::SchemaMeta bad_type;
+  bad_type.type_name = std::string("bad\xFF", 4);
+  std::vector<uint8_t> dst = {0xAAu};
+  const auto r1 = omnibuf::try_append_field0_schema_meta(dst, bad_type);
+  EXPECT(!r1.ok());
+  EXPECT(dst == (std::vector<uint8_t>{0xAAu}));
+
+  omnibuf::SchemaMeta bad_field;
+  bad_field.fields[1] = std::string("\xC3\x28", 2);
+  const auto r2 = omnibuf::try_append_field0_schema_meta(dst, bad_field);
+  EXPECT(!r2.ok());
+  EXPECT(dst == (std::vector<uint8_t>{0xAAu}));
+
+  // Result-returning omnibuf::marshal must return Error instead of throwing on SchemaMeta failure.
+  BadUtf8NameStruct s{5};
+  bool threw = false;
+  try {
+    const auto mr = omnibuf::marshal(s, {.self_describing = true});
+    EXPECT(!mr.ok());
+  } catch (...) {
+    threw = true;
+  }
+  EXPECT_MSG(!threw, "omnibuf::marshal threw instead of returning Error on invalid SchemaMeta");
+}
+
+// ---------------------------------------------------------------------------
+// CPP-20: read_submsg validates segment boundaries before concatenating
+// ---------------------------------------------------------------------------
+void test_cpp20_read_submsg_validates_segments() {
+  // Segment 1: truncated field #1 WireUint tag (0x21 = (1<<5)|(0<<1)|1) with NO payload byte.
+  // Segment 2: single byte 0x03 (which if blindly glued onto seg 1 would decode as field #1 = 1!).
+  std::vector<uint8_t> pkt;
+  omnibuf::append_tag(pkt, 1, omnibuf::WireSubMsg);
+  omnibuf::append_varint(pkt, 1);
+  pkt.push_back(0x21u);  // truncated WireUint field #1
+  omnibuf::append_tag(pkt, 1, omnibuf::WireSubMsg);
+  omnibuf::append_varint(pkt, 1);
+  pkt.push_back(0x03u);  // would complete varint if concatenated blindly
+
+  const auto [merged, ok] = omnibuf::read_submsg(pkt, 1);
+  EXPECT_MSG(!ok, "read_submsg concatenated truncated segment without boundary validation");
+  EXPECT(merged.empty());
+
+  const std::array<omnibuf::OneofBranchSpec, 1> grp = {
+      omnibuf::OneofBranchSpec{1u, static_cast<uint16_t>(1u << omnibuf::WireSubMsg)}};
+  const auto oneof_res = omnibuf::read_oneof_submsg(pkt, 1, grp, false);
+  EXPECT_MSG(!oneof_res.valid, "read_oneof_submsg concatenated truncated segment");
+}
+
+// ---------------------------------------------------------------------------
+// CPP-21: parse_blind_container_shape bounded by max_total_elements
+// ---------------------------------------------------------------------------
+void test_cpp21_blind_container_shape_bounded() {
+  // Outer WireArray(WireArray) of 200 empty inner arrays.
+  std::vector<uint8_t> inner_empty;
+  inner_empty.push_back(omnibuf::WireUint);
+  inner_empty.push_back(0x01u);  // count = 0
+
+  std::vector<uint8_t> outer_body;
+  outer_body.push_back(omnibuf::WireArray);
+  omnibuf::append_varint(outer_body, 200);
+  for (int i = 0; i < 200; ++i) {
+    omnibuf::append_varint(outer_body, inner_empty.size());
+    outer_body.insert(outer_body.end(), inner_empty.begin(), inner_empty.end());
+  }
+  std::vector<uint8_t> pkt;
+  omnibuf::append_tag(pkt, 1, omnibuf::WireArray);
+  omnibuf::append_varint(pkt, outer_body.size());
+  pkt.insert(pkt.end(), outer_body.begin(), outer_body.end());
+
+  const auto fail_res = omnibuf::decode_blind(pkt, {.max_total_elements = 100});
+  EXPECT_MSG(!fail_res.ok(), "decode_blind bypassed max_total_elements in parse_blind_container_shape");
+
+  // Legitimate nested array with 200 elements must still succeed under max_total_elements = 200 (no double-charge).
+  const auto ok_res = omnibuf::decode_blind(pkt, {.max_total_elements = 200});
+  EXPECT_MSG(ok_res.ok(), ok_res.error().c_str());
+}
+
+// ---------------------------------------------------------------------------
+// CPP-22: rebind_pmr_member exception safety for std::pmr::unordered_map
+// ---------------------------------------------------------------------------
+void test_cpp22_rebind_pmr_unordered_map_exception_safety() {
+  PmrMapStruct src;
+  src.items.emplace(std::pmr::string("k1"), 11u);
+  const auto wire = omnibuf::marshal(src);
+  EXPECT_MSG(wire.ok(), wire.error().c_str());
+
+  PmrMapStruct target;
+  target.items.emplace(std::pmr::string("existing"), 99u);
+  // Force allocation failure during rebind_pmr_member via null_memory_resource.
+  // Note: unordered_map(Alloc(mr)) may allocate eagerly or lazily depending on stdlib;
+  // either way, unmarshal_pmr throws std::bad_alloc without double-destroying target.items.
+  bool caught = false;
+  try {
+    (void)omnibuf::unmarshal_pmr(wire.value(), target, std::pmr::null_memory_resource());
+  } catch (const std::bad_alloc&) {
+    caught = true;
+  }
+  EXPECT_MSG(caught, "unmarshal_pmr with null_memory_resource did not throw std::bad_alloc");
+  // target destructor runs cleanly at scope exit (no UB / double-destroy).
+}
+
+// ---------------------------------------------------------------------------
+// CPP-23: Repeated Field #3 inside a single SchemaMeta uses replace-by-key
+// ---------------------------------------------------------------------------
+void test_cpp23_schema_meta_repeated_field3_replace_by_key() {
+  omnibuf::SchemaMeta c1;
+  c1.fields[10] = "old_a";
+  c1.fields[11] = "old_b";
+  omnibuf::SchemaMeta c2;
+  c2.fields[10] = "new_a";
+
+  std::vector<uint8_t> c1_body;
+  omnibuf::append_schema_meta_body(c1_body, c1);
+  std::vector<uint8_t> c2_body;
+  omnibuf::append_schema_meta_body(c2_body, c2);
+
+  auto append_child_map = [](std::vector<uint8_t>& dst, const std::vector<uint8_t>& child_body) {
+    // Field #3: WireMap(WireUint, WireSubMsg), 1 entry with key = 1
+    std::vector<uint8_t> mbody;
+    mbody.push_back(omnibuf::WireUint);
+    mbody.push_back(omnibuf::WireSubMsg);
+    omnibuf::append_varint(mbody, 1);
+    omnibuf::append_varint(mbody, 1);  // child field key = 1
+    omnibuf::append_varint(mbody, child_body.size());
+    mbody.insert(mbody.end(), child_body.begin(), child_body.end());
+    dst.push_back(0x7Du);  // Tag (3 << 4) | WireMap(14) = 62 -> 0x7D
+    omnibuf::append_varint(dst, mbody.size());
+    dst.insert(dst.end(), mbody.begin(), mbody.end());
+  };
+
+  std::vector<uint8_t> single_meta_body;
+  append_child_map(single_meta_body, c1_body);
+  append_child_map(single_meta_body, c2_body);
+
+  const auto res = omnibuf::decode_schema_meta(single_meta_body);
+  EXPECT_MSG(res.ok(), res.error().c_str());
+  const auto& child = res.value()->children.at(1);
+  EXPECT(child->fields.size() == 1);
+  EXPECT(child->fields.at(10) == "new_a");
+  EXPECT(!child->fields.contains(11));
+}
+
 }  // namespace
 
 int main() {
@@ -1043,6 +1447,15 @@ int main() {
   RUN_CASE(test_cpp12_decode_blind_max_total_elements_depth_mult);
   RUN_CASE(test_cpp13_fast_writer_exception_zero_tail);
   RUN_CASE(test_cpp14_reused_unmarshal_no_capacity_explosion);
+  RUN_CASE(test_cpp15_repeated_field0_linear_merge);
+  RUN_CASE(test_cpp16_opaque_view_getters_not_noexcept);
+  RUN_CASE(test_cpp17_opaque_container_limits_and_map_depth);
+  RUN_CASE(test_cpp18_optional_container_concatenation);
+  RUN_CASE(test_cpp19_schema_meta_utf8_and_result_marshal);
+  RUN_CASE(test_cpp20_read_submsg_validates_segments);
+  RUN_CASE(test_cpp21_blind_container_shape_bounded);
+  RUN_CASE(test_cpp22_rebind_pmr_unordered_map_exception_safety);
+  RUN_CASE(test_cpp23_schema_meta_repeated_field3_replace_by_key);
 
   std::printf("\nAudit Regression Summary: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

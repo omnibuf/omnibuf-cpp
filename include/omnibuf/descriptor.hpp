@@ -1490,7 +1490,8 @@ struct DecodedMapKey {
       meta = detail::build_proto_value_schema_meta(&desc, msg, 1);
     }
     if (meta) {
-      append_field0_schema_meta(dst, *meta);
+      auto f0_res = try_append_field0_schema_meta(dst, *meta);
+      if (!f0_res) return Error{f0_res.error()};
     }
   }
   auto res = detail::encode_dynamic_msg(dst, desc, msg);

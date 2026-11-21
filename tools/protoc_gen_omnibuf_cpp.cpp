@@ -299,7 +299,7 @@ std::optional<std::string> validate_message_tree(const std::string& prefix,
       return "omnibuf: field extensions are not supported: " + ffull;
     }
     if (f.number == 0 || f.number > omnibuf::MAX_FIELD_NUMBER) {
-      return "omnibuf: field number out of OmniBuf range [1..16777215]: " + ffull;
+      return "omnibuf: field number out of OmniBuf range [1..536870911]: " + ffull;
     }
     if (!f.has_type || f.type == FieldType::Unknown) {
       return "omnibuf: unknown or missing descriptor field type: " + ffull;
@@ -1810,7 +1810,8 @@ void emit_struct_methods(std::ostringstream& out,
   out << "      meta = value_schema_meta(1);\n";
   out << "    }\n";
   out << "    if (meta) {\n";
-  out << "      ::omnibuf::append_field0_schema_meta(dst, *meta);\n";
+  out << "      auto f0_res = ::omnibuf::try_append_field0_schema_meta(dst, *meta);\n";
+  out << "      if (!f0_res) return ::omnibuf::Error{f0_res.error()};\n";
   out << "    }\n";
   out << "  }\n";
   out << "  const size_t root_hint = min_wire_size(0);\n";
@@ -2485,21 +2486,23 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
           cls_out << "  [[nodiscard]] " << m_type << " get_" << f.name << "() const {\n";
           cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+          cls_out << "    ::omnibuf::DecodeState state{};\n";
           cls_out << "    return ::omnibuf::read_submsg_map<" << wire_const_expr(mi.key_type)
                   << ", " << m_type << ">(raw(), " << fnum
-                  << "u, [](std::span<const uint8_t> sb, auto& sv) {\n";
-          cls_out << "      return sv.unmarshal_omnibuf(sb).ok();\n";
-          cls_out << "    }).first;\n";
+                  << "u, [&state](std::span<const uint8_t> sb, auto& sv) {\n";
+          cls_out << "      return sv.decode_omnibuf_raw(sb, 2, false, true, state) == nullptr;\n";
+          cls_out << "    }, &state).first;\n";
           cls_out << "  }\n";
 
           cls_out << "  [[nodiscard]] ::omnibuf::Result<" << m_type << "> try_get_" << f.name
                   << "() const {\n";
           cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+          cls_out << "    ::omnibuf::DecodeState state{};\n";
           cls_out << "    return ::omnibuf::try_read_submsg_map<" << wire_const_expr(mi.key_type)
                   << ", " << m_type << ">(raw(), " << fnum
-                  << "u, [](std::span<const uint8_t> sb, auto& sv) {\n";
-          cls_out << "      return sv.unmarshal_omnibuf(sb).ok();\n";
-          cls_out << "    });\n";
+                  << "u, [&state](std::span<const uint8_t> sb, auto& sv) {\n";
+          cls_out << "      return sv.decode_omnibuf_raw(sb, 2, false, true, state) == nullptr;\n";
+          cls_out << "    }, &state);\n";
           cls_out << "  }\n";
         } else {
           const std::string v_cpp =
@@ -2523,17 +2526,19 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
           cls_out << "  [[nodiscard]] " << m_type << " get_" << f.name << "() const {\n";
           cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+          cls_out << "    ::omnibuf::DecodeState state{};\n";
           cls_out << "    return ::omnibuf::read_scalar_map<" << wire_const_expr(mi.key_type)
                   << ", " << wire_const_expr(mi.val_type) << ", " << m_type << ">(raw(), " << fnum
-                  << "u).first;\n";
+                  << "u, &state).first;\n";
           cls_out << "  }\n";
 
           cls_out << "  [[nodiscard]] ::omnibuf::Result<" << m_type << "> try_get_" << f.name
                   << "() const {\n";
           cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+          cls_out << "    ::omnibuf::DecodeState state{};\n";
           cls_out << "    return ::omnibuf::try_read_scalar_map<" << wire_const_expr(mi.key_type)
                   << ", " << wire_const_expr(mi.val_type) << ", " << m_type << ">(raw(), " << fnum
-                  << "u);\n";
+                  << "u, &state);\n";
           cls_out << "  }\n";
         }
 
@@ -2708,43 +2713,44 @@ void emit_opaque_class(std::ostringstream& cls_out,
       auto emit_arr_lambda = [&](std::ostringstream& os) {
         switch (f.type) {
           case FieldType::String:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_string_arr_body(v, b); }";
+            os << "[&state](auto& v, auto b) { return ::omnibuf::append_string_arr_body(v, b, &state); }";
             break;
           case FieldType::Bytes:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_bytes_arr_body(v, b); }";
+            os << "[&state](auto& v, auto b) { return ::omnibuf::append_bytes_arr_body(v, b, &state); }";
             break;
           case FieldType::Bool:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_bool_arr_body(v, b); }";
+            os << "[&state](auto& v, auto b) { return ::omnibuf::append_bool_arr_body(v, b, &state); }";
             break;
           case FieldType::Uint32:
           case FieldType::Uint64:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_uint_arr_body(v, b); }";
+            os << "[&state](auto& v, auto b) { return ::omnibuf::append_uint_arr_body(v, b, &state); }";
             break;
           case FieldType::Int32:
           case FieldType::Sint32:
           case FieldType::Int64:
           case FieldType::Sint64:
           case FieldType::Enum:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_sint_arr_body(v, b); }";
+            os << "[&state](auto& v, auto b) { return ::omnibuf::append_sint_arr_body(v, b, &state); }";
             break;
           case FieldType::Fixed32:
           case FieldType::Sfixed32:
           case FieldType::Float:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_fixed32_arr_body(v, b, "
-               << static_cast<uint32_t>(elem_wt) << "u); }";
+            os << "[&state](auto& v, auto b) { return ::omnibuf::append_fixed32_arr_body(v, b, "
+               << static_cast<uint32_t>(elem_wt) << "u, &state); }";
             break;
           case FieldType::Fixed64:
           case FieldType::Sfixed64:
           case FieldType::Double:
           default:
-            os << "[](auto& v, auto b) { return ::omnibuf::append_fixed64_arr_body(v, b, "
-               << static_cast<uint32_t>(elem_wt) << "u); }";
+            os << "[&state](auto& v, auto b) { return ::omnibuf::append_fixed64_arr_body(v, b, "
+               << static_cast<uint32_t>(elem_wt) << "u, &state); }";
             break;
         }
       };
 
       cls_out << "  [[nodiscard]] std::vector<" << cpp_t << "> get_" << f.name << "() const {\n";
       cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+      cls_out << "    ::omnibuf::DecodeState state{};\n";
       cls_out << "    std::vector<" << cpp_t << "> dst;\n";
       cls_out << "    (void)::omnibuf::read_arrays_into(dst, raw(), " << fnum << "u, ";
       emit_arr_lambda(cls_out);
@@ -2755,6 +2761,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
       cls_out << "  [[nodiscard]] ::omnibuf::Result<std::vector<" << cpp_t << ">> try_get_"
               << f.name << "() const {\n";
       cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+      cls_out << "    ::omnibuf::DecodeState state{};\n";
       cls_out << "    return ::omnibuf::try_read_arrays<std::vector<" << cpp_t << ">>(raw(), "
               << fnum << "u, ";
       emit_arr_lambda(cls_out);
@@ -2954,7 +2961,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
     }
 
     if (f.type == FieldType::String) {
-      cls_out << "  [[nodiscard]] std::string_view get_" << f.name << "_view() const noexcept {\n";
+      cls_out << "  [[nodiscard]] std::string_view get_" << f.name << "_view() const {\n";
       cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
@@ -3024,7 +3031,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
 
     if (f.type == FieldType::Bytes) {
       cls_out << "  [[nodiscard]] std::span<const uint8_t> get_" << f.name
-              << "_view() const noexcept {\n";
+              << "_view() const {\n";
       cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
       if (is_oneof) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
@@ -3086,7 +3093,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
       continue;
     }
 
-    cls_out << "  [[nodiscard]] " << cpp_t << " get_" << f.name << "() const noexcept {\n";
+    cls_out << "  [[nodiscard]] " << cpp_t << " get_" << f.name << "() const {\n";
     cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
     if (is_oneof) {
       const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
@@ -3356,7 +3363,7 @@ void emit_opaque_class(std::ostringstream& cls_out,
   cls_out << "    if (!arena_) arena_ = std::make_shared<::omnibuf::OpaqueArena>();\n";
   cls_out << "    return *arena_;\n";
   cls_out << "  }\n";
-  cls_out << "  [[nodiscard]] uint8_t ensure_dir_() const noexcept {\n";
+  cls_out << "  [[nodiscard]] uint8_t ensure_dir_() const {\n";
   if (num_fields > 0) {
     cls_out << "    if (dir_state_ == 0u) {\n";
     if (num_fields > 64) {
@@ -3513,9 +3520,9 @@ void emit_view_struct(std::ostringstream& cls_out,
         cls_out << "    return ::omnibuf::submsg_arr_len(raw_, " << fnum << "u);\n";
         cls_out << "  }\n";
         cls_out << "  [[nodiscard]] " << sub_view << " get_" << f.name
-                << "(size_t idx) const noexcept;\n";
+                << "(size_t idx) const;\n";
         out_of_line_out << "inline " << sub_view << " " << cls << "::get_" << f.name
-                        << "(size_t idx) const noexcept {\n";
+                        << "(size_t idx) const {\n";
         out_of_line_out << "  const auto [elem, ok] = ::omnibuf::read_submsg_arr_elem(raw_, "
                         << fnum << "u, idx);\n";
         out_of_line_out << "  return ok ? " << sub_view << "(elem) : " << sub_view << "{};\n";
@@ -3523,11 +3530,11 @@ void emit_view_struct(std::ostringstream& cls_out,
         continue;
       }
 
-      cls_out << "  [[nodiscard]] " << sub_view << " get_" << f.name << "() const noexcept;\n";
+      cls_out << "  [[nodiscard]] " << sub_view << " get_" << f.name << "() const;\n";
       cls_out << "  [[nodiscard]] ::omnibuf::Result<std::optional<" << sub_view << ">> try_get_"
               << f.name << "() const;\n";
       out_of_line_out << "inline " << sub_view << " " << cls << "::get_" << f.name
-                      << "() const noexcept {\n";
+                      << "() const {\n";
       if (is_oneof) {
         out_of_line_out << "  const auto [sl, ok] = ::omnibuf::locate_last_oneof_submsg_slice(raw_, "
                         << fnum << "u, " << oneof_group_ref << ");\n";
@@ -3572,7 +3579,7 @@ void emit_view_struct(std::ostringstream& cls_out,
     if (f.type == FieldType::String) {
       if (is_opt_scalar) {
         cls_out << "  [[nodiscard]] std::optional<std::string_view> get_" << f.name
-                << "() const noexcept {\n";
+                << "() const {\n";
         cls_out << "    const auto [sv, ok] = " << fn_prefix << "string_view(raw_, " << fnum << "u"
                 << extra_arg << ");\n";
         cls_out << "    return ok ? std::optional<std::string_view>{sv} : std::nullopt;\n";
@@ -3583,7 +3590,7 @@ void emit_view_struct(std::ostringstream& cls_out,
                 << ");\n";
         cls_out << "  }\n";
       } else {
-        cls_out << "  [[nodiscard]] std::string_view get_" << f.name << "() const noexcept {\n";
+        cls_out << "  [[nodiscard]] std::string_view get_" << f.name << "() const {\n";
         cls_out << "    return " << fn_prefix << "string_view(raw_, " << fnum << "u" << extra_arg
                 << ").first;\n";
         cls_out << "  }\n";
@@ -3601,7 +3608,7 @@ void emit_view_struct(std::ostringstream& cls_out,
     if (f.type == FieldType::Bytes) {
       if (is_opt_scalar) {
         cls_out << "  [[nodiscard]] std::optional<std::span<const uint8_t>> get_" << f.name
-                << "() const noexcept {\n";
+                << "() const {\n";
         cls_out << "    const auto [sp, ok] = " << fn_prefix << "bytes_view(raw_, " << fnum << "u"
                 << extra_arg << ");\n";
         cls_out << "    return ok ? std::optional<std::span<const uint8_t>>{sp} : std::nullopt;\n";
@@ -3613,7 +3620,7 @@ void emit_view_struct(std::ostringstream& cls_out,
         cls_out << "  }\n";
       } else {
         cls_out << "  [[nodiscard]] std::span<const uint8_t> get_" << f.name
-                << "() const noexcept {\n";
+                << "() const {\n";
         cls_out << "    return " << fn_prefix << "bytes_view(raw_, " << fnum << "u" << extra_arg
                 << ").first;\n";
         cls_out << "  }\n";
@@ -3661,7 +3668,7 @@ void emit_view_struct(std::ostringstream& cls_out,
 
     if (is_opt_scalar) {
       cls_out << "  [[nodiscard]] std::optional<" << cpp_t << "> get_" << f.name
-              << "() const noexcept {\n";
+              << "() const {\n";
       cls_out << "    const auto [v, ok] = " << fn_prefix << rsuf << "(raw_, " << fnum << "u"
               << extra_arg << ");\n";
       if (f.type == FieldType::Enum) {
@@ -3688,7 +3695,7 @@ void emit_view_struct(std::ostringstream& cls_out,
       }
       cls_out << "  }\n";
     } else {
-      cls_out << "  [[nodiscard]] " << cpp_t << " get_" << f.name << "() const noexcept {\n";
+      cls_out << "  [[nodiscard]] " << cpp_t << " get_" << f.name << "() const {\n";
       if (f.type == FieldType::Enum) {
         cls_out << "    return static_cast<" << cpp_t << ">(static_cast<int32_t>(" << fn_prefix
                 << rsuf << "(raw_, " << fnum << "u" << extra_arg << ").first));\n";

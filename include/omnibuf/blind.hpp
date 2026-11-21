@@ -225,6 +225,9 @@ struct BlindContainerShapeResult {
     if (!hdr.ok) {
       return Error{"omnibuf: invalid WireArray header"};
     }
+    if (!state.charge_elements(hdr.count)) {
+      return Error{"omnibuf: total decoded elements exceed max_total_elements"};
+    }
     if (hdr.elem_wt != WireArray && hdr.elem_wt != WireMap) {
       auto leaf = std::make_shared<BlindShape>(BlindShape{hdr.elem_wt, 0, false, nullptr});
       auto outer = std::make_shared<BlindShape>(BlindShape{WireArray, 0, false, std::move(leaf)});
@@ -263,6 +266,9 @@ struct BlindContainerShapeResult {
   const auto hdr = parse_map_header(body);
   if (!hdr.ok) {
     return Error{"omnibuf: invalid WireMap header"};
+  }
+  if (!state.charge_elements(hdr.count)) {
+    return Error{"omnibuf: total decoded elements exceed max_total_elements"};
   }
   if (hdr.val_wt != WireArray && hdr.val_wt != WireMap) {
     auto leaf = std::make_shared<BlindShape>(BlindShape{hdr.val_wt, 0, false, nullptr});
@@ -312,7 +318,8 @@ struct BlindContainerShapeResult {
   if (wt != WireArray && wt != WireMap) {
     return std::make_shared<const BlindShape>(BlindShape{wt, 0, false, nullptr});
   }
-  auto res = parse_blind_container_shape(data, pos, wt, depth, state);
+  DecodeState shape_state = state;
+  auto res = parse_blind_container_shape(data, pos, wt, depth, shape_state);
   if (!res) return Error{res.error()};
   return res.value().shape;
 }
@@ -603,7 +610,7 @@ struct MapValResult {
       if (!f0_body) return Error{f0_body.error()};
       auto meta = decode_schema_meta(f0_body.value().slice, depth + 1, state);
       if (!meta) return Error{meta.error()};
-      local_schema = merge_schema_meta(local_schema, meta.value());
+      merge_schema_meta_in_place(local_schema, std::move(meta.value()));
       scan = f0_body.value().next_pos;
     } else {
       auto skip_res = skip_value(data, scan, wt);
