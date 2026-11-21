@@ -799,13 +799,15 @@ size_t field_max_fixed_wire_bytes(const FieldDescriptorProto& f) {
   }
 }
 
-void emit_flat_leaf_ptr_body(std::ostringstream& out,
-                             const DescriptorProto& msg,
-                             const MessagePlan& plan,
-                             bool is_proto2,
-                             std::string_view p_var,
-                             std::string_view indent) {
-  for (size_t i = 0; i < msg.fields.size(); ++i) {
+void emit_flat_leaf_ptr_range(std::ostringstream& out,
+                              const DescriptorProto& msg,
+                              const MessagePlan& plan,
+                              bool is_proto2,
+                              size_t begin_idx,
+                              size_t end_idx,
+                              std::string_view p_var,
+                              std::string_view indent) {
+  for (size_t i = begin_idx; i < end_idx; ++i) {
     const auto& f = msg.fields[i];
     const bool is_opt = is_explicit_optional_scalar(f, is_proto2);
     const std::string val_expr = is_opt ? ("(*" + plan.field_idents[i] + ")") : plan.field_idents[i];
@@ -1676,12 +1678,61 @@ void emit_struct_methods(std::ostringstream& out,
     out << "  if (max_bytes <= 512u) [[likely]] {\n";
     out << "    w.ensure(max_bytes);\n";
     out << "    uint8_t* p = w.raw_cur();\n";
-    emit_flat_leaf_ptr_body(out, msg, plan, rec.is_proto2, "p", "    ");
+    emit_flat_leaf_ptr_range(out, msg, plan, rec.is_proto2, 0, msg.fields.size(), "p", "    ");
     out << "    w.set_raw_cur(p);\n";
     out << "    return nullptr;\n";
     out << "  }\n";
   }
-  for (size_t i = 0; i < msg.fields.size(); ++i) {
+  for (size_t i = 0; i < msg.fields.size();) {
+    // Coalesce contiguous runs of >= 2 non-oneof, non-repeated, non-message scalar fields
+    // into a single w.ensure(...) + raw-pointer write block when bounded <= 512 bytes.
+    auto is_run_scalar = [&](size_t idx) -> bool {
+      const auto& rf = msg.fields[idx];
+      return rf.label != FieldLabel::Repeated && rf.type != FieldType::Message &&
+             rf.type != FieldType::Group && !is_real_oneof_field(rf);
+    };
+    if (!is_leaf && is_run_scalar(i)) {
+      size_t j = i;
+      size_t run_fixed_max = 0;
+      std::vector<std::string> run_var_exprs;
+      while (j < msg.fields.size() && is_run_scalar(j)) {
+        const auto& rf = msg.fields[j];
+        run_fixed_max += field_max_fixed_wire_bytes(rf);
+        if (rf.type == FieldType::String || rf.type == FieldType::Bytes) {
+          const bool is_opt = is_explicit_optional_scalar(rf, rec.is_proto2);
+          if (is_opt) {
+            run_var_exprs.push_back("(" + plan.field_idents[j] + ".has_value() ? " +
+                                    plan.field_idents[j] + "->size() : 0u)");
+          } else {
+            run_var_exprs.push_back(plan.field_idents[j] + ".size()");
+          }
+        }
+        ++j;
+      }
+      if (j - i >= 2) {
+        out << "  {\n";
+        out << "    size_t run_max = " << run_fixed_max << "u;\n";
+        for (const auto& expr : run_var_exprs) {
+          out << "    run_max += " << expr << ";\n";
+        }
+        out << "    if (run_max <= 512u) [[likely]] {\n";
+        out << "      w.ensure(run_max);\n";
+        out << "      uint8_t* p = w.raw_cur();\n";
+        emit_flat_leaf_ptr_range(out, msg, plan, rec.is_proto2, i, j, "p", "      ");
+        out << "      w.set_raw_cur(p);\n";
+        out << "    } else {\n";
+        for (size_t k = i; k < j; ++k) {
+          const auto& fk = msg.fields[k];
+          const bool is_opt_k = is_explicit_optional_scalar(fk, rec.is_proto2);
+          emit_try_encode_field_fast(out, fk, plan.field_idents[k], is_opt_k, "", catalog, "w",
+                                     "depth", "check_large", "      ");
+        }
+        out << "    }\n";
+        out << "  }\n";
+        i = j;
+        continue;
+      }
+    }
     const auto& f = msg.fields[i];
     const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
     std::string oneof_guard;
@@ -1691,6 +1742,7 @@ void emit_struct_methods(std::ostringstream& out,
     }
     emit_try_encode_field_fast(out, f, plan.field_idents[i], is_opt_scalar, oneof_guard, catalog,
                                "w", "depth", "check_large", "  ");
+    ++i;
   }
   out << "  return nullptr;\n";
   out << "}\n\n";
@@ -1709,7 +1761,7 @@ void emit_struct_methods(std::ostringstream& out,
     out << "    w.ensure(2u + max_bytes);\n";
     out << "    uint8_t* const start = w.raw_cur();\n";
     out << "    uint8_t* p = start + 2;\n";
-    emit_flat_leaf_ptr_body(out, msg, plan, rec.is_proto2, "p", "    ");
+    emit_flat_leaf_ptr_range(out, msg, plan, rec.is_proto2, 0, msg.fields.size(), "p", "    ");
     out << "    const size_t body_len = static_cast<size_t>(p - (start + 2));\n";
     out << "    ::omnibuf::write_u16_le(start, static_cast<uint16_t>((body_len << 2) | 2u));\n";
     out << "    w.set_raw_cur(p);\n";

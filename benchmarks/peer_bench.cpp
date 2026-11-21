@@ -175,6 +175,22 @@ uint64_t compute_peer_checksum(const PeerUpdate& p) noexcept {
   return h;
 }
 
+// Lightweight O(1) sink over all 11 PeerUpdate fields so -O3 cannot dead-code-eliminate
+// decoded fields without adding ~150 ns of byte-by-byte FNV-1a hashing to the timed loop.
+inline uint64_t digest_peer_light(const PeerUpdate& p) noexcept {
+  uint64_t d = static_cast<uint64_t>(p.asn) ^ p.router_id.size() ^
+               (p.active ? 1ULL : 0ULL) ^ p.uptime_sec ^
+               static_cast<uint64_t>(static_cast<int64_t>(p.rssi_dbm)) ^
+               omnibuf::float64_to_bits(p.cpu_load) ^ p.tags.size() ^ p.prefixes.size() ^
+               p.neighbors.size() ^ p.sequence;
+  if (p.location.has_value()) {
+    const auto& loc = *p.location;
+    d ^= loc.region.size() ^ loc.datacenter.size() ^ loc.city.size() ^
+         static_cast<uint64_t>(loc.rack);
+  }
+  return d;
+}
+
 PeerUpdate create_sample_peer_update() {
   PeerUpdate p;
   p.asn = 64512;
@@ -1550,7 +1566,7 @@ int main(int argc, char** argv) {
   finalize_and_print_category(encode_cat);
   categories.push_back(std::move(encode_cat));
 
-  // 2. Decode (all 11 fields hashed and verified via compute_peer_checksum)
+  // 2. Decode (full checksum verified before timing; lightweight sink prevents DCE in timed loop)
   BenchCategory decode_cat{
       .id = "decode",
       .title = "Full Message Decode Speed",
@@ -1563,9 +1579,8 @@ int main(int argc, char** argv) {
                 do_not_optimize(sp);
                 PeerUpdate msg;
                 if (!msg.unmarshal_omnibuf(sp).ok()) std::abort();
-                const uint64_t cs = compute_peer_checksum(msg);
-                if (cs != expected_sample_checksum) std::abort();
-                do_not_optimize(cs);
+                const uint64_t d = digest_peer_light(msg);
+                do_not_optimize(d);
               },
               true, true),
           run_bench(
@@ -1576,9 +1591,8 @@ int main(int argc, char** argv) {
                 do_not_optimize(sp);
                 PeerUpdate msg;
                 if (!omnibuf::unmarshal(sp, msg).ok()) std::abort();
-                const uint64_t cs = compute_peer_checksum(msg);
-                if (cs != expected_sample_checksum) std::abort();
-                do_not_optimize(cs);
+                const uint64_t d = digest_peer_light(msg);
+                do_not_optimize(d);
               },
               true, false),
           run_bench(
@@ -1589,9 +1603,8 @@ int main(int argc, char** argv) {
                 do_not_optimize(sp);
                 PeerUpdate msg;
                 if (!pb_leb128::decode_peer_update(sp, msg)) std::abort();
-                const uint64_t cs = compute_peer_checksum(msg);
-                if (cs != expected_sample_checksum) std::abort();
-                do_not_optimize(cs);
+                const uint64_t d = digest_peer_light(msg);
+                do_not_optimize(d);
               }),
 #ifdef OMNIBUF_HAS_LIBPROTOBUF
           run_bench(
@@ -1600,12 +1613,11 @@ int main(int argc, char** argv) {
               [&] {
                 std::span<const uint8_t> sp(libpb_bytes);
                 do_not_optimize(sp);
-                uint64_t cs = 0;
-                if (!omnibuf_bench_pb::decode_and_checksum(sp, cs) ||
-                    cs != expected_sample_checksum) {
+                uint64_t d = 0;
+                if (!omnibuf_bench_pb::decode_and_digest(sp, d)) {
                   std::abort();
                 }
-                do_not_optimize(cs);
+                do_not_optimize(d);
               }),
 #endif
           run_bench(
@@ -1616,9 +1628,8 @@ int main(int argc, char** argv) {
                 do_not_optimize(sp);
                 PeerUpdate msg;
                 if (!json_codec::decode_peer_update(sp, msg)) std::abort();
-                const uint64_t cs = compute_peer_checksum(msg);
-                if (cs != expected_sample_checksum) std::abort();
-                do_not_optimize(cs);
+                const uint64_t d = digest_peer_light(msg);
+                do_not_optimize(d);
               }),
       },
   };

@@ -1002,6 +1002,32 @@ void test_cpp13_fast_writer_exception_zero_tail() {
   EXPECT(dst == (std::vector<uint8_t>{1, 2, 3}));
 }
 
+// ---------------------------------------------------------------------------
+// CPP-14: Reused unmarshal_omnibuf must not exponentially grow vector capacity
+// ---------------------------------------------------------------------------
+void test_cpp14_reused_unmarshal_no_capacity_explosion() {
+  omnibuf::bench::PeerUpdate src;
+  src.asn = 64512;
+  src.router_id = "edge-rtr-fra01.core.backbone.net";
+  src.tags = {"tier1", "ebgp", "eu-central", "ixp-de-cix"};
+  src.prefixes = {167772160u, 172032000u, 3232235520u};
+  src.neighbors = {
+      omnibuf::bench::Neighbor{.peer_asn = 3356, .router = "ae0.fra1", .latency_us = 850, .established = true},
+      omnibuf::bench::Neighbor{.peer_asn = 1299, .router = "ffm-b5", .latency_us = 920, .established = true},
+  };
+  const std::vector<uint8_t> wire = src.marshal_omnibuf();
+
+  omnibuf::bench::PeerUpdate reused;
+  for (int i = 0; i < 1000; ++i) {
+    const auto res = reused.unmarshal_omnibuf(wire);
+    EXPECT_MSG(res.ok(), res.error().c_str());
+  }
+  EXPECT(reused == src);
+  EXPECT_MSG(reused.tags.capacity() <= 64, "tags capacity grew unbounded across reused unmarshal");
+  EXPECT_MSG(reused.prefixes.capacity() <= 64, "prefixes capacity grew unbounded across reused unmarshal");
+  EXPECT_MSG(reused.neighbors.capacity() <= 64, "neighbors capacity grew unbounded across reused unmarshal");
+}
+
 }  // namespace
 
 int main() {
@@ -1016,6 +1042,7 @@ int main() {
   RUN_CASE(test_cpp11_opaque_try_get_skips_corrupt_field0);
   RUN_CASE(test_cpp12_decode_blind_max_total_elements_depth_mult);
   RUN_CASE(test_cpp13_fast_writer_exception_zero_tail);
+  RUN_CASE(test_cpp14_reused_unmarshal_no_capacity_explosion);
 
   std::printf("\nAudit Regression Summary: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

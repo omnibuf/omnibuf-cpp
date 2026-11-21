@@ -571,6 +571,9 @@ struct SliceStep {
 }
 
 [[nodiscard]] inline size_t grow_capacity(size_t current, size_t required) noexcept {
+  if (current >= required) {
+    return current;
+  }
   if (current <= (SIZE_MAX / 4) && current * 2 > required) {
     return current * 2;
   }

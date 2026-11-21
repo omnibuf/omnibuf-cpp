@@ -22,6 +22,7 @@ PeerHandlePtr make_routing_32_handle();
 
 std::string encode_handle(const PeerHandle& h);
 bool decode_and_checksum(std::span<const uint8_t> wire, uint64_t& checksum_out);
+bool decode_and_digest(std::span<const uint8_t> wire, uint64_t& digest_out);
 bool lookup_city(std::span<const uint8_t> wire, std::string& city_out);
 bool mutate_sequence(std::span<const uint8_t> wire, std::string& out_wire);
 bool mutate_embedded_grow(std::span<const uint8_t> wire,

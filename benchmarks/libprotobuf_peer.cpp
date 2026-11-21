@@ -159,6 +159,27 @@ bool decode_and_checksum(std::span<const uint8_t> wire, uint64_t& checksum_out) 
   return true;
 }
 
+bool decode_and_digest(std::span<const uint8_t> wire, uint64_t& digest_out) {
+  libpb::bench::PeerUpdate msg;
+  if (!msg.ParseFromArray(wire.data(), static_cast<int>(wire.size()))) {
+    return false;
+  }
+  uint64_t d = static_cast<uint64_t>(msg.asn()) ^ msg.router_id().size() ^
+               (msg.active() ? 1ULL : 0ULL) ^ msg.uptime_sec() ^
+               static_cast<uint64_t>(static_cast<int64_t>(msg.rssi_dbm())) ^
+               std::bit_cast<uint64_t>(msg.cpu_load()) ^
+               static_cast<uint64_t>(msg.tags_size()) ^
+               static_cast<uint64_t>(msg.prefixes_size()) ^
+               static_cast<uint64_t>(msg.neighbors_size()) ^ msg.sequence();
+  if (msg.has_location()) {
+    const auto& loc = msg.location();
+    d ^= loc.region().size() ^ loc.datacenter().size() ^ loc.city().size() ^
+         static_cast<uint64_t>(loc.rack());
+  }
+  digest_out = d;
+  return true;
+}
+
 bool lookup_city(std::span<const uint8_t> wire, std::string& city_out) {
   libpb::bench::PeerUpdate msg;
   if (!msg.ParseFromArray(wire.data(), static_cast<int>(wire.size())) || !msg.has_location()) {
