@@ -22,6 +22,19 @@ namespace omnibuf {
   const size_t n = b.size();
   size_t i = 0;
 
+  // Fast path for short strings (< 16 bytes): avoid checking 64B/16B SIMD loops.
+  if (n < 16) {
+    if (n >= 8) {
+      if ((read_u64_le(p) & 0x8080808080808080ULL) == 0) {
+        i = 8;
+      }
+    }
+    while (i < n && p[i] < 0x80u) {
+      ++i;
+    }
+    if (i >= n) return true;
+  }
+
   while (i < n) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     while (i + 64 <= n) {
@@ -65,13 +78,12 @@ namespace omnibuf {
       }
       break;
     }
+    while (i < n && p[i] < 0x80u) {
+      ++i;
+    }
     if (i >= n) break;
 
     const uint8_t b0 = p[i];
-    if (b0 < 0x80u) {
-      ++i;
-      continue;
-    }
     if (b0 < 0xC2u) {
       // 0x80..0xBF continuation byte or 0xC0..0xC1 overlong 2-byte starter
       return false;

@@ -1344,9 +1344,8 @@ template <RegisteredStruct T>
 [[nodiscard]] inline Result<std::vector<uint8_t>> marshal(const T& msg,
                                                           MarshalOptions opts = {}) {
   std::vector<uint8_t> dst;
-  const size_t hint = detail::struct_wire_size_hint(msg, 0);
   if (opts.self_describing) {
-    dst.reserve(hint + 512);
+    dst.reserve(512);
     std::set<const void*> active;
     bool cyclic = false;
     auto meta = detail::build_struct_schema_meta<T>(1, active, &cyclic);
@@ -1359,7 +1358,7 @@ template <RegisteredStruct T>
   }
   MarshalOptions body_opts = opts;
   body_opts.self_describing = false;
-  FastWriter w(dst, hint + 64);
+  FastWriter w(dst, 0);
   const char* err = detail::encode_struct_body(w, msg, body_opts, 0);
   if (err != nullptr) [[unlikely]] return Error{err};
   w.finish();

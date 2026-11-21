@@ -268,7 +268,7 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
       return "omnibuf: invalid UTF-8 in WireString";
     }
     w.write_varint(s.size());
-    w.write_bytes(s.data(), s.size());
+    w.write_bytes_noalias(s.data(), s.size());
   }
   w.backpatch_len_hint(len_pos, use_4b);
   return nullptr;
@@ -291,7 +291,7 @@ inline void encode_bytes_arr(FastWriter& w, std::span<const std::vector<uint8_t>
   w.write_varint(items.size());
   for (const auto& b : items) {
     w.write_varint(b.size());
-    w.write_bytes(b.data(), b.size());
+    w.write_bytes_noalias(b.data(), b.size());
   }
   w.backpatch_len_hint(len_pos, use_4b);
 }

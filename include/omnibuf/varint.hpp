@@ -288,58 +288,94 @@ inline void patch_reserved_varint(std::vector<uint8_t>& dst, size_t pos, uint64_
 }
 
 // Cursor writer over std::vector<uint8_t> with RAII exception rollback.
-// Maintains a byte pointer and capacity limit in local registers and restores
-// vec to its initial size if destroyed before finish() is called.
+// Stages writes in a 1 KiB stack buffer and appends to vec via reserve + insert
+// so std::vector::resize never zero-fills output memory.
 class FastWriter {
  public:
-  explicit FastWriter(std::vector<uint8_t>& vec, size_t initial_headroom = 512)
-      : vec_(&vec), initial_size_(vec.size()), pos_(vec.size()), limit_(vec.size()) {
-    if (initial_headroom > 0) {
-      if (initial_headroom > SIZE_MAX - pos_) [[unlikely]] {
+  static constexpr size_t kInlineCap = 1024;
+
+  explicit FastWriter(std::vector<uint8_t>& vec, size_t initial_headroom = 0)
+      : vec_(&vec),
+        data_(inline_buf_),
+        initial_size_(vec.size()),
+        flushed_(vec.size()),
+        pos_(0),
+        limit_(kInlineCap) {
+    if (initial_headroom > kInlineCap) {
+      if (initial_headroom > SIZE_MAX - initial_size_) [[unlikely]] {
         throw std::length_error("omnibuf: buffer size overflow");
       }
-      const size_t target = pos_ + initial_headroom;
-      vec.resize(target);
-      limit_ = target;
+      const size_t target = initial_size_ + initial_headroom;
+      if (target > vec.capacity()) {
+        vec.reserve(target);
+      }
     }
-    data_ = vec.data();
   }
 
   FastWriter(const FastWriter&) = delete;
   FastWriter& operator=(const FastWriter&) = delete;
 
   ~FastWriter() noexcept {
-    if (!finished_ && vec_ != nullptr) {
+    if (!finished_ && vec_ != nullptr && vec_->size() != initial_size_) {
       vec_->resize(initial_size_);
     }
   }
 
-  [[nodiscard]] size_t size() const noexcept { return pos_; }
+  [[nodiscard]] size_t size() const noexcept { return flushed_ + pos_; }
 
   [[nodiscard]] uint8_t* raw_cur() noexcept { return data_ + pos_; }
 
   void set_raw_cur(uint8_t* p) noexcept { pos_ = static_cast<size_t>(p - data_); }
 
-  void finish() noexcept {
+  void finish() {
     if (!finished_) {
-      vec_->resize(pos_);
+      if (!direct_mode_) {
+        if (pos_ > 0) {
+          vec_->insert(vec_->end(), inline_buf_, inline_buf_ + pos_);
+          flushed_ = vec_->size();
+          pos_ = 0;
+        }
+      } else {
+        vec_->resize(pos_);
+      }
       finished_ = true;
     }
   }
 
   void rollback() noexcept {
     if (!finished_ && vec_ != nullptr) {
-      pos_ = initial_size_;
-      vec_->resize(initial_size_);
-      limit_ = initial_size_;
-      data_ = vec_->data();
+      if (vec_->size() != initial_size_) {
+        vec_->resize(initial_size_);
+      }
+      direct_mode_ = false;
+      data_ = inline_buf_;
+      flushed_ = initial_size_;
+      pos_ = 0;
+      limit_ = kInlineCap;
       finished_ = true;
+    }
+  }
+
+  void reserve_capacity(size_t extra) {
+    if (direct_mode_) {
+      ensure(extra);
+      return;
+    }
+    const size_t cur = flushed_ + pos_;
+    if (extra > SIZE_MAX - cur) [[unlikely]] {
+      throw std::length_error("omnibuf: buffer size overflow");
+    }
+    const size_t target = cur + extra;
+    const size_t cap = vec_->capacity();
+    if (target > cap) {
+      const size_t doubled = (cap <= SIZE_MAX / 2) ? (cap * 2) : target;
+      vec_->reserve(doubled > target ? doubled : target);
     }
   }
 
   void ensure(size_t extra) {
     if (extra > limit_ - pos_) [[unlikely]] {
-      grow(extra);
+      flush_or_grow(extra);
     }
   }
 
@@ -372,7 +408,21 @@ class FastWriter {
       write_bytes_slow(src, len);
       return;
     }
-    std::memmove(data_ + pos_, src, len);
+    if (!direct_mode_) [[likely]] {
+      std::memcpy(data_ + pos_, src, len);
+    } else {
+      std::memmove(data_ + pos_, src, len);
+    }
+    pos_ += len;
+  }
+
+  void write_bytes_noalias(const void* src, size_t len) {
+    if (len == 0) return;
+    if (len > limit_ - pos_) [[unlikely]] {
+      write_bytes_noalias_slow(src, len);
+      return;
+    }
+    std::memcpy(data_ + pos_, src, len);
     pos_ += len;
   }
 
@@ -393,44 +443,55 @@ class FastWriter {
 
   [[nodiscard]] size_t reserve_len_2b() {
     ensure(2);
-    const size_t p = pos_;
-    data_[p] = 0;
-    data_[p + 1] = 0;
+    const size_t p = flushed_ + pos_;
+    data_[pos_] = 0;
+    data_[pos_ + 1] = 0;
     pos_ += 2;
     return p;
   }
 
   [[nodiscard]] size_t reserve_len_4b() {
     ensure(4);
-    const size_t p = pos_;
-    write_u32_le(data_ + p, 0);
+    const size_t p = flushed_ + pos_;
+    write_u32_le(data_ + pos_, 0);
     pos_ += 4;
     return p;
   }
 
   [[nodiscard]] size_t reserve_len_hint(size_t body_hint) {
-    return (body_hint > 16383u) ? reserve_len_4b() : reserve_len_2b();
+    if (body_hint > 16383u) [[unlikely]] {
+      const size_t pad = (body_hint <= SIZE_MAX - 512u) ? (body_hint + 512u) : body_hint;
+      reserve_capacity(pad);
+      return reserve_len_4b();
+    }
+    return reserve_len_2b();
   }
 
   void backpatch_len(size_t len_pos) {
-    if (len_pos > pos_ || pos_ - len_pos < 2) [[unlikely]] {
+    const size_t total = flushed_ + pos_;
+    if (len_pos > total || total - len_pos < 2) [[unlikely]] {
       throw std::logic_error("omnibuf: invalid container length slot");
     }
-    const uint64_t sub_len = static_cast<uint64_t>(pos_ - (len_pos + 2));
+    const uint64_t sub_len = static_cast<uint64_t>(total - (len_pos + 2));
     if (sub_len <= 16383u) [[likely]] {
-      write_u16_le(data_ + len_pos, static_cast<uint16_t>((sub_len << 2) | 2u));
+      uint8_t* slot = (len_pos >= flushed_) ? (data_ + (len_pos - flushed_))
+                                            : (vec_->data() + len_pos);
+      write_u16_le(slot, static_cast<uint16_t>((sub_len << 2) | 2u));
       return;
     }
     backpatch_len_slow(len_pos, sub_len);
   }
 
   void backpatch_len_4b(size_t len_pos) {
-    if (len_pos > pos_ || pos_ - len_pos < 4) [[unlikely]] {
+    const size_t total = flushed_ + pos_;
+    if (len_pos > total || total - len_pos < 4) [[unlikely]] {
       throw std::logic_error("omnibuf: invalid 4-byte container length slot");
     }
-    const uint64_t sub_len = static_cast<uint64_t>(pos_ - (len_pos + 4));
+    const uint64_t sub_len = static_cast<uint64_t>(total - (len_pos + 4));
     if (sub_len > 16383u && sub_len <= 536870911u) [[likely]] {
-      write_u32_le(data_ + len_pos, static_cast<uint32_t>((sub_len << 3) | 4u));
+      uint8_t* slot = (len_pos >= flushed_) ? (data_ + (len_pos - flushed_))
+                                            : (vec_->data() + len_pos);
+      write_u32_le(slot, static_cast<uint32_t>((sub_len << 3) | 4u));
       return;
     }
     backpatch_len_4b_slow(len_pos, sub_len);
@@ -445,7 +506,15 @@ class FastWriter {
   }
 
  private:
-  OMNIBUF_NOINLINE void grow(size_t extra) {
+  void flush_staging() {
+    if (pos_ > 0) {
+      vec_->insert(vec_->end(), inline_buf_, inline_buf_ + pos_);
+      flushed_ = vec_->size();
+      pos_ = 0;
+    }
+  }
+
+  OMNIBUF_NOINLINE void grow_direct(size_t extra) {
     if (extra > SIZE_MAX - pos_) [[unlikely]] {
       throw std::length_error("omnibuf: buffer size overflow");
     }
@@ -458,26 +527,83 @@ class FastWriter {
     limit_ = next;
   }
 
-  OMNIBUF_NOINLINE void write_bytes_slow(const void* src, size_t len) {
-    // Preserve aliased input before grow reallocates the backing vector.
-    const auto source = reinterpret_cast<uintptr_t>(src);
-    const auto start = reinterpret_cast<uintptr_t>(data_);
-    if (source >= start && source - start < limit_) {
-      const size_t offset = source - start;
-      if (len > limit_ - offset) {
-        throw std::out_of_range("omnibuf: aliased source exceeds buffer");
-      }
-      grow(len);
-      std::memmove(data_ + pos_, data_ + offset, len);
+  OMNIBUF_NOINLINE void flush_or_grow(size_t extra) {
+    if (direct_mode_) {
+      grow_direct(extra);
+      return;
+    }
+    flush_staging();
+    if (extra <= kInlineCap) {
+      return;
+    }
+    // Caller requested a contiguous writable span > kInlineCap via ensure()/raw_cur().
+    direct_mode_ = true;
+    pos_ = flushed_;
+    flushed_ = 0;
+    limit_ = vec_->size();
+    grow_direct(extra);
+  }
+
+  OMNIBUF_NOINLINE void write_bytes_noalias_slow(const void* src, size_t len) {
+    if (direct_mode_) {
+      grow_direct(len);
+      std::memcpy(data_ + pos_, src, len);
       pos_ += len;
       return;
     }
-    grow(len);
-    std::memcpy(data_ + pos_, src, len);
-    pos_ += len;
+    flush_staging();
+    if (len <= kInlineCap) {
+      std::memcpy(inline_buf_, src, len);
+      pos_ = len;
+      return;
+    }
+    const auto* p = static_cast<const uint8_t*>(src);
+    vec_->insert(vec_->end(), p, p + len);
+    flushed_ = vec_->size();
   }
 
-  OMNIBUF_NOINLINE void write_varint_multi(uint64_t v) {
+  OMNIBUF_NOINLINE void write_bytes_slow(const void* src, size_t len) {
+    if (direct_mode_) {
+      const auto source = reinterpret_cast<uintptr_t>(src);
+      const auto start = reinterpret_cast<uintptr_t>(data_);
+      if (source >= start && source - start < limit_) {
+        const size_t offset = source - start;
+        if (len > limit_ - offset) {
+          throw std::out_of_range("omnibuf: aliased source exceeds buffer");
+        }
+        grow_direct(len);
+        std::memmove(data_ + pos_, data_ + offset, len);
+        pos_ += len;
+        return;
+      }
+      grow_direct(len);
+      std::memcpy(data_ + pos_, src, len);
+      pos_ += len;
+      return;
+    }
+    // Check if src aliases the backing vector before flushing/inserting.
+    const auto source = reinterpret_cast<uintptr_t>(src);
+    const auto vec_start = reinterpret_cast<uintptr_t>(vec_->data());
+    const size_t vec_sz = vec_->size();
+    if (vec_sz > 0 && source >= vec_start && source - vec_start < vec_sz) {
+      const size_t offset = source - vec_start;
+      if (len > vec_sz - offset) {
+        throw std::out_of_range("omnibuf: aliased source exceeds buffer");
+      }
+      flush_staging();
+      const size_t dst_off = vec_->size();
+      if (len > SIZE_MAX - dst_off) [[unlikely]] {
+        throw std::length_error("omnibuf: buffer size overflow");
+      }
+      vec_->resize(dst_off + len);
+      std::memmove(vec_->data() + dst_off, vec_->data() + offset, len);
+      flushed_ = vec_->size();
+      return;
+    }
+    write_bytes_noalias_slow(src, len);
+  }
+
+  inline void write_varint_multi(uint64_t v) {
     if (v <= 16383u) {
       ensure(2);
       write_u16_le(data_ + pos_, static_cast<uint16_t>((v << 2) | 2u));
@@ -498,6 +624,24 @@ class FastWriter {
 
   OMNIBUF_NOINLINE void backpatch_len_slow(size_t len_pos, uint64_t sub_len) {
     const size_t extra = (sub_len <= 536870911u) ? 2 : 7;
+    if (!direct_mode_) {
+      flush_staging();
+      const size_t old_size = vec_->size();
+      if (extra > SIZE_MAX - old_size) [[unlikely]] {
+        throw std::length_error("omnibuf: buffer size overflow");
+      }
+      vec_->resize(old_size + extra);
+      std::memmove(vec_->data() + len_pos + 2 + extra, vec_->data() + len_pos + 2,
+                   old_size - (len_pos + 2));
+      if (extra == 2) {
+        write_u32_le(vec_->data() + len_pos, static_cast<uint32_t>((sub_len << 3) | 4u));
+      } else {
+        (*vec_)[len_pos] = 0x00;
+        write_u64_le(vec_->data() + len_pos + 1, sub_len);
+      }
+      flushed_ = vec_->size();
+      return;
+    }
     ensure(extra);
     std::memmove(data_ + len_pos + 2 + extra, data_ + len_pos + 2, pos_ - (len_pos + 2));
     pos_ += extra;
@@ -510,6 +654,28 @@ class FastWriter {
   }
 
   OMNIBUF_NOINLINE void backpatch_len_4b_slow(size_t len_pos, uint64_t sub_len) {
+    if (!direct_mode_) {
+      flush_staging();
+      if (sub_len <= 16383u) {
+        write_u16_le(vec_->data() + len_pos, static_cast<uint16_t>((sub_len << 2) | 2u));
+        std::memmove(vec_->data() + len_pos + 2, vec_->data() + len_pos + 4,
+                     static_cast<size_t>(sub_len));
+        vec_->resize(vec_->size() - 2);
+        flushed_ = vec_->size();
+        return;
+      }
+      const size_t old_size = vec_->size();
+      if (5 > SIZE_MAX - old_size) [[unlikely]] {
+        throw std::length_error("omnibuf: buffer size overflow");
+      }
+      vec_->resize(old_size + 5);
+      std::memmove(vec_->data() + len_pos + 9, vec_->data() + len_pos + 4,
+                   old_size - (len_pos + 4));
+      (*vec_)[len_pos] = 0x00;
+      write_u64_le(vec_->data() + len_pos + 1, sub_len);
+      flushed_ = vec_->size();
+      return;
+    }
     if (sub_len <= 16383u) {
       write_u16_le(data_ + len_pos, static_cast<uint16_t>((sub_len << 2) | 2u));
       std::memmove(data_ + len_pos + 2, data_ + len_pos + 4, static_cast<size_t>(sub_len));
@@ -526,9 +692,12 @@ class FastWriter {
   std::vector<uint8_t>* vec_ = nullptr;
   uint8_t* data_ = nullptr;
   size_t initial_size_ = 0;
+  size_t flushed_ = 0;
   size_t pos_ = 0;
   size_t limit_ = 0;
+  bool direct_mode_ = false;
   bool finished_ = false;
+  alignas(8) uint8_t inline_buf_[kInlineCap];
 };
 
 }  // namespace omnibuf

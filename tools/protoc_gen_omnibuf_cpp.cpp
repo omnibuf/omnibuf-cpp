@@ -821,13 +821,13 @@ void emit_try_encode_scalar_value_fast(std::ostringstream& out,
       out << indent << "}\n";
       out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireString);\n";
       out << indent << w_var << ".write_varint((" << val_expr << ").size());\n";
-      out << indent << w_var << ".write_bytes((" << val_expr << ").data(), (" << val_expr
+      out << indent << w_var << ".write_bytes_noalias((" << val_expr << ").data(), (" << val_expr
           << ").size());\n";
       break;
     case FieldType::Bytes:
       out << indent << w_var << ".write_tag(" << fnum << "u, ::omnibuf::WireBytes);\n";
       out << indent << w_var << ".write_varint((" << val_expr << ").size());\n";
-      out << indent << w_var << ".write_bytes((" << val_expr << ").data(), (" << val_expr
+      out << indent << w_var << ".write_bytes_noalias((" << val_expr << ").data(), (" << val_expr
           << ").size());\n";
       break;
     default:
@@ -1387,7 +1387,6 @@ void emit_struct_methods(std::ostringstream& out,
         if (mi.val_type == FieldType::Message) {
           out << "  for (const auto& [_, sv] : " << ident << ") {\n";
           out << "    sz += 3u + sv.min_wire_size(depth + 2);\n";
-          out << "    if (sz > 16383u) return sz;\n";
           out << "  }\n";
         } else {
           out << "  sz += " << ident << ".size() * 2u;\n";
@@ -1396,7 +1395,6 @@ void emit_struct_methods(std::ostringstream& out,
         out << "  sz += 5u;\n";
         out << "  for (const auto& elem : " << ident << ") {\n";
         out << "    sz += 2u + elem.min_wire_size(depth + 2);\n";
-        out << "    if (sz > 16383u) return sz;\n";
         out << "  }\n";
       } else {
         out << guard_open;
@@ -1418,7 +1416,6 @@ void emit_struct_methods(std::ostringstream& out,
         out << "  sz += 5u;\n";
         out << "  for (const auto& elem : " << ident << ") {\n";
         out << "    sz += 1u + elem.size();\n";
-        out << "    if (sz > 16383u) return sz;\n";
         out << "  }\n";
       } else {
         out << "  sz += 5u + " << ident << ".size() * " << elem_min << "u;\n";
@@ -1456,7 +1453,6 @@ void emit_struct_methods(std::ostringstream& out,
       }
       out << guard_close;
     }
-    out << "  if (sz > 16383u) return sz;\n";
   }
   out << "  return sz;\n";
   out << "}\n\n";
@@ -1489,7 +1485,7 @@ void emit_struct_methods(std::ostringstream& out,
   out << "}\n\n";
 
   out << "inline void " << qname << "::marshal_omnibuf_append(std::vector<uint8_t>& dst) const {\n";
-  out << "  ::omnibuf::FastWriter w(dst, 512);\n";
+  out << "  ::omnibuf::FastWriter w(dst, 0u);\n";
   out << "  marshal_omnibuf_fast(w);\n";
   out << "  w.finish();\n";
   out << "}\n\n";
@@ -1509,7 +1505,7 @@ void emit_struct_methods(std::ostringstream& out,
   out << "      ::omnibuf::append_field0_schema_meta(dst, *meta);\n";
   out << "    }\n";
   out << "  }\n";
-  out << "  ::omnibuf::FastWriter w(dst, 512);\n";
+  out << "  ::omnibuf::FastWriter w(dst, 0u);\n";
   out << "  if (const char* err = try_marshal_omnibuf_fast(w)) [[unlikely]] {\n";
   out << "    return ::omnibuf::Error{err};\n";
   out << "  }\n";
