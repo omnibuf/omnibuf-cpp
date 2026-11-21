@@ -101,12 +101,14 @@ inline void sink_bytes(const std::vector<uint8_t>& out) {
   do_not_optimize(sz);
 }
 
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
 inline void sink_string(const std::string& out) {
   const char* ptr = out.data();
   const size_t sz = out.size();
   do_not_optimize(ptr);
   do_not_optimize(sz);
 }
+#endif
 
 inline void clobber_memory() {
 #if defined(__GNUC__) || defined(__clang__)
