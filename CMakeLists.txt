@@ -195,4 +195,41 @@ if(OMNIBUF_BUILD_TESTS)
     omnibuf_bench
     PRIVATE OMNIBUF_BENCH_JSON_PATH="${CMAKE_CURRENT_SOURCE_DIR}/testdata/benchmarks.json"
   )
+
+  # Optional real libprotobuf (google::protobuf::Message) benchmark peer when installed.
+  # Keeps omnibuf::omnibuf strictly zero-dependency; only links into omnibuf_bench.
+  find_package(protobuf CONFIG QUIET)
+  find_program(OMNIBUF_PROTOC_EXECUTABLE NAMES protoc)
+  if(protobuf_FOUND AND OMNIBUF_PROTOC_EXECUTABLE)
+    set(OMNIBUF_PB_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/pb_gen")
+    set(OMNIBUF_PB_PROTO_IN "${OMNIBUF_PB_GEN_DIR}/libpb_peer.proto")
+    set(OMNIBUF_PB_GEN_CC "${OMNIBUF_PB_GEN_DIR}/libpb_peer.pb.cc")
+    set(OMNIBUF_PB_GEN_H "${OMNIBUF_PB_GEN_DIR}/libpb_peer.pb.h")
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/proto/omnibuf/bench/peer.proto" OMNIBUF_PEER_PROTO_CONTENT)
+    string(REPLACE "package omnibuf.bench;" "package libpb.bench;" OMNIBUF_LIBPB_PROTO_CONTENT "${OMNIBUF_PEER_PROTO_CONTENT}")
+    file(WRITE "${OMNIBUF_PB_PROTO_IN}" "${OMNIBUF_LIBPB_PROTO_CONTENT}")
+    add_custom_command(
+      OUTPUT "${OMNIBUF_PB_GEN_CC}" "${OMNIBUF_PB_GEN_H}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${OMNIBUF_PB_GEN_DIR}"
+      COMMAND "${OMNIBUF_PROTOC_EXECUTABLE}"
+        "--proto_path=${OMNIBUF_PB_GEN_DIR}"
+        "--cpp_out=${OMNIBUF_PB_GEN_DIR}"
+        "${OMNIBUF_PB_PROTO_IN}"
+      DEPENDS "${OMNIBUF_PB_PROTO_IN}"
+      COMMENT "Generating official libprotobuf C++ peer benchmark source"
+      VERBATIM
+    )
+    add_library(
+      omnibuf_bench_libprotobuf STATIC
+      benchmarks/libprotobuf_peer.cpp
+      "${OMNIBUF_PB_GEN_CC}"
+    )
+    target_compile_features(omnibuf_bench_libprotobuf PRIVATE cxx_std_20)
+    target_compile_options(omnibuf_bench_libprotobuf PRIVATE -O3 -DNDEBUG)
+    target_include_directories(omnibuf_bench_libprotobuf PRIVATE "${OMNIBUF_PB_GEN_DIR}")
+    target_link_libraries(omnibuf_bench_libprotobuf PRIVATE protobuf::libprotobuf)
+    target_link_libraries(omnibuf_bench PRIVATE omnibuf_bench_libprotobuf)
+    target_compile_definitions(omnibuf_bench PRIVATE OMNIBUF_HAS_LIBPROTOBUF=1)
+    message(STATUS "omnibuf_bench: enabling official libprotobuf peer comparison")
+  endif()
 endif()

@@ -13,8 +13,8 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 188,
-          "opsPerSec": 5328937,
+          "nsPerOp": 204,
+          "opsPerSec": 4902400,
           "wireBytes": 366,
           "highlight": true,
           "baseline": true
@@ -22,20 +22,26 @@
         {
           "name": "OmniBuf (C++ Struct)",
           "nsPerOp": 205,
-          "opsPerSec": 4871673,
+          "opsPerSec": 4877523,
           "wireBytes": 366,
           "highlight": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 215,
-          "opsPerSec": 4640482,
+          "nsPerOp": 213,
+          "opsPerSec": 4684901,
+          "wireBytes": 341
+        },
+        {
+          "name": "Protobuf (libprotobuf)",
+          "nsPerOp": 249,
+          "opsPerSec": 4022372,
           "wireBytes": 341
         },
         {
           "name": "JSON",
-          "nsPerOp": 475,
-          "opsPerSec": 2105731,
+          "nsPerOp": 464,
+          "opsPerSec": 2153372,
           "wireBytes": 803
         }
       ]
@@ -47,26 +53,31 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 482,
-          "opsPerSec": 2073492,
+          "nsPerOp": 475,
+          "opsPerSec": 2104774,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "OmniBuf (C++ Struct)",
-          "nsPerOp": 537,
-          "opsPerSec": 1860569,
+          "nsPerOp": 519,
+          "opsPerSec": 1926762,
           "highlight": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 586,
-          "opsPerSec": 1706623
+          "nsPerOp": 576,
+          "opsPerSec": 1736781
+        },
+        {
+          "name": "Protobuf (libprotobuf)",
+          "nsPerOp": 998,
+          "opsPerSec": 1002463
         },
         {
           "name": "JSON",
-          "nsPerOp": 1303,
-          "opsPerSec": 767296
+          "nsPerOp": 1274,
+          "opsPerSec": 784667
         }
       ]
     },
@@ -78,19 +89,24 @@
         {
           "name": "OmniBuf (Generated)",
           "nsPerOp": 98,
-          "opsPerSec": 10183942,
+          "opsPerSec": 10168765,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 432,
-          "opsPerSec": 2315842
+          "nsPerOp": 449,
+          "opsPerSec": 2228270
+        },
+        {
+          "name": "Protobuf (libprotobuf)",
+          "nsPerOp": 839,
+          "opsPerSec": 1192232
         },
         {
           "name": "JSON",
-          "nsPerOp": 1141,
-          "opsPerSec": 876247
+          "nsPerOp": 1127,
+          "opsPerSec": 887075
         }
       ]
     },
@@ -101,20 +117,25 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 294,
-          "opsPerSec": 3397691,
+          "nsPerOp": 293,
+          "opsPerSec": 3416833,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 656,
-          "opsPerSec": 1523372
+          "nsPerOp": 653,
+          "opsPerSec": 1531615
+        },
+        {
+          "name": "Protobuf (libprotobuf)",
+          "nsPerOp": 1098,
+          "opsPerSec": 910466
         },
         {
           "name": "JSON",
-          "nsPerOp": 1625,
-          "opsPerSec": 615572
+          "nsPerOp": 1606,
+          "opsPerSec": 622488
         }
       ]
     },
@@ -125,29 +146,35 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 1320,
-          "opsPerSec": 757818,
+          "nsPerOp": 1433,
+          "opsPerSec": 697799,
           "wireBytes": 39256,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "OmniBuf (C++ Struct)",
-          "nsPerOp": 1377,
-          "opsPerSec": 725965,
+          "nsPerOp": 1508,
+          "opsPerSec": 663347,
           "wireBytes": 39256,
           "highlight": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 1654,
-          "opsPerSec": 604760,
+          "nsPerOp": 1906,
+          "opsPerSec": 524527,
+          "wireBytes": 39227
+        },
+        {
+          "name": "Protobuf (libprotobuf)",
+          "nsPerOp": 2963,
+          "opsPerSec": 337461,
           "wireBytes": 39227
         },
         {
           "name": "JSON",
-          "nsPerOp": 40227,
-          "opsPerSec": 24859,
+          "nsPerOp": 40563,
+          "opsPerSec": 24653,
           "wireBytes": 39681
         }
       ]
@@ -159,22 +186,28 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 1718,
-          "opsPerSec": 581966,
+          "nsPerOp": 1699,
+          "opsPerSec": 588513,
           "wireBytes": 21935,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "Protobuf (LEB128 Wire)",
-          "nsPerOp": 3540,
-          "opsPerSec": 282471,
+          "nsPerOp": 3488,
+          "opsPerSec": 286689,
+          "wireBytes": 21923
+        },
+        {
+          "name": "Protobuf (libprotobuf)",
+          "nsPerOp": 5750,
+          "opsPerSec": 173921,
           "wireBytes": 21923
         },
         {
           "name": "JSON",
-          "nsPerOp": 27697,
-          "opsPerSec": 36105,
+          "nsPerOp": 27781,
+          "opsPerSec": 35996,
           "wireBytes": 23914
         }
       ]

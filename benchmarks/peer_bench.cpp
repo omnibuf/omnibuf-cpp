@@ -23,6 +23,9 @@
 
 #include "omnibuf/bench/peer.omnibuf.pb.hpp"
 #include "omnibuf/omnibuf.hpp"
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+#include "libprotobuf_peer.hpp"
+#endif
 
 // RegisterStruct traits for omnibuf::bench::{Location, Neighbor, PeerUpdate}
 // so OmniBuf (C++ Struct) benchmarks StructTraits<T> reflection on the exact same data model.
@@ -93,6 +96,13 @@ inline void do_not_optimize(const T& value) {
 
 inline void sink_bytes(const std::vector<uint8_t>& out) {
   const uint8_t* ptr = out.data();
+  const size_t sz = out.size();
+  do_not_optimize(ptr);
+  do_not_optimize(sz);
+}
+
+inline void sink_string(const std::string& out) {
+  const char* ptr = out.data();
   const size_t sz = out.size();
   do_not_optimize(ptr);
   do_not_optimize(sz);
@@ -1267,6 +1277,30 @@ int main(int argc, char** argv) {
   const std::vector<uint8_t>& omnibuf_struct_bytes = omnibuf_struct_res.value();
   const std::vector<uint8_t> protobuf_bytes = pb_leb128::encode_peer_update(sample);
   const std::vector<uint8_t> json_bytes = json_codec::encode_peer_update(sample);
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+  const auto libpb_sample = omnibuf_bench_pb::make_sample_handle();
+  const std::string libpb_sample_str = omnibuf_bench_pb::encode_handle(*libpb_sample);
+  const std::vector<uint8_t> libpb_bytes(libpb_sample_str.begin(), libpb_sample_str.end());
+  if (libpb_bytes.size() != 341) {
+    std::fprintf(stderr, "omnibuf_bench: expected 341B libprotobuf packet, got %zu\n",
+                 libpb_bytes.size());
+    return EXIT_FAILURE;
+  }
+  {
+    uint64_t libpb_cs = 0;
+    if (!omnibuf_bench_pb::decode_and_checksum(libpb_bytes, libpb_cs) ||
+        libpb_cs != expected_sample_checksum) {
+      std::fprintf(stderr, "omnibuf_bench: libprotobuf round-trip checksum mismatch\n");
+      return EXIT_FAILURE;
+    }
+  }
+  const auto libpb_shifted = omnibuf_bench_pb::make_shifted_handle();
+  const std::string libpb_shifted_str = omnibuf_bench_pb::encode_handle(*libpb_shifted);
+  const auto libpb_routing_32 = omnibuf_bench_pb::make_routing_32_handle();
+  const std::string libpb_routing_32_str = omnibuf_bench_pb::encode_handle(*libpb_routing_32);
+  const std::vector<uint8_t> libpb_routing_32_bytes(libpb_routing_32_str.begin(),
+                                                    libpb_routing_32_str.end());
+#endif
 
   // Strict wire-size and full 11-field checksum invariants before timing
   if (omnibuf_gen_bytes.size() != 366 || omnibuf_struct_bytes.size() != 366 ||
@@ -1488,6 +1522,18 @@ int main(int argc, char** argv) {
                 sink_bytes(out);
               },
               false, false, protobuf_bytes.size()),
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+          run_bench(
+              cfg,
+              "Protobuf (libprotobuf)",
+              [&] {
+                const auto* ptr = libpb_sample.get();
+                do_not_optimize(ptr);
+                auto out = omnibuf_bench_pb::encode_handle(*ptr);
+                sink_string(out);
+              },
+              false, false, libpb_bytes.size()),
+#endif
           run_bench(
               cfg,
               "JSON",
@@ -1545,6 +1591,21 @@ int main(int argc, char** argv) {
                 if (cs != expected_sample_checksum) std::abort();
                 do_not_optimize(cs);
               }),
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+          run_bench(
+              cfg,
+              "Protobuf (libprotobuf)",
+              [&] {
+                std::span<const uint8_t> sp(libpb_bytes);
+                do_not_optimize(sp);
+                uint64_t cs = 0;
+                if (!omnibuf_bench_pb::decode_and_checksum(sp, cs) ||
+                    cs != expected_sample_checksum) {
+                  std::abort();
+                }
+                do_not_optimize(cs);
+              }),
+#endif
           run_bench(
               cfg,
               "JSON",
@@ -1598,6 +1659,20 @@ int main(int argc, char** argv) {
                 do_not_optimize(p);
                 do_not_optimize(n);
               }),
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+          run_bench(
+              cfg,
+              "Protobuf (libprotobuf)",
+              [&] {
+                std::span<const uint8_t> sp(libpb_bytes);
+                do_not_optimize(sp);
+                std::string city;
+                if (!omnibuf_bench_pb::lookup_city(sp, city) || city != "Frankfurt") {
+                  std::abort();
+                }
+                sink_string(city);
+              }),
+#endif
           run_bench(
               cfg,
               "JSON",
@@ -1652,6 +1727,18 @@ int main(int argc, char** argv) {
                 auto out = pb_leb128::encode_peer_update(msg);
                 sink_bytes(out);
               }),
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+          run_bench(
+              cfg,
+              "Protobuf (libprotobuf)",
+              [&] {
+                std::span<const uint8_t> sp(libpb_bytes);
+                do_not_optimize(sp);
+                std::string out;
+                if (!omnibuf_bench_pb::mutate_sequence(sp, out)) std::abort();
+                sink_string(out);
+              }),
+#endif
           run_bench(
               cfg,
               "JSON",
@@ -1705,6 +1792,18 @@ int main(int argc, char** argv) {
                 sink_bytes(out);
               },
               false, false, shifted_pb.size()),
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+          run_bench(
+              cfg,
+              "Protobuf (libprotobuf)",
+              [&] {
+                const auto* ptr = libpb_shifted.get();
+                do_not_optimize(ptr);
+                auto out = omnibuf_bench_pb::encode_handle(*ptr);
+                sink_string(out);
+              },
+              false, false, libpb_shifted_str.size()),
+#endif
           run_bench(
               cfg,
               "JSON",
@@ -1759,6 +1858,19 @@ int main(int argc, char** argv) {
                 sink_bytes(out);
               },
               false, false, grown_pb_wire_bytes),
+#ifdef OMNIBUF_HAS_LIBPROTOBUF
+          run_bench(
+              cfg,
+              "Protobuf (libprotobuf)",
+              [&] {
+                std::span<const uint8_t> sp(libpb_routing_32_bytes);
+                do_not_optimize(sp);
+                std::string out;
+                if (!omnibuf_bench_pb::mutate_embedded_grow(sp, grown_dc, out)) std::abort();
+                sink_string(out);
+              },
+              false, false, grown_pb_wire_bytes),
+#endif
           run_bench(
               cfg,
               "JSON",
