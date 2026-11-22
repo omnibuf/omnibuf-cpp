@@ -16,7 +16,7 @@ permissions:
 jobs:
   verify:
     name: Full C++20 CI & Conformance Gate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       CXX: clang++
     steps:
@@ -101,7 +101,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
