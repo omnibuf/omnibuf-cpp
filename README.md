@@ -211,16 +211,7 @@ OmniBuf Conformance Suite (./build/conformance-cpp)
 
 ## Benchmarks
 
-Measured by `./build/omnibuf_bench` (`just bench`, `-O3 -DNDEBUG`, Apple Clang 21.0.0 C++20 on Apple M1 Pro, `darwin/arm64`) on the 11-field `SamplePeerUpdate` workload (`OmniBuf = 366 B`, `Protobuf = 341 B`, `JSON = 803 B`, reading `peer.location.city` and mutating `peer.sequence`). `omnibuf_bench` runs six categories in total, adding `Large Embedded Message Encode` and `Embedded Message Growth` stress workloads where nested payloads exceed 16,383 bytes and trigger 2-byte to 4-byte length-prefix expansion. Raw results are stored in [`testdata/benchmarks.json`](testdata/benchmarks.json).
-
-| Category | OmniBuf Generated | OmniBuf C++ Struct | Protobuf LEB128 | JSON |
-| :--- | ---: | ---: | ---: | ---: |
-| **Full Message Encode Speed** | **281 ns/op** (366 B) | 340 ns/op (366 B) | 284 ns/op (341 B) | 671 ns/op (803 B) |
-| **Full Message Decode Speed** | **657 ns/op** | 743 ns/op | 789 ns/op | 1,686 ns/op |
-| **Read a Single Nested Field** | **121 ns/op** | - | 591 ns/op | 1,485 ns/op |
-| **Selective Single-Field Mutation** | **427 ns/op** | - | 885 ns/op | 2,194 ns/op |
-| **Large Embedded Message Encode** | 5,242 ns/op (39,256 B) | 5,298 ns/op (39,256 B) | **4,140 ns/op** (39,227 B) | 53,706 ns/op (39,681 B) |
-| **Embedded Message Growth** | **3,581 ns/op** | - | 5,907 ns/op | 37,049 ns/op |
+C++20 benchmark results, methodology, and cross-language comparisons live at [omnibuf.com/benchmarks?lang=cpp](https://omnibuf.com/benchmarks?lang=cpp) (all languages at [omnibuf.com/benchmarks](https://omnibuf.com/benchmarks)). Run `just bench` (`./build/omnibuf_bench`) to regenerate [`testdata/benchmarks.json`](testdata/benchmarks.json).
 
 ---
 
