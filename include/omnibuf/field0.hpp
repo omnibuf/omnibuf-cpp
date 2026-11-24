@@ -378,6 +378,121 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
   return decode_schema_meta(data, depth, state);
 }
 
+[[nodiscard]] inline Result<void> validate_field0_slice(std::span<const uint8_t> data,
+                                                        int depth,
+                                                        DecodeState& state) {
+  if (depth > state.opts.max_depth) {
+    return Error{"omnibuf: SchemaMeta nesting depth exceeds max_depth"};
+  }
+  if (data.size() > state.opts.max_message_bytes) {
+    return Error{"omnibuf: SchemaMeta payload exceeds max_message_bytes"};
+  }
+  size_t pos = 0;
+  const size_t n = data.size();
+
+  while (pos < n) {
+    const auto [tag, tn] = decode_varint(data.subspan(pos));
+    if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) {
+      return Error{"omnibuf: invalid or truncated tag in Field #0 SchemaMeta"};
+    }
+    pos += tn;
+    const uint32_t fnum = static_cast<uint32_t>(tag >> 4);
+    const uint8_t wt = static_cast<uint8_t>(tag & 0x0Fu);
+
+    switch (fnum) {
+      case 1: {
+        if (wt != WireString) {
+          return Error{"omnibuf: SchemaMeta field #1 (type_name) must be WireString"};
+        }
+        auto s_res = read_str_slice(data, pos);
+        if (!s_res) return Error{s_res.error()};
+        pos = s_res.value().next_pos;
+        break;
+      }
+      case 2: {
+        if (wt != WireMap) {
+          return Error{"omnibuf: SchemaMeta field #2 (fields) must be WireMap"};
+        }
+        if (depth + 1 > state.opts.max_depth) {
+          return Error{"omnibuf: SchemaMeta fields map exceeds max_depth"};
+        }
+        auto body_res = read_len_slice(data, pos, 3);
+        if (!body_res) return Error{body_res.error()};
+        pos = body_res.value().next_pos;
+        const auto body = body_res.value().slice;
+        const auto hdr = parse_map_header(body);
+        if (!hdr.ok || hdr.key_wt != WireUint || hdr.val_wt != WireString) {
+          return Error{"omnibuf: invalid SchemaMeta fields map header"};
+        }
+        if (!state.charge_elements(hdr.count)) {
+          return Error{"omnibuf: SchemaMeta fields map exceeds max_total_elements"};
+        }
+        size_t p = hdr.pos;
+        for (size_t i = 0; i < hdr.count; ++i) {
+          const auto [k64, kn] = decode_varint(body.subspan(p));
+          if (kn == 0 || k64 == 0 || k64 > MAX_FIELD_NUMBER) {
+            return Error{"omnibuf: invalid SchemaMeta field number"};
+          }
+          p += kn;
+          auto name_res = read_str_slice(body, p);
+          if (!name_res) return Error{name_res.error()};
+          p = name_res.value().next_pos;
+        }
+        if (p != body.size()) {
+          return Error{"omnibuf: SchemaMeta fields map trailing bytes"};
+        }
+        break;
+      }
+      case 3: {
+        if (wt != WireMap) {
+          return Error{"omnibuf: SchemaMeta field #3 (children) must be WireMap"};
+        }
+        if (depth + 1 > state.opts.max_depth) {
+          return Error{"omnibuf: SchemaMeta children map exceeds max_depth"};
+        }
+        auto body_res = read_len_slice(data, pos, 3);
+        if (!body_res) return Error{body_res.error()};
+        pos = body_res.value().next_pos;
+        const auto body = body_res.value().slice;
+        const auto hdr = parse_map_header(body);
+        if (!hdr.ok || hdr.key_wt != WireUint || hdr.val_wt != WireSubMsg) {
+          return Error{"omnibuf: invalid SchemaMeta children map header"};
+        }
+        if (!state.charge_elements(hdr.count)) {
+          return Error{"omnibuf: SchemaMeta children map exceeds max_total_elements"};
+        }
+        size_t p = hdr.pos;
+        for (size_t i = 0; i < hdr.count; ++i) {
+          const auto [k64, kn] = decode_varint(body.subspan(p));
+          if (kn == 0 || k64 == 0 || k64 > MAX_FIELD_NUMBER) {
+            return Error{"omnibuf: invalid SchemaMeta child field number"};
+          }
+          p += kn;
+          auto child_slice = read_len_slice(body, p, 0);
+          if (!child_slice) return Error{child_slice.error()};
+          auto child_ok = validate_field0_slice(child_slice.value().slice, depth + 2, state);
+          if (!child_ok) return Error{child_ok.error()};
+          p = child_slice.value().next_pos;
+        }
+        if (p != body.size()) {
+          return Error{"omnibuf: SchemaMeta children map trailing bytes"};
+        }
+        break;
+      }
+      default: {
+        if (fnum == 0) {
+          return Error{"omnibuf: invalid field #0 inside SchemaMeta"};
+        }
+        auto skip_res = validate_value(data, pos, wt, depth, state);
+        if (!skip_res) return Error{skip_res.error()};
+        pos = skip_res.value();
+        break;
+      }
+    }
+  }
+  return Result<void>::success();
+}
+
 [[nodiscard]] inline Result<size_t> validate_field0(std::span<const uint8_t> data,
                                                     size_t pos,
                                                     uint8_t wt,
@@ -388,8 +503,8 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
   }
   auto body_res = read_len_slice(data, pos, 0);
   if (!body_res) return Error{body_res.error()};
-  auto meta_res = decode_schema_meta(body_res.value().slice, depth + 1, state);
-  if (!meta_res) return Error{meta_res.error()};
+  auto ok = validate_field0_slice(body_res.value().slice, depth + 1, state);
+  if (!ok) return Error{ok.error()};
   return body_res.value().next_pos;
 }
 

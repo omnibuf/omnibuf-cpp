@@ -1111,17 +1111,18 @@ void test_cpp16_opaque_view_getters_not_noexcept() {
   g_fail_allocs.store(false, std::memory_order_relaxed);
   EXPECT_MSG(caught_bad_alloc, "OpaqueWideMessage::get_f1() did not propagate std::bad_alloc");
 
-  // Also test View getter when Field #0 validation allocates.
+  // View getter validates Field #0 in-place with zero heap allocations.
   omnibuf::test::WideMessageView view(pkt);
-  bool view_caught = false;
+  int32_t view_val = 0;
   g_fail_allocs.store(true, std::memory_order_relaxed);
   try {
-    (void)view.get_f1();
-  } catch (const std::bad_alloc&) {
-    view_caught = true;
+    view_val = view.get_f1();
+  } catch (...) {
+    g_fail_allocs.store(false, std::memory_order_relaxed);
+    throw;
   }
   g_fail_allocs.store(false, std::memory_order_relaxed);
-  EXPECT_MSG(view_caught, "ViewWideMessage::get_f1() did not propagate std::bad_alloc");
+  EXPECT_MSG(view_val == 77, "ViewWideMessage::get_f1() did not read f1 without heap allocation");
 #endif
 }
 

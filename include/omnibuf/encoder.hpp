@@ -231,16 +231,17 @@ inline void encode_map_string_uint(std::vector<uint8_t>& dst,
   dst.push_back(WireUint);
   append_varint(dst, m.size());
   if (deterministic && m.size() > 1) {
-    std::vector<std::string_view> keys;
-    keys.reserve(m.size());
-    for (const auto& [k, _] : m) {
-      keys.emplace_back(k);
+    std::vector<std::pair<std::string_view, uint64_t>> entries;
+    entries.reserve(m.size());
+    for (const auto& [k, v] : m) {
+      entries.emplace_back(k, v);
     }
-    std::sort(keys.begin(), keys.end());
-    for (std::string_view k : keys) {
+    std::sort(entries.begin(), entries.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [k, v] : entries) {
       append_varint(dst, k.size());
       dst.insert(dst.end(), k.begin(), k.end());
-      append_varint(dst, m.find(std::string(k))->second);
+      append_varint(dst, v);
     }
   } else {
     for (const auto& [k, v] : m) {
@@ -772,14 +773,14 @@ class Encoder {
   }
 
   void begin_container() {
-    push_frame(buf_.size(), 0);
+    push_frame(buf_.size(), 0, FrameKind::Container);
     buf_.push_back(0);
     buf_.push_back(0);
   }
 
   void end_container() {
-    const auto [len_pos, _] = pop_frame();
-    backpatch_container_len(buf_, len_pos);
+    const auto frame = pop_frame(FrameKind::Container);
+    backpatch_container_len(buf_, frame.len_pos);
   }
 
   void begin_submsg(uint32_t field_num) {
@@ -791,7 +792,7 @@ class Encoder {
 
   void begin_submsg_arr(uint32_t field_num) {
     write_tag(field_num, WireArray);
-    push_frame(buf_.size(), 0);
+    push_frame(buf_.size(), 0, FrameKind::SubMsgArr);
     buf_.push_back(0);
     buf_.push_back(0);
     buf_.push_back(WireSubMsg);
@@ -806,9 +807,9 @@ class Encoder {
   void end_submsg_elem() { end_container(); }
 
   void end_submsg_arr() {
-    const auto [len_pos, count] = pop_frame();
-    patch_reserved_varint(buf_, len_pos + 3, count);
-    backpatch_container_len(buf_, len_pos);
+    const auto frame = pop_frame(FrameKind::SubMsgArr);
+    patch_reserved_varint(buf_, frame.len_pos + 3, frame.count);
+    backpatch_container_len(buf_, frame.len_pos);
   }
 
   void write_string_arr(uint32_t field_num, std::span<const std::string> items) {
@@ -834,23 +835,32 @@ class Encoder {
   }
 
  private:
+  enum class FrameKind : uint8_t {
+    Container,
+    SubMsgArr,
+  };
+
   struct Frame {
     size_t len_pos = 0;
     size_t count = 0;
+    FrameKind kind = FrameKind::Container;
   };
 
-  void push_frame(size_t len_pos, size_t count) {
+  void push_frame(size_t len_pos, size_t count, FrameKind kind) {
     if (depth_ < kInlineStackSize) {
       len_stack_[depth_] = len_pos;
       count_stack_[depth_] = count;
+      kind_stack_[depth_] = kind;
     } else {
       const size_t idx = depth_ - kInlineStackSize;
       if (idx < len_overflow_.size()) {
         len_overflow_[idx] = len_pos;
         count_overflow_[idx] = count;
+        kind_overflow_[idx] = kind;
       } else {
         len_overflow_.push_back(len_pos);
         count_overflow_.push_back(count);
+        kind_overflow_.push_back(kind);
       }
     }
     ++depth_;
@@ -862,6 +872,12 @@ class Encoder {
           "omnibuf: Encoder::begin_submsg_elem called without active array container");
     }
     const size_t parent = depth_ - 1;
+    const FrameKind parent_kind =
+        (parent < kInlineStackSize) ? kind_stack_[parent] : kind_overflow_[parent - kInlineStackSize];
+    if (parent_kind != FrameKind::SubMsgArr) [[unlikely]] {
+      throw std::logic_error(
+          "omnibuf: Encoder::begin_submsg_elem called without active array container");
+    }
     if (parent < kInlineStackSize) {
       ++count_stack_[parent];
     } else {
@@ -869,23 +885,33 @@ class Encoder {
     }
   }
 
-  Frame pop_frame() {
+  Frame pop_frame(FrameKind expected) {
     if (depth_ == 0) [[unlikely]] {
       throw std::logic_error("omnibuf: Encoder container stack underflow");
     }
-    --depth_;
+    const size_t top = depth_ - 1;
+    const FrameKind actual =
+        (top < kInlineStackSize) ? kind_stack_[top] : kind_overflow_[top - kInlineStackSize];
+    if (actual != expected) [[unlikely]] {
+      throw std::logic_error(expected == FrameKind::SubMsgArr
+                                 ? "omnibuf: Encoder::end_submsg_arr called on non-array container"
+                                 : "omnibuf: Encoder::end_container called on submsg array");
+    }
+    depth_ = top;
     if (depth_ < kInlineStackSize) {
-      return {len_stack_[depth_], count_stack_[depth_]};
+      return {len_stack_[depth_], count_stack_[depth_], actual};
     }
     const size_t idx = depth_ - kInlineStackSize;
-    return {len_overflow_[idx], count_overflow_[idx]};
+    return {len_overflow_[idx], count_overflow_[idx], actual};
   }
 
   std::vector<uint8_t> buf_;
   std::array<size_t, kInlineStackSize> len_stack_{};
   std::array<size_t, kInlineStackSize> count_stack_{};
+  std::array<FrameKind, kInlineStackSize> kind_stack_{};
   std::vector<size_t> len_overflow_;
   std::vector<size_t> count_overflow_;
+  std::vector<FrameKind> kind_overflow_;
   size_t depth_ = 0;
 };
 
