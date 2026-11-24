@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   omnibuf_cpp
-  VERSION 0.1.4
+  VERSION 0.1.5
   DESCRIPTION "Modern C++20 implementation of the OmniBuf wire format"
   LANGUAGES CXX
 )
