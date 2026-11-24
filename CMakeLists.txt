@@ -157,32 +157,31 @@ if(OMNIBUF_BUILD_TESTS)
     PRIVATE OMNIBUF_SCHEMAS_FDS_PATH="${OMNIBUF_SCHEMAS_FDS}"
   )
 
-  # Unit test suite
+  # Unit test suites
   enable_testing()
-  add_executable(omnibuf_tests tests/omnibuf_tests.cpp)
-  add_dependencies(omnibuf_tests omnibuf_codegen)
-  target_include_directories(omnibuf_tests PRIVATE "${OMNIBUF_GEN_DIR}")
-  target_link_libraries(omnibuf_tests PRIVATE omnibuf)
-  omnibuf_configure_internal_target(omnibuf_tests)
-  target_compile_definitions(
-    omnibuf_tests
-    PRIVATE OMNIBUF_SCHEMAS_FDS_PATH="${OMNIBUF_SCHEMAS_FDS}"
-  )
-  add_test(NAME omnibuf_tests COMMAND omnibuf_tests)
 
-  # Audit regression suite
-  add_executable(audit_regressions tests/audit_regressions.cpp)
-  add_dependencies(audit_regressions omnibuf_codegen protoc-gen-omnibuf-cpp)
-  target_include_directories(audit_regressions PRIVATE "${OMNIBUF_GEN_DIR}")
-  target_link_libraries(audit_regressions PRIVATE omnibuf)
-  omnibuf_configure_internal_target(audit_regressions)
+  function(omnibuf_add_unit_test target_name source_file)
+    add_executable(${target_name} "${source_file}")
+    add_dependencies(${target_name} omnibuf_codegen)
+    target_include_directories(${target_name} PRIVATE "${OMNIBUF_GEN_DIR}")
+    target_link_libraries(${target_name} PRIVATE omnibuf)
+    omnibuf_configure_internal_target(${target_name})
+    target_compile_definitions(
+      ${target_name}
+      PRIVATE OMNIBUF_SCHEMAS_FDS_PATH="${OMNIBUF_SCHEMAS_FDS}"
+    )
+    add_test(NAME ${target_name} COMMAND ${target_name})
+  endfunction()
+
+  omnibuf_add_unit_test(omnibuf_tests tests/omnibuf_tests.cpp)
+  omnibuf_add_unit_test(opaque_test tests/opaque_test.cpp)
+  omnibuf_add_unit_test(wire_and_traits_test tests/wire_and_traits_test.cpp)
+  omnibuf_add_unit_test(codegen_plugin_test tests/codegen_plugin_test.cpp)
+  add_dependencies(codegen_plugin_test protoc-gen-omnibuf-cpp)
   target_compile_definitions(
-    audit_regressions
-    PRIVATE
-      OMNIBUF_SCHEMAS_FDS_PATH="${OMNIBUF_SCHEMAS_FDS}"
-      OMNIBUF_PLUGIN_BIN="$<TARGET_FILE:protoc-gen-omnibuf-cpp>"
+    codegen_plugin_test
+    PRIVATE OMNIBUF_PLUGIN_BIN="$<TARGET_FILE:protoc-gen-omnibuf-cpp>"
   )
-  add_test(NAME audit_regressions COMMAND audit_regressions)
 
   # Reproducible PeerUpdate benchmark executable (always compiled with -O3 -DNDEBUG)
   add_executable(omnibuf_bench benchmarks/peer_bench.cpp)

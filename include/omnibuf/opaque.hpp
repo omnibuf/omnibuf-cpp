@@ -1488,12 +1488,14 @@ template <typename AppendDirtyFn, typename FieldNumT>
 // top-level truncated tags/lengths and invalid Field #0 blocks.
 namespace detail {
 
-template <bool DeepValidate, typename AppendDirtyFn>
-[[nodiscard]] inline Result<void> splice_fields_into_impl(std::vector<uint8_t>& dst,
-                                                          std::span<const uint8_t> raw,
-                                                          std::span<const uint64_t> dirty_words,
-                                                          uint32_t max_field,
-                                                          AppendDirtyFn&& append_dirty) {
+template <bool DeepValidate, bool FastSkip, bool SkipZeroBit, typename MapSlotFn,
+          typename AppendSlotFn>
+[[nodiscard]] inline Result<void> splice_fields_core(std::vector<uint8_t>& dst,
+                                                     std::span<const uint8_t> raw,
+                                                     std::span<const uint64_t> dirty_words,
+                                                     uint64_t slot_limit,
+                                                     MapSlotFn&& map_fnum_to_slot,
+                                                     AppendSlotFn&& append_dirty_slot) {
   const size_t orig_dst_size = dst.size();
   const size_t n = raw.size();
   std::vector<uint8_t> raw_copy;
@@ -1523,185 +1525,18 @@ template <bool DeepValidate, typename AppendDirtyFn>
     emitted = std::span<uint64_t>(heap_emitted);
   }
 
-  auto is_dirty = [&](uint32_t fnum) noexcept -> bool {
-    const size_t w = fnum >> 6;
-    return w < dirty_words.size() && ((dirty_words[w] >> (fnum & 63u)) & 1u) != 0;
+  auto is_dirty = [&](size_t slot) noexcept -> bool {
+    const size_t w = slot >> 6;
+    return w < dirty_words.size() && ((dirty_words[w] >> (slot & 63u)) & 1u) != 0;
   };
-  auto is_emitted = [&](uint32_t fnum) noexcept -> bool {
-    const size_t w = fnum >> 6;
-    return w < emitted.size() && ((emitted[w] >> (fnum & 63u)) & 1u) != 0;
+  auto is_emitted = [&](size_t slot) noexcept -> bool {
+    const size_t w = slot >> 6;
+    return w < emitted.size() && ((emitted[w] >> (slot & 63u)) & 1u) != 0;
   };
-  auto mark_emitted = [&](uint32_t fnum) noexcept {
-    const size_t w = fnum >> 6;
+  auto mark_emitted = [&](size_t slot) noexcept {
+    const size_t w = slot >> 6;
     if (w < emitted.size()) {
-      emitted[w] |= (uint64_t{1} << (fnum & 63u));
-    }
-  };
-
-  DecodeState val_state{};
-  size_t pos = 0;
-  size_t clean_start = 0;
-
-  while (pos < n) {
-    const size_t field_start = pos;
-    uint32_t fnum = 0;
-    uint8_t wt = 0;
-    const uint8_t b0 = raw[pos];
-    if ((b0 & 1u) != 0) {
-      fnum = static_cast<uint32_t>(b0 >> 5);
-      wt = static_cast<uint8_t>((b0 >> 1) & 0x0Fu);
-      ++pos;
-    } else if ((b0 & 2u) != 0 && pos + 2 <= n) {
-      const uint16_t u = static_cast<uint16_t>(read_u16_le(raw.data() + pos) >> 2);
-      fnum = static_cast<uint32_t>(u >> 4);
-      wt = static_cast<uint8_t>(u & 0x0Fu);
-      pos += 2;
-    } else {
-      const auto [tag, tn] = decode_varint(raw.subspan(pos));
-      if (tn == 0 || (tag >> 4) > MAX_FIELD_NUMBER) {
-        dst.resize(orig_dst_size);
-        return Error{"omnibuf: corrupt or truncated tag in splice_fields_into"};
-      }
-      fnum = static_cast<uint32_t>(tag >> 4);
-      wt = static_cast<uint8_t>(tag & 0x0Fu);
-      pos += tn;
-    }
-
-    if (fnum == 0) {
-      auto f0 = validate_field0(raw, pos, wt, 0, val_state);
-      if (!f0) {
-        dst.resize(orig_dst_size);
-        return Error{f0.error()};
-      }
-      pos = f0.value();
-    } else if constexpr (DeepValidate) {
-      auto vr = validate_value(raw, pos, wt, 0, val_state);
-      if (!vr) {
-        dst.resize(orig_dst_size);
-        return Error{vr.error()};
-      }
-      pos = vr.value();
-    } else {
-      const auto skip_res = skip_value_checked(raw, pos, wt);
-      if (!skip_res.ok) {
-        dst.resize(orig_dst_size);
-        return Error{"omnibuf: corrupt or truncated field payload in splice_fields_into"};
-      }
-      pos = skip_res.next_pos;
-    }
-    const size_t field_end = pos;
-
-    if (is_dirty(fnum)) {
-      if (clean_start < field_start) {
-        dst.insert(dst.end(), raw.begin() + static_cast<ptrdiff_t>(clean_start),
-                   raw.begin() + static_cast<ptrdiff_t>(field_start));
-      }
-      if (!is_emitted(fnum)) {
-        if constexpr (std::is_invocable_v<AppendDirtyFn&, std::vector<uint8_t>&, uint32_t>) {
-          if (const char* err = invoke_append_dirty(append_dirty, dst, fnum)) {
-            dst.resize(orig_dst_size);
-            return Error{err};
-          }
-        } else {
-          if (const char* err =
-                  invoke_append_dirty(append_dirty, dst, static_cast<uint16_t>(fnum))) {
-            dst.resize(orig_dst_size);
-            return Error{err};
-          }
-        }
-        mark_emitted(fnum);
-      }
-      clean_start = field_end;
-    } else {
-      mark_emitted(fnum);
-    }
-  }
-
-  if (clean_start < n) {
-    dst.insert(dst.end(), raw.begin() + static_cast<ptrdiff_t>(clean_start),
-               raw.begin() + static_cast<ptrdiff_t>(n));
-  }
-
-  for (size_t w = 0; w < dirty_words.size(); ++w) {
-    uint64_t rem = dirty_words[w] & ~emitted[w];
-    if (w == 0) {
-      rem &= ~uint64_t{1};
-    }
-    while (rem != 0) {
-      const int bit_idx = std::countr_zero(rem);
-      const uint32_t fnum = static_cast<uint32_t>((w << 6) + static_cast<size_t>(bit_idx));
-      if (fnum > max_field) {
-        break;
-      }
-      if constexpr (std::is_invocable_v<AppendDirtyFn&, std::vector<uint8_t>&, uint32_t>) {
-        if (const char* err = invoke_append_dirty(append_dirty, dst, fnum)) {
-          dst.resize(orig_dst_size);
-          return Error{err};
-        }
-      } else {
-        if (const char* err =
-                invoke_append_dirty(append_dirty, dst, static_cast<uint16_t>(fnum))) {
-          dst.resize(orig_dst_size);
-          return Error{err};
-        }
-      }
-      rem &= (rem - 1u);
-    }
-  }
-
-  return Result<void>::success();
-}
-
-// Ordinal-indexed zero-decode wire splicer used by generated Opaque<T> classes so dirty_
-// scales with dense field count (num_fields) rather than sparse maximum tag numbers.
-template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
-[[nodiscard]] inline Result<void> splice_fields_ordinal_into_impl(
-    std::vector<uint8_t>& dst,
-    std::span<const uint8_t> raw,
-    std::span<const uint64_t> dirty_words,
-    size_t num_fields,
-    MapOrdFn&& map_fnum_to_ord,
-    AppendOrdFn&& append_dirty_ord) {
-  const size_t orig_dst_size = dst.size();
-  const size_t n = raw.size();
-  std::vector<uint8_t> raw_copy;
-  if (n > 0 && dst.capacity() > 0) {
-    const uintptr_t dst_start = reinterpret_cast<uintptr_t>(dst.data());
-    const uintptr_t dst_end = dst_start + dst.capacity();
-    const uintptr_t raw_start = reinterpret_cast<uintptr_t>(raw.data());
-    const uintptr_t raw_end = raw_start + n;
-    if (dst_start < raw_end && raw_start < dst_end) {
-      raw_copy.assign(raw.begin(), raw.end());
-      raw = raw_copy;
-    }
-  }
-  if (n <= SIZE_MAX - 160 && dst.size() <= SIZE_MAX - (n + 160) &&
-      dst.capacity() < dst.size() + n + 160) {
-    dst.reserve(dst.size() + n + 160);
-  }
-
-  std::array<uint64_t, 4> inline_emitted{};
-  std::vector<uint64_t> heap_emitted;
-  std::span<uint64_t> emitted;
-  if (dirty_words.size() <= inline_emitted.size()) {
-    emitted = std::span<uint64_t>(inline_emitted.data(), dirty_words.size());
-  } else {
-    heap_emitted.assign(dirty_words.size(), 0);
-    emitted = std::span<uint64_t>(heap_emitted);
-  }
-
-  auto is_dirty_ord = [&](size_t ord) noexcept -> bool {
-    const size_t w = ord >> 6;
-    return w < dirty_words.size() && ((dirty_words[w] >> (ord & 63u)) & 1u) != 0;
-  };
-  auto is_emitted_ord = [&](size_t ord) noexcept -> bool {
-    const size_t w = ord >> 6;
-    return w < emitted.size() && ((emitted[w] >> (ord & 63u)) & 1u) != 0;
-  };
-  auto mark_emitted_ord = [&](size_t ord) noexcept {
-    const size_t w = ord >> 6;
-    if (w < emitted.size()) {
-      emitted[w] |= (uint64_t{1} << (ord & 63u));
+      emitted[w] |= (uint64_t{1} << (slot & 63u));
     }
   };
 
@@ -1735,7 +1570,7 @@ template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
     }
 
     if (fnum == 0) {
-      if constexpr (DeepValidate) {
+      if constexpr (DeepValidate || !FastSkip) {
         auto f0 = validate_field0(raw, pos, wt, 0, val_state);
         if (!f0) {
           dst.resize(orig_dst_size);
@@ -1762,7 +1597,8 @@ template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
       }
       pos = vr.value();
     } else {
-      const auto skip_res = fast_skip_value(raw, pos, wt);
+      const auto skip_res =
+          FastSkip ? fast_skip_value(raw, pos, wt) : skip_value_checked(raw, pos, wt);
       if (!skip_res.ok) {
         dst.resize(orig_dst_size);
         return Error{"omnibuf: corrupt or truncated field payload in splice_fields_into"};
@@ -1771,24 +1607,24 @@ template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
     }
     const size_t field_end = pos;
 
-    const int ord_i = map_fnum_to_ord(fnum);
-    if (ord_i >= 0) {
-      const size_t ord = static_cast<size_t>(ord_i);
-      if (is_dirty_ord(ord)) {
+    const int64_t slot_i = static_cast<int64_t>(map_fnum_to_slot(fnum));
+    if (slot_i >= 0) {
+      const size_t slot = static_cast<size_t>(slot_i);
+      if (is_dirty(slot)) {
         if (clean_start < field_start) {
           dst.insert(dst.end(), raw.begin() + static_cast<ptrdiff_t>(clean_start),
                      raw.begin() + static_cast<ptrdiff_t>(field_start));
         }
-        if (!is_emitted_ord(ord)) {
-          if (const char* err = invoke_append_dirty(append_dirty_ord, dst, ord)) {
+        if (!is_emitted(slot)) {
+          if (const char* err = invoke_append_dirty(append_dirty_slot, dst, slot)) {
             dst.resize(orig_dst_size);
             return Error{err};
           }
-          mark_emitted_ord(ord);
+          mark_emitted(slot);
         }
         clean_start = field_end;
       } else {
-        mark_emitted_ord(ord);
+        mark_emitted(slot);
       }
     }
   }
@@ -1800,13 +1636,19 @@ template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
 
   for (size_t w = 0; w < dirty_words.size(); ++w) {
     uint64_t rem = dirty_words[w] & ~emitted[w];
+    if constexpr (SkipZeroBit) {
+      if (w == 0) {
+        rem &= ~uint64_t{1};
+      }
+    }
     while (rem != 0) {
       const int bit_idx = std::countr_zero(rem);
-      const size_t ord = (w << 6) + static_cast<size_t>(bit_idx);
-      if (ord >= num_fields) {
+      const uint64_t slot = (static_cast<uint64_t>(w) << 6) + static_cast<uint64_t>(bit_idx);
+      if (slot >= slot_limit) {
         break;
       }
-      if (const char* err = invoke_append_dirty(append_dirty_ord, dst, ord)) {
+      if (const char* err =
+              invoke_append_dirty(append_dirty_slot, dst, static_cast<size_t>(slot))) {
         dst.resize(orig_dst_size);
         return Error{err};
       }
@@ -1815,6 +1657,40 @@ template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
   }
 
   return Result<void>::success();
+}
+
+template <bool DeepValidate, typename AppendDirtyFn>
+[[nodiscard]] inline Result<void> splice_fields_into_impl(std::vector<uint8_t>& dst,
+                                                          std::span<const uint8_t> raw,
+                                                          std::span<const uint64_t> dirty_words,
+                                                          uint32_t max_field,
+                                                          AppendDirtyFn&& append_dirty) {
+  auto append_fnum = [&](std::vector<uint8_t>& out, size_t slot) -> const char* {
+    const uint32_t fnum = static_cast<uint32_t>(slot);
+    if constexpr (std::is_invocable_v<AppendDirtyFn&, std::vector<uint8_t>&, uint32_t>) {
+      return invoke_append_dirty(append_dirty, out, fnum);
+    } else {
+      return invoke_append_dirty(append_dirty, out, static_cast<uint16_t>(fnum));
+    }
+  };
+  return splice_fields_core<DeepValidate, false, true>(
+      dst, raw, dirty_words, static_cast<uint64_t>(max_field) + 1u,
+      [](uint32_t fnum) noexcept -> int64_t { return static_cast<int64_t>(fnum); }, append_fnum);
+}
+
+// Ordinal-indexed zero-decode wire splicer used by generated Opaque<T> classes so dirty_
+// scales with dense field count (num_fields) rather than sparse maximum tag numbers.
+template <bool DeepValidate, typename MapOrdFn, typename AppendOrdFn>
+[[nodiscard]] inline Result<void> splice_fields_ordinal_into_impl(
+    std::vector<uint8_t>& dst,
+    std::span<const uint8_t> raw,
+    std::span<const uint64_t> dirty_words,
+    size_t num_fields,
+    MapOrdFn&& map_fnum_to_ord,
+    AppendOrdFn&& append_dirty_ord) {
+  return splice_fields_core<DeepValidate, true, false>(
+      dst, raw, dirty_words, static_cast<uint64_t>(num_fields),
+      std::forward<MapOrdFn>(map_fnum_to_ord), std::forward<AppendOrdFn>(append_dirty_ord));
 }
 
 }  // namespace detail

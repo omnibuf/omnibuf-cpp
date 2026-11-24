@@ -32,11 +32,5 @@ jobs:
           GOBIN="$HOME/.local/bin" mise exec -- go install github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Run full CI suite
+      - name: Run full CI suite (lint, proto, Release tests, ASan/UBSan tests, conformance)
         run: just ci
-
-      - name: Run ASan & UBSan unit test suite
-        run: |
-          cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DOMNIBUF_ENABLE_SANITIZERS=ON
-          cmake --build build-san --target omnibuf_tests audit_regressions protoc-gen-omnibuf-cpp -j
-          ctest --test-dir build-san --output-on-failure

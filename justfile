@@ -25,6 +25,12 @@ build: configure
 test: build
     ctest --test-dir build --output-on-failure
 
+# Build and run unit test suites with AddressSanitizer and UndefinedBehaviorSanitizer
+test-asan:
+    cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DOMNIBUF_ENABLE_SANITIZERS=ON
+    cmake --build build-san --target omnibuf_tests opaque_test wire_and_traits_test codegen_plugin_test protoc-gen-omnibuf-cpp -j
+    ctest --test-dir build-san --output-on-failure
+
 # Run the language-independent 758-case OmniBuf conformance suite across all 4 tiers
 conformance adapter="./build/conformance-cpp": build
     #!/usr/bin/env bash
@@ -55,4 +61,4 @@ lint:
     cmake --build build --clean-first -j
 
 # Full continuous integration gate
-ci: lint proto test conformance
+ci: lint proto test test-asan conformance
