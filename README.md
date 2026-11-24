@@ -50,6 +50,19 @@ PeerEvent decoded;
 auto status = omnibuf::unmarshal(encoded.value(), decoded);
 ```
 
+## gRPC C++
+
+Include the detached `omnibuf/grpc.hpp` header for `grpc_codec::serialize` / `deserialize` and an opt-in `grpc::SerializationTraits<T>` helper (activated automatically when `<grpcpp/support/serialization_traits.h>` is included first):
+
+```cpp
+#include <grpcpp/support/serialization_traits.h>
+#include "omnibuf/grpc.hpp"
+
+template <>
+struct grpc::SerializationTraits<PeerEvent>
+    : omnibuf::grpc_codec::SerializationTraitsHelper<PeerEvent> {};
+```
+
 ## Implementation
 
 - **Zero external dependencies:** Targets standard C++20 (`<bit>`, `<span>`, `<string_view>`, `<charconv>`, `<optional>`) on Clang and GCC.

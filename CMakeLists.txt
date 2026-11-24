@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   omnibuf_cpp
-  VERSION 0.1.5
+  VERSION 0.1.6
   DESCRIPTION "Modern C++20 implementation of the OmniBuf wire format"
   LANGUAGES CXX
 )
@@ -176,6 +176,8 @@ if(OMNIBUF_BUILD_TESTS)
   omnibuf_add_unit_test(omnibuf_tests tests/omnibuf_tests.cpp)
   omnibuf_add_unit_test(opaque_test tests/opaque_test.cpp)
   omnibuf_add_unit_test(wire_and_traits_test tests/wire_and_traits_test.cpp)
+  omnibuf_add_unit_test(grpc_codec_test tests/grpc_codec_test.cpp)
+  target_sources(grpc_codec_test PRIVATE tests/grpc_traits_mock.cpp)
   omnibuf_add_unit_test(codegen_plugin_test tests/codegen_plugin_test.cpp)
   add_dependencies(codegen_plugin_test protoc-gen-omnibuf-cpp)
   target_compile_definitions(
