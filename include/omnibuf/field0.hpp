@@ -348,7 +348,12 @@ inline void append_field0_schema_meta(std::vector<uint8_t>& dst, const SchemaMet
           return Error{"omnibuf: SchemaMeta children map trailing bytes"};
         }
         for (auto& [key_num, child_meta] : map_children) {
-          meta->children[key_num] = std::move(child_meta);
+          auto it = meta->children.find(key_num);
+          if (it != meta->children.end()) {
+            merge_schema_meta_in_place(it->second, std::move(child_meta));
+          } else {
+            meta->children.emplace(key_num, std::move(child_meta));
+          }
         }
         break;
       }

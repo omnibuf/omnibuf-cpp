@@ -34,9 +34,9 @@ class Result {
   [[nodiscard]] bool ok() const noexcept { return error_ == nullptr && value_.has_value(); }
   [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
 
-  [[nodiscard]] T& value() & { return *value_; }
-  [[nodiscard]] const T& value() const& { return *value_; }
-  [[nodiscard]] T&& value() && { return std::move(*value_); }
+  [[nodiscard]] T& value() & { return value_.value(); }
+  [[nodiscard]] const T& value() const& { return value_.value(); }
+  [[nodiscard]] T&& value() && { return std::move(value_).value(); }
 
   [[nodiscard]] const std::string& error() const noexcept {
     static const std::string kEmpty;

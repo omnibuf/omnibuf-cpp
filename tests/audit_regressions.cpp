@@ -1392,14 +1392,23 @@ void test_cpp22_rebind_pmr_unordered_map_exception_safety() {
 }
 
 // ---------------------------------------------------------------------------
-// CPP-23: Repeated Field #3 inside a single SchemaMeta uses replace-by-key
+// CPP-23: Repeated Field #3 inside a single SchemaMeta merges recursively
 // ---------------------------------------------------------------------------
-void test_cpp23_schema_meta_repeated_field3_replace_by_key() {
+void test_cpp23_schema_meta_repeated_field3_recursive_merge() {
   omnibuf::SchemaMeta c1;
+  c1.type_name = "pkg.Child";
   c1.fields[10] = "old_a";
   c1.fields[11] = "old_b";
+  auto gc1 = std::make_shared<omnibuf::SchemaMeta>();
+  gc1->fields[1] = "grand_a";
+  c1.children[20] = gc1;
+
   omnibuf::SchemaMeta c2;
   c2.fields[10] = "new_a";
+  c2.fields[12] = "new_c";
+  auto gc2 = std::make_shared<omnibuf::SchemaMeta>();
+  gc2->fields[2] = "grand_b";
+  c2.children[20] = gc2;
 
   std::vector<uint8_t> c1_body;
   omnibuf::append_schema_meta_body(c1_body, c1);
@@ -1427,9 +1436,109 @@ void test_cpp23_schema_meta_repeated_field3_replace_by_key() {
   const auto res = omnibuf::decode_schema_meta(single_meta_body);
   EXPECT_MSG(res.ok(), res.error().c_str());
   const auto& child = res.value()->children.at(1);
-  EXPECT(child->fields.size() == 1);
+  EXPECT(child->type_name == "pkg.Child");
+  EXPECT(child->fields.size() == 3);
   EXPECT(child->fields.at(10) == "new_a");
-  EXPECT(!child->fields.contains(11));
+  EXPECT(child->fields.at(11) == "old_b");
+  EXPECT(child->fields.at(12) == "new_c");
+  EXPECT(child->children.contains(20));
+  const auto& grandchild = child->children.at(20);
+  EXPECT(grandchild->fields.size() == 2);
+  EXPECT(grandchild->fields.at(1) == "grand_a");
+  EXPECT(grandchild->fields.at(2) == "grand_b");
+}
+
+// ---------------------------------------------------------------------------
+// CPP-24: Result<T>::value() throws std::bad_optional_access on error Result
+// ---------------------------------------------------------------------------
+void test_cpp24_result_value_throws_on_error() {
+  omnibuf::Result<int> err_lval(omnibuf::Error{"boom"});
+  EXPECT(!err_lval.ok());
+  bool threw_lval = false;
+  try {
+    (void)err_lval.value();
+  } catch (const std::bad_optional_access&) {
+    threw_lval = true;
+  }
+  EXPECT_MSG(threw_lval, "Result<T>::value() & did not throw on error");
+
+  const omnibuf::Result<int>& err_clval = err_lval;
+  bool threw_clval = false;
+  try {
+    (void)err_clval.value();
+  } catch (const std::bad_optional_access&) {
+    threw_clval = true;
+  }
+  EXPECT_MSG(threw_clval, "Result<T>::value() const& did not throw on error");
+
+  bool threw_rval = false;
+  try {
+    (void)omnibuf::Result<int>(omnibuf::Error{"boom_rval"}).value();
+  } catch (const std::bad_optional_access&) {
+    threw_rval = true;
+  }
+  EXPECT_MSG(threw_rval, "Result<T>::value() && did not throw on error");
+
+  omnibuf::Result<int> ok_val(42);
+  EXPECT(ok_val.ok());
+  EXPECT(ok_val.value() == 42);
+}
+
+// ---------------------------------------------------------------------------
+// CPP-25: read_uint_at / read_sint_at guard pos >= packet.size()
+// ---------------------------------------------------------------------------
+void test_cpp25_read_int_at_out_of_bounds() {
+  const std::vector<uint8_t> empty;
+  EXPECT(omnibuf::read_uint_at(empty, 0) == 0);
+  EXPECT(omnibuf::read_uint_at(empty, 1) == 0);
+  EXPECT(omnibuf::read_uint_at(empty, 1024) == 0);
+  EXPECT(omnibuf::read_sint_at(empty, 0) == 0);
+  EXPECT(omnibuf::read_sint_at(empty, 1) == 0);
+  EXPECT(omnibuf::read_sint_at(empty, 1024) == 0);
+
+  const std::vector<uint8_t> pkt = {0x0Bu};  // 1-byte varint 5
+  EXPECT(omnibuf::read_uint_at(pkt, 0) == 5);
+  EXPECT(omnibuf::read_uint_at(pkt, 1) == 0);
+  EXPECT(omnibuf::read_uint_at(pkt, 2) == 0);
+  EXPECT(omnibuf::read_uint_at(pkt, 999) == 0);
+  EXPECT(omnibuf::read_sint_at(pkt, 1) == 0);
+  EXPECT(omnibuf::read_sint_at(pkt, 2) == 0);
+  EXPECT(omnibuf::read_sint_at(pkt, 999) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// CPP-26: FastWriter destructor / rollback never allocate when vec shrunk
+// ---------------------------------------------------------------------------
+void test_cpp26_fast_writer_dtor_no_alloc_when_shrunk() {
+  std::vector<uint8_t> buf(16, 0xAAu);
+  {
+    omnibuf::FastWriter w(buf);
+    buf.clear();
+    buf.shrink_to_fit();
+#if OMNIBUF_TRACK_HEAP
+    g_fail_allocs.store(true, std::memory_order_relaxed);
+#endif
+    // Destructor must not resize upward (which would allocate and terminate noexcept).
+  }
+#if OMNIBUF_TRACK_HEAP
+  g_fail_allocs.store(false, std::memory_order_relaxed);
+#endif
+  EXPECT(buf.empty());
+
+  buf.assign(16, 0xBBu);
+  {
+    omnibuf::FastWriter w(buf);
+    buf.clear();
+    buf.shrink_to_fit();
+#if OMNIBUF_TRACK_HEAP
+    g_fail_allocs.store(true, std::memory_order_relaxed);
+#endif
+    w.rollback();
+#if OMNIBUF_TRACK_HEAP
+    g_fail_allocs.store(false, std::memory_order_relaxed);
+#endif
+  }
+  EXPECT(buf.empty());
 }
 
 }  // namespace
@@ -1455,7 +1564,10 @@ int main() {
   RUN_CASE(test_cpp20_read_submsg_validates_segments);
   RUN_CASE(test_cpp21_blind_container_shape_bounded);
   RUN_CASE(test_cpp22_rebind_pmr_unordered_map_exception_safety);
-  RUN_CASE(test_cpp23_schema_meta_repeated_field3_replace_by_key);
+  RUN_CASE(test_cpp23_schema_meta_repeated_field3_recursive_merge);
+  RUN_CASE(test_cpp24_result_value_throws_on_error);
+  RUN_CASE(test_cpp25_read_int_at_out_of_bounds);
+  RUN_CASE(test_cpp26_fast_writer_dtor_no_alloc_when_shrunk);
 
   std::printf("\nAudit Regression Summary: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

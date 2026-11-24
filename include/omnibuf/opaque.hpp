@@ -320,7 +320,10 @@ struct NextContainerResult {
 
 // Direct offset readers used by Opaque's lazy field-offset directory.
 [[nodiscard]] inline uint64_t read_uint_at(std::span<const uint8_t> packet, size_t pos) noexcept {
-  if (pos < packet.size() && (packet[pos] & 1u) != 0) [[likely]] {
+  if (pos >= packet.size()) [[unlikely]] {
+    return 0;
+  }
+  if ((packet[pos] & 1u) != 0) [[likely]] {
     return static_cast<uint64_t>(packet[pos] >> 1);
   }
   const auto [v, n] = decode_varint(packet.subspan(pos));
@@ -328,7 +331,10 @@ struct NextContainerResult {
 }
 
 [[nodiscard]] inline int64_t read_sint_at(std::span<const uint8_t> packet, size_t pos) noexcept {
-  if (pos < packet.size() && (packet[pos] & 1u) != 0) [[likely]] {
+  if (pos >= packet.size()) [[unlikely]] {
+    return 0;
+  }
+  if ((packet[pos] & 1u) != 0) [[likely]] {
     return decode_zigzag(static_cast<uint64_t>(packet[pos] >> 1));
   }
   const auto [v, n] = decode_varint(packet.subspan(pos));

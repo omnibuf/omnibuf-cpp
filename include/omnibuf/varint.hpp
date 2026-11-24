@@ -400,7 +400,7 @@ class FastWriter {
   FastWriter& operator=(const FastWriter&) = delete;
 
   ~FastWriter() noexcept {
-    if (!finished_ && vec_ != nullptr && vec_->size() != initial_size_) {
+    if (!finished_ && vec_ != nullptr && vec_->size() > initial_size_) {
       vec_->resize(initial_size_);
     }
   }
@@ -428,7 +428,7 @@ class FastWriter {
 
   void rollback() noexcept {
     if (!finished_ && vec_ != nullptr) {
-      if (vec_->size() != initial_size_) {
+      if (vec_->size() > initial_size_) {
         vec_->resize(initial_size_);
       }
       direct_mode_ = false;

@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #elif defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__)
 #include <immintrin.h>
@@ -20,7 +20,7 @@ namespace detail {
 [[nodiscard]] OMNIBUF_NOINLINE inline bool is_valid_utf8_long(const uint8_t* p,
                                                               size_t n) noexcept {
   if (n <= 64) {
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_NEON)
     if (n > 32) {
       const uint8x16_t v0 = vld1q_u8(p);
       const uint8x16_t v1 = vld1q_u8(p + 16);
@@ -54,7 +54,7 @@ namespace detail {
 
   size_t i = 0;
   while (i < n) {
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_NEON)
     while (i + 64 <= n) {
       const uint8x16_t v0 = vld1q_u8(p + i);
       const uint8x16_t v1 = vld1q_u8(p + i + 16);
