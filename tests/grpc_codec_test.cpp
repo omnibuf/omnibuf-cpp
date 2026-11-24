@@ -105,7 +105,8 @@ void test_decode_errors_and_limits() {
   auto bad = omnibuf::grpc_codec::deserialize<RpcPeerEvent>(malformed);
   EXPECT(!bad.ok());
 
-  RpcPeerEvent large_tags{.tags = {"a", "b", "c", "d"}};
+  RpcPeerEvent large_tags{};
+  large_tags.tags = {"a", "b", "c", "d"};
   auto encoded = omnibuf::grpc_codec::serialize(large_tags);
   EXPECT(encoded.ok());
 

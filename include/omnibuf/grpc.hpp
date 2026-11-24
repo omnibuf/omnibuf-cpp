@@ -1,8 +1,6 @@
 #pragma once
 
-// Detached opt-in gRPC codec helpers for OmniBuf.
-// Include this header directly (`#include "omnibuf/grpc.hpp"`). It is not
-// included by `omnibuf/omnibuf.hpp` and adds zero dependency on grpc++.
+// gRPC codec helpers for OmniBuf (`grpc::SerializationTraits`).
 
 #include <cstddef>
 #include <cstdint>
