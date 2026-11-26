@@ -1,4 +1,4 @@
-name: Release & Publish protoc-gen-omnibuf-cpp Binaries
+name: Release
 
 on:
   push:
