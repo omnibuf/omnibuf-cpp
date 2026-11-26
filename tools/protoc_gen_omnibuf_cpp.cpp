@@ -57,9 +57,16 @@ struct MessageRecord {
   bool is_proto2 = false;
 };
 
+struct EnumRecord {
+  std::string cpp_name;
+  const EnumDescriptorProto* desc = nullptr;
+  bool is_closed = false;
+};
+
 struct TypeCatalog {
   std::unordered_map<std::string, MapEntryInfo> map_entries;
   std::unordered_map<std::string, std::string> enum_cpp_names;
+  std::unordered_map<std::string, EnumRecord> enums;
   std::unordered_map<std::string, MessageRecord> messages;
 };
 
@@ -266,9 +273,14 @@ bool is_supported_field_type(FieldType t) {
 
 std::optional<std::string> validate_message_tree(const std::string& prefix,
                                                  const DescriptorProto& d,
-                                                 bool is_proto2) {
+                                                 bool is_proto2,
+                                                 bool is_edition,
+                                                 const TypeCatalog& catalog) {
   const std::string full = prefix.empty() ? d.name : (prefix + "." + d.name);
   if (d.has_extensions) {
+    if (is_edition) {
+      return "omnibuf: editions non-option extensions are not supported in message " + full;
+    }
     return "omnibuf: proto2 extensions are not supported in message " + full;
   }
   if (d.map_entry) {
@@ -289,6 +301,12 @@ std::optional<std::string> validate_message_tree(const std::string& prefix,
     }
     if (!is_supported_field_type(val_f->type)) {
       return "omnibuf: unsupported map value type in " + full;
+    }
+    if (is_edition && val_f->type == FieldType::Enum) {
+      auto eit = catalog.enums.find(trim_leading_dot(val_f->type_name));
+      if (eit != catalog.enums.end() && eit->second.is_closed) {
+        return "omnibuf: editions CLOSED enums are not supported in " + full;
+      }
     }
     return std::nullopt;
   }
@@ -319,22 +337,43 @@ std::optional<std::string> validate_message_tree(const std::string& prefix,
     if (is_proto2 && !f.default_value.empty()) {
       return "omnibuf: proto2 custom default values are not supported: " + ffull;
     }
+    if (is_edition) {
+      if (f.type == FieldType::Enum) {
+        auto eit = catalog.enums.find(trim_leading_dot(f.type_name));
+        if (eit != catalog.enums.end() && eit->second.is_closed) {
+          return "omnibuf: editions CLOSED enums are not supported: " + ffull;
+        }
+        if (!f.default_value.empty()) {
+          const EnumDescriptorProto* ed = (eit != catalog.enums.end()) ? eit->second.desc : nullptr;
+          if (!omnibuf::proto::is_zero_enum_default(f.default_value, ed)) {
+            return "omnibuf: editions custom default values are not supported: " + ffull;
+          }
+        }
+      } else if (!f.default_value.empty() && !omnibuf::proto::is_zero_scalar_default(f)) {
+        return "omnibuf: editions custom default values are not supported: " + ffull;
+      }
+    }
   }
   for (const auto& nested : d.nested_types) {
-    if (auto err = validate_message_tree(full, nested, is_proto2)) {
+    if (auto err = validate_message_tree(full, nested, is_proto2, is_edition, catalog)) {
       return err;
     }
   }
   return std::nullopt;
 }
 
-std::optional<std::string> validate_target_file(const FileDescriptorProto& file) {
+std::optional<std::string> validate_target_file(const FileDescriptorProto& file,
+                                                const TypeCatalog& catalog) {
+  const bool is_edition = (file.edition != 0);
   if (file.has_extensions) {
+    if (is_edition) {
+      return "omnibuf: editions non-option extensions are not supported in " + file.name;
+    }
     return "omnibuf: proto2 extensions are not supported in " + file.name;
   }
-  const bool is_proto2 = file.syntax.empty() || file.syntax == "proto2";
+  const bool is_proto2 = !is_edition && (file.syntax.empty() || file.syntax == "proto2");
   for (const auto& m : file.message_types) {
-    if (auto err = validate_message_tree(file.package, m, is_proto2)) {
+    if (auto err = validate_message_tree(file.package, m, is_proto2, is_edition, catalog)) {
       return err;
     }
   }
@@ -396,6 +435,11 @@ void index_descriptor_tree(const std::string& source_file,
     const std::string e_proto = full_proto + "." + e.name;
     const std::string e_cpp = cpp_qual + "::" + sanitize_basic_ident(e.name);
     catalog.enum_cpp_names[e_proto] = e_cpp;
+    catalog.enums[e_proto] = EnumRecord{
+        .cpp_name = e_cpp,
+        .desc = &e,
+        .is_closed = is_proto2 || e.is_closed,
+    };
   }
   for (const auto& nested : d.nested_types) {
     index_descriptor_tree(source_file, full_proto, cpp_ns_prefix, local_path, opaque_chain, nested,
@@ -407,13 +451,20 @@ TypeCatalog build_catalog(const CodeGeneratorRequest& req) {
   TypeCatalog catalog;
   for (const auto& file : req.proto_files) {
     const std::string cpp_ns = proto_package_to_cpp_ns(file.package);
-    const bool is_proto2 = file.syntax.empty() || file.syntax == "proto2";
+    const bool is_edition = (file.edition != 0);
+    const bool is_proto2 = !is_edition && (file.syntax.empty() || file.syntax == "proto2");
     for (const auto& e : file.enum_types) {
       const std::string e_proto =
           file.package.empty() ? e.name : (file.package + "." + e.name);
       const std::string e_ident = sanitize_basic_ident(e.name);
-      catalog.enum_cpp_names[e_proto] =
+      const std::string e_cpp =
           cpp_ns.empty() ? ("::" + e_ident) : ("::" + cpp_ns + "::" + e_ident);
+      catalog.enum_cpp_names[e_proto] = e_cpp;
+      catalog.enums[e_proto] = EnumRecord{
+          .cpp_name = e_cpp,
+          .desc = &e,
+          .is_closed = is_proto2 || e.is_closed,
+      };
     }
     for (const auto& m : file.message_types) {
       index_descriptor_tree(file.name, file.package, cpp_ns, "", "", m, is_proto2, catalog);
@@ -810,10 +861,11 @@ void emit_flat_leaf_ptr_range(std::ostringstream& out,
   for (size_t i = begin_idx; i < end_idx; ++i) {
     const auto& f = msg.fields[i];
     const bool is_opt = is_explicit_optional_scalar(f, is_proto2);
-    const std::string val_expr = is_opt ? ("(*" + plan.field_idents[i] + ")") : plan.field_idents[i];
+    const std::string member = "this->" + plan.field_idents[i];
+    const std::string val_expr = is_opt ? ("(*" + member + ")") : member;
     const std::string ind = is_opt ? (std::string(indent) + "  ") : std::string(indent);
     if (is_opt) {
-      out << indent << "if (" << plan.field_idents[i] << ".has_value()) {\n";
+      out << indent << "if (" << member << ".has_value()) {\n";
     }
     const uint64_t fnum = f.number;
     switch (f.type) {
@@ -1396,9 +1448,10 @@ void emit_struct_methods(std::ostringstream& out,
   for (const auto& ro : plan.real_oneofs) {
     out << "inline void " << qname << "::" << ro.clear_fn_name << "() {\n";
     for (size_t fi : ro.field_indices) {
-      emit_clear_single_member(out, msg.fields[fi], plan.field_idents[fi], false, catalog, "  ");
+      emit_clear_single_member(out, msg.fields[fi], "this->" + plan.field_idents[fi], false, catalog,
+                               "  ");
     }
-    out << "  " << ro.member_var << " = " << ro.enum_name << "::kNotSet;\n";
+    out << "  this->" << ro.member_var << " = " << ro.enum_name << "::kNotSet;\n";
     out << "}\n\n";
 
     for (size_t fi : ro.field_indices) {
@@ -1407,18 +1460,18 @@ void emit_struct_methods(std::ostringstream& out,
       if (f.type == FieldType::Message) {
         out << "inline void " << qname << "::set_" << f.name << "("
             << resolve_cpp_message(f.type_name, catalog) << " v) {\n";
-        out << "  if (" << ro.member_var << " != " << case_val << ") " << ro.clear_fn_name
-            << "();\n";
-        out << "  " << plan.field_idents[fi] << " = std::move(v);\n";
-        out << "  " << ro.member_var << " = " << case_val << ";\n";
+        out << "  if (this->" << ro.member_var << " != " << case_val << ") this->"
+            << ro.clear_fn_name << "();\n";
+        out << "  this->" << plan.field_idents[fi] << " = std::move(v);\n";
+        out << "  this->" << ro.member_var << " = " << case_val << ";\n";
         out << "}\n\n";
       } else {
         out << "inline void " << qname << "::set_" << f.name << "(" << scalar_cpp_type(f, catalog)
             << " v) {\n";
-        out << "  if (" << ro.member_var << " != " << case_val << ") " << ro.clear_fn_name
-            << "();\n";
-        out << "  " << plan.field_idents[fi] << " = std::move(v);\n";
-        out << "  " << ro.member_var << " = " << case_val << ";\n";
+        out << "  if (this->" << ro.member_var << " != " << case_val << ") this->"
+            << ro.clear_fn_name << "();\n";
+        out << "  this->" << plan.field_idents[fi] << " = std::move(v);\n";
+        out << "  this->" << ro.member_var << " = " << case_val << ";\n";
         out << "}\n\n";
       }
     }
@@ -1428,11 +1481,11 @@ void emit_struct_methods(std::ostringstream& out,
   out << "inline bool " << qname << "::operator==(const " << qname << "& rhs) const {\n";
   out << "  (void)rhs;\n";
   for (size_t i = 0; i < msg.fields.size(); ++i) {
-    out << "  if (!(" << plan.field_idents[i] << " == rhs." << plan.field_idents[i]
+    out << "  if (!(this->" << plan.field_idents[i] << " == rhs." << plan.field_idents[i]
         << ")) return false;\n";
   }
   for (const auto& ro : plan.real_oneofs) {
-    out << "  if (" << ro.member_var << " != rhs." << ro.member_var << ") return false;\n";
+    out << "  if (this->" << ro.member_var << " != rhs." << ro.member_var << ") return false;\n";
   }
   out << "  return true;\n";
   out << "}\n\n";
@@ -1442,10 +1495,10 @@ void emit_struct_methods(std::ostringstream& out,
   for (size_t i = 0; i < msg.fields.size(); ++i) {
     const auto& f = msg.fields[i];
     const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
-    emit_clear_single_member(out, f, plan.field_idents[i], is_opt_scalar, catalog, "  ");
+    emit_clear_single_member(out, f, "this->" + plan.field_idents[i], is_opt_scalar, catalog, "  ");
   }
   for (const auto& ro : plan.real_oneofs) {
-    out << "  " << ro.member_var << " = " << ro.enum_name << "::kNotSet;\n";
+    out << "  this->" << ro.member_var << " = " << ro.enum_name << "::kNotSet;\n";
   }
   out << "}\n\n";
 
@@ -1502,7 +1555,7 @@ void emit_struct_methods(std::ostringstream& out,
   out << "  meta->type_name = \"" << msg.name << "\";\n";
   for (size_t i = 0; i < msg.fields.size(); ++i) {
     const auto& f = msg.fields[i];
-    const std::string& ident = plan.field_idents[i];
+    const std::string ident = "this->" + plan.field_idents[i];
     out << "  meta->fields[" << f.number << "u] = \"" << f.name << "\";\n";
     if (f.type == FieldType::Message) {
       const std::string target = trim_leading_dot(f.type_name);
@@ -1525,7 +1578,7 @@ void emit_struct_methods(std::ostringstream& out,
       } else if (is_real_oneof_field(f)) {
         const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
         const std::string case_val = ro.enum_name + "::k" + to_pascal_case(f.name);
-        out << "    if (" << ro.member_var << " == " << case_val << " && " << ident
+        out << "    if (this->" << ro.member_var << " == " << case_val << " && " << ident
             << ".has_value()) {\n";
         out << "      if (auto c = " << ident
             << "->value_schema_meta(schema_depth + 2)) meta->children[" << f.number
@@ -1550,7 +1603,7 @@ void emit_struct_methods(std::ostringstream& out,
   out << "  size_t sz = 0u;\n";
   for (size_t i = 0; i < msg.fields.size(); ++i) {
     const auto& f = msg.fields[i];
-    const std::string& ident = plan.field_idents[i];
+    const std::string ident = "this->" + plan.field_idents[i];
     const bool is_repeated = (f.label == FieldLabel::Repeated);
     const bool is_opt_scalar = is_explicit_optional_scalar(f, rec.is_proto2);
     const bool is_oneof = is_real_oneof_field(f);
@@ -1559,7 +1612,7 @@ void emit_struct_methods(std::ostringstream& out,
     std::string ind = "  ";
     if (is_oneof) {
       const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
-      guard_open = "  if (" + ro.member_var + " == " + ro.enum_name + "::k" +
+      guard_open = "  if (this->" + ro.member_var + " == " + ro.enum_name + "::k" +
                    to_pascal_case(f.name) + ") {\n";
       guard_close = "  }\n";
       ind = "    ";
@@ -1654,10 +1707,10 @@ void emit_struct_methods(std::ostringstream& out,
       if (f.type == FieldType::String || f.type == FieldType::Bytes) {
         const bool is_opt = is_explicit_optional_scalar(f, rec.is_proto2);
         if (is_opt) {
-          leaf_var_size_exprs.push_back("(" + plan.field_idents[i] + ".has_value() ? " +
+          leaf_var_size_exprs.push_back("(this->" + plan.field_idents[i] + ".has_value() ? this->" +
                                         plan.field_idents[i] + "->size() : 0u)");
         } else {
-          leaf_var_size_exprs.push_back(plan.field_idents[i] + ".size()");
+          leaf_var_size_exprs.push_back("this->" + plan.field_idents[i] + ".size()");
         }
       }
     }
@@ -1701,10 +1754,10 @@ void emit_struct_methods(std::ostringstream& out,
         if (rf.type == FieldType::String || rf.type == FieldType::Bytes) {
           const bool is_opt = is_explicit_optional_scalar(rf, rec.is_proto2);
           if (is_opt) {
-            run_var_exprs.push_back("(" + plan.field_idents[j] + ".has_value() ? " +
+            run_var_exprs.push_back("(this->" + plan.field_idents[j] + ".has_value() ? this->" +
                                     plan.field_idents[j] + "->size() : 0u)");
           } else {
-            run_var_exprs.push_back(plan.field_idents[j] + ".size()");
+            run_var_exprs.push_back("this->" + plan.field_idents[j] + ".size()");
           }
         }
         ++j;
@@ -1724,8 +1777,8 @@ void emit_struct_methods(std::ostringstream& out,
         for (size_t k = i; k < j; ++k) {
           const auto& fk = msg.fields[k];
           const bool is_opt_k = is_explicit_optional_scalar(fk, rec.is_proto2);
-          emit_try_encode_field_fast(out, fk, plan.field_idents[k], is_opt_k, "", catalog, "w",
-                                     "depth", "check_large", "      ");
+          emit_try_encode_field_fast(out, fk, "this->" + plan.field_idents[k], is_opt_k, "",
+                                     catalog, "w", "depth", "check_large", "      ");
         }
         out << "    }\n";
         out << "  }\n";
@@ -1738,10 +1791,11 @@ void emit_struct_methods(std::ostringstream& out,
     std::string oneof_guard;
     if (is_real_oneof_field(f)) {
       const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
-      oneof_guard = ro.member_var + " == " + ro.enum_name + "::k" + to_pascal_case(f.name);
+      oneof_guard = "this->" + ro.member_var + " == " + ro.enum_name + "::k" +
+                    to_pascal_case(f.name);
     }
-    emit_try_encode_field_fast(out, f, plan.field_idents[i], is_opt_scalar, oneof_guard, catalog,
-                               "w", "depth", "check_large", "  ");
+    emit_try_encode_field_fast(out, f, "this->" + plan.field_idents[i], is_opt_scalar, oneof_guard,
+                               catalog, "w", "depth", "check_large", "  ");
     ++i;
   }
   out << "  return nullptr;\n";
@@ -1946,22 +2000,22 @@ void emit_struct_methods(std::ostringstream& out,
     if (!is_real_oneof_field(f)) return;
     const auto& ro = plan.real_oneofs[plan.oneof_idx_to_plan.at(*f.oneof_index)];
     const std::string case_val = ro.enum_name + "::k" + to_pascal_case(f.name);
-    out << ind << "if (" << ro.member_var << " != " << case_val << ") {\n";
+    out << ind << "if (this->" << ro.member_var << " != " << case_val << ") {\n";
     for (size_t sib_fi : ro.field_indices) {
       if (sib_fi == field_idx) continue;
-      emit_clear_single_member(out, msg.fields[sib_fi], plan.field_idents[sib_fi], false, catalog,
-                               std::string(ind) + "  ");
+      emit_clear_single_member(out, msg.fields[sib_fi], "this->" + plan.field_idents[sib_fi], false,
+                               catalog, std::string(ind) + "  ");
       const size_t sw = sib_fi >> 6;
       const uint64_t sb = uint64_t{1} << (sib_fi & 63u);
       out << ind << "  seen_words[" << sw << "] &= ~" << sb << "ULL;\n";
     }
-    out << ind << "  " << ro.member_var << " = " << case_val << ";\n";
+    out << ind << "  this->" << ro.member_var << " = " << case_val << ";\n";
     out << ind << "}\n";
   };
 
   for (size_t idx = 0; idx < msg.fields.size(); ++idx) {
     const auto& f = msg.fields[idx];
-    const std::string& ident = plan.field_idents[idx];
+    const std::string ident = "this->" + plan.field_idents[idx];
     const uint64_t fnum = f.number;
     const bool is_repeated = (f.label == FieldLabel::Repeated);
     const size_t word_idx = idx >> 6;
@@ -2304,7 +2358,8 @@ void emit_struct_methods(std::ostringstream& out,
       const size_t word_idx = idx >> 6;
       const uint64_t bit_mask = uint64_t{1} << (idx & 63u);
       out << "    if ((seen_words[" << word_idx << "] & " << bit_mask << "ULL) == 0) {\n";
-      emit_clear_single_member(out, f, plan.field_idents[idx], is_opt_scalar, catalog, "      ");
+      emit_clear_single_member(out, f, "this->" + plan.field_idents[idx], is_opt_scalar, catalog,
+                               "      ");
       out << "    }\n";
     }
     for (const auto& ro : plan.real_oneofs) {
@@ -2315,7 +2370,7 @@ void emit_struct_methods(std::ostringstream& out,
         out << "(seen_words[" << (fi >> 6) << "] & " << (uint64_t{1} << (fi & 63u)) << "ULL) == 0";
       }
       out << ") {\n";
-      out << "      " << ro.member_var << " = " << ro.enum_name << "::kNotSet;\n";
+      out << "      this->" << ro.member_var << " = " << ro.enum_name << "::kNotSet;\n";
       out << "    }\n";
     }
     out << "  }\n";
@@ -2903,7 +2958,16 @@ void emit_opaque_class(std::ostringstream& cls_out,
     if (is_opt_scalar) {
       cls_out << "  [[nodiscard]] ::omnibuf::Result<std::optional<" << cpp_t << ">> try_get_"
               << f.name << "() const {\n";
-      cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+      if (f.type == FieldType::String) {
+        cls_out << "    if (is_dirty_ord_(" << idx << "u)) {\n";
+        cls_out << "      if (" << heap_ref << ".has_value() && !::omnibuf::is_valid_utf8(*"
+                << heap_ref
+                << ")) return ::omnibuf::Error{\"omnibuf: invalid UTF-8 in WireString\"};\n";
+        cls_out << "      return " << heap_ref << ";\n";
+        cls_out << "    }\n";
+      } else {
+        cls_out << "    if (is_dirty_ord_(" << idx << "u)) return " << heap_ref << ";\n";
+      }
       cls_out << "    const uint8_t ds = ensure_dir_();\n";
       cls_out << "    if (ds == 3u) return ::omnibuf::Error{\"omnibuf: corrupt packet\"};\n";
       cls_out << "    if (ds == 2u) {\n";
@@ -3897,16 +3961,16 @@ int main() {
   const std::unordered_set<std::string> targets(req.files_to_generate.begin(),
                                                 req.files_to_generate.end());
 
+  const TypeCatalog catalog = build_catalog(req);
+
   for (const auto& file : req.proto_files) {
     if (!targets.contains(file.name)) continue;
-    if (auto err = validate_target_file(file)) {
+    if (auto err = validate_target_file(file, catalog)) {
       const auto err_bytes = omnibuf::proto::encode_code_generator_response({}, *err);
       (void)write_all_stdout(err_bytes);
       return 0;
     }
   }
-
-  const TypeCatalog catalog = build_catalog(req);
 
   std::unordered_map<std::string, const FileDescriptorProto*> files_by_name;
   for (const auto& file : req.proto_files) {

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   omnibuf_cpp
-  VERSION 0.1.6
+  VERSION 0.1.7
   DESCRIPTION "Modern C++20 implementation of the OmniBuf wire format"
   LANGUAGES CXX
 )
@@ -113,12 +113,18 @@ if(OMNIBUF_BUILD_TESTS)
   set(OMNIBUF_GEN_HEADERS
     "${OMNIBUF_GEN_DIR}/omnibuf/bench/peer.omnibuf.pb.hpp"
     "${OMNIBUF_GEN_DIR}/omnibuf/conformance/conformance.omnibuf.pb.hpp"
+    "${OMNIBUF_GEN_DIR}/omnibuf/conformance/editions_2023.omnibuf.pb.hpp"
+    "${OMNIBUF_GEN_DIR}/omnibuf/conformance/editions_2024.omnibuf.pb.hpp"
+    "${OMNIBUF_GEN_DIR}/omnibuf/conformance/editions_2026.omnibuf.pb.hpp"
     "${OMNIBUF_GEN_DIR}/omnibuf/test/edge.omnibuf.pb.hpp"
   )
   set(OMNIBUF_SCHEMAS_FDS "${OMNIBUF_GEN_DIR}/schemas.fds.pb")
   set(OMNIBUF_PROTO_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/proto/omnibuf/bench/peer.proto"
     "${CMAKE_CURRENT_SOURCE_DIR}/proto/omnibuf/conformance/conformance.proto"
+    "${CMAKE_CURRENT_SOURCE_DIR}/proto/omnibuf/conformance/editions_2023.proto"
+    "${CMAKE_CURRENT_SOURCE_DIR}/proto/omnibuf/conformance/editions_2024.proto"
+    "${CMAKE_CURRENT_SOURCE_DIR}/proto/omnibuf/conformance/editions_2026.proto"
     "${CMAKE_CURRENT_SOURCE_DIR}/proto/omnibuf/test/edge.proto"
   )
   set(OMNIBUF_CMAKE_BUF_GEN "${CMAKE_CURRENT_BINARY_DIR}/buf.gen.cmake.yaml")
@@ -185,6 +191,59 @@ if(OMNIBUF_BUILD_TESTS)
     PRIVATE OMNIBUF_PLUGIN_BIN="$<TARGET_FILE:protoc-gen-omnibuf-cpp>"
   )
 
+  # Protobuf Editions (2023, 2024, 2026) end-to-end codegen + runtime tests via protoc
+  find_program(OMNIBUF_PROTOC_EXECUTABLE NAMES protoc)
+  if(OMNIBUF_PROTOC_EXECUTABLE)
+    set(OMNIBUF_EDITIONS_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen_editions")
+    set(OMNIBUF_EDITIONS_FDS "${OMNIBUF_EDITIONS_GEN_DIR}/editions.fds.pb")
+    set(OMNIBUF_EDITIONS_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/testdata")
+    set(OMNIBUF_EDITIONS_PROTOS
+      "${OMNIBUF_EDITIONS_PROTO_DIR}/editions_2023.proto"
+      "${OMNIBUF_EDITIONS_PROTO_DIR}/editions_2023_implicit.proto"
+      "${OMNIBUF_EDITIONS_PROTO_DIR}/editions_2024.proto"
+      "${OMNIBUF_EDITIONS_PROTO_DIR}/editions_2026.proto"
+    )
+    set(OMNIBUF_EDITIONS_HEADERS
+      "${OMNIBUF_EDITIONS_GEN_DIR}/editions_2023.omnibuf.pb.hpp"
+      "${OMNIBUF_EDITIONS_GEN_DIR}/editions_2023_implicit.omnibuf.pb.hpp"
+      "${OMNIBUF_EDITIONS_GEN_DIR}/editions_2024.omnibuf.pb.hpp"
+      "${OMNIBUF_EDITIONS_GEN_DIR}/editions_2026.omnibuf.pb.hpp"
+    )
+    add_custom_command(
+      OUTPUT ${OMNIBUF_EDITIONS_HEADERS} "${OMNIBUF_EDITIONS_FDS}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${OMNIBUF_EDITIONS_GEN_DIR}"
+      COMMAND "${OMNIBUF_PROTOC_EXECUTABLE}"
+        "--plugin=protoc-gen-omnibuf-cpp=$<TARGET_FILE:protoc-gen-omnibuf-cpp>"
+        "--omnibuf-cpp_out=${OMNIBUF_EDITIONS_GEN_DIR}"
+        "--descriptor_set_out=${OMNIBUF_EDITIONS_FDS}"
+        "-I${OMNIBUF_EDITIONS_PROTO_DIR}"
+        ${OMNIBUF_EDITIONS_PROTOS}
+      DEPENDS
+        protoc-gen-omnibuf-cpp
+        ${OMNIBUF_EDITIONS_PROTOS}
+      COMMENT "Generating C++20 OmniBuf headers for Protobuf Editions 2023/2024/2026 with protoc"
+      VERBATIM
+    )
+    add_custom_target(
+      omnibuf_editions_codegen
+      DEPENDS ${OMNIBUF_EDITIONS_HEADERS} "${OMNIBUF_EDITIONS_FDS}"
+    )
+
+    add_executable(editions_e2e_test tests/editions_e2e_test.cpp)
+    add_dependencies(editions_e2e_test omnibuf_editions_codegen protoc-gen-omnibuf-cpp)
+    target_include_directories(editions_e2e_test PRIVATE "${OMNIBUF_EDITIONS_GEN_DIR}")
+    target_link_libraries(editions_e2e_test PRIVATE omnibuf)
+    omnibuf_configure_internal_target(editions_e2e_test)
+    target_compile_definitions(
+      editions_e2e_test
+      PRIVATE
+        OMNIBUF_EDITIONS_FDS_PATH="${OMNIBUF_EDITIONS_FDS}"
+        OMNIBUF_PLUGIN_BIN="$<TARGET_FILE:protoc-gen-omnibuf-cpp>"
+        OMNIBUF_PROTOC_BIN="${OMNIBUF_PROTOC_EXECUTABLE}"
+    )
+    add_test(NAME editions_e2e_test COMMAND editions_e2e_test)
+  endif()
+
   # Reproducible PeerUpdate benchmark executable (always compiled with -O3 -DNDEBUG)
   add_executable(omnibuf_bench benchmarks/peer_bench.cpp)
   add_dependencies(omnibuf_bench omnibuf_codegen)
@@ -200,7 +259,6 @@ if(OMNIBUF_BUILD_TESTS)
   # Optional real libprotobuf (google::protobuf::Message) benchmark peer when installed.
   # Keeps omnibuf::omnibuf strictly zero-dependency; only links into omnibuf_bench.
   find_package(protobuf CONFIG QUIET)
-  find_program(OMNIBUF_PROTOC_EXECUTABLE NAMES protoc)
   if(protobuf_FOUND AND OMNIBUF_PROTOC_EXECUTABLE)
     set(OMNIBUF_PB_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/pb_gen")
     set(OMNIBUF_PB_PROTO_IN "${OMNIBUF_PB_GEN_DIR}/libpb_peer.proto")

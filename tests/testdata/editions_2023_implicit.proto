@@ -1,0 +1,21 @@
+edition = "2023";
+
+package omnibuf.editions.e2023_imp;
+
+import "google/protobuf/descriptor.proto";
+
+option features.field_presence = IMPLICIT;
+
+extend google.protobuf.MessageOptions {
+  string note = 50123;
+}
+
+message ImplicitEnvelope {
+  option (note) = "custom-option-ok";
+
+  int32 implicit_i32 = 1;
+  string implicit_str = 2;
+  int32 explicit_i32 = 3 [features.field_presence = EXPLICIT];
+  bool explicit_bool = 4 [features.field_presence = EXPLICIT];
+  string explicit_str = 5 [features.field_presence = EXPLICIT];
+}

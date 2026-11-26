@@ -1,0 +1,67 @@
+edition = "2023";
+
+package omnibuf.editions.e2023;
+
+enum E23Status {
+  E23_STATUS_UNSPECIFIED = 0;
+  E23_STATUS_OK = 1;
+  E23_STATUS_FAILED = -2;
+}
+
+message Child {
+  int32 id = 1;
+  string note = 2;
+  bool active = 3;
+}
+
+message Envelope {
+  enum NestedKind {
+    NESTED_KIND_UNSPECIFIED = 0;
+    NESTED_KIND_ALPHA = 1;
+  }
+
+  message Detail {
+    option features.json_format = LEGACY_BEST_EFFORT;
+    string info = 1;
+  }
+
+  int32 opt_i32 = 1;
+  uint64 opt_u64 = 2;
+  double opt_f64 = 3;
+  bool opt_bool = 4;
+  string opt_str = 5;
+  bytes opt_bytes = 6;
+  E23Status opt_status = 7;
+
+  int32 zero_i32 = 8 [default = 0];
+  double zero_f64 = 9 [default = 0.0];
+  bool zero_bool = 10 [default = false];
+  string zero_str = 11 [default = ""];
+  bytes zero_bytes = 12 [default = ""];
+  E23Status zero_status = 13 [default = E23_STATUS_UNSPECIFIED];
+
+  int32 imp_i32 = 14 [features.field_presence = IMPLICIT];
+  bool imp_bool = 15 [features.field_presence = IMPLICIT];
+  string imp_str = 16 [features.field_presence = IMPLICIT];
+
+  repeated int32 packed_nums = 17 [features.repeated_field_encoding = PACKED];
+  repeated int32 expanded_nums = 18 [features.repeated_field_encoding = EXPANDED];
+  repeated string tags = 19;
+  repeated Child children_list = 20;
+  map<string, int32> scores = 21;
+  map<string, Child> children_map = 22;
+
+  Child regular_child = 23;
+  Child delimited_child = 24 [features.message_encoding = DELIMITED];
+  repeated Child delimited_list = 25 [features.message_encoding = DELIMITED];
+  Detail detail = 26;
+  NestedKind nested_kind = 32;
+
+  oneof choice {
+    int32 choice_num = 27;
+    bool choice_flag = 28;
+    string choice_text = 29;
+    Child choice_child = 30;
+    Child choice_delimited = 31 [features.message_encoding = DELIMITED];
+  }
+}

@@ -16,6 +16,9 @@
 
 #include "omnibuf/bench/peer.omnibuf.pb.hpp"
 #include "omnibuf/conformance/conformance.omnibuf.pb.hpp"
+#include "omnibuf/conformance/editions_2023.omnibuf.pb.hpp"
+#include "omnibuf/conformance/editions_2024.omnibuf.pb.hpp"
+#include "omnibuf/conformance/editions_2026.omnibuf.pb.hpp"
 #include "omnibuf/omnibuf.hpp"
 
 namespace ipc {
@@ -419,6 +422,90 @@ ipc::ConformanceResponse handle_blind(const ipc::ConformanceRequest& req) {
   return resp;
 }
 
+template <typename MsgT, typename ChildT, typename StatusT, typename OpaqueT>
+ipc::ConformanceResponse handle_editions_plugin(const ipc::ConformanceRequest& req,
+                                                StatusT stale_status,
+                                                std::string_view type_label) {
+  ipc::ConformanceResponse resp;
+
+  MsgT msg;
+  msg.explicit_int = 999;
+  msg.explicit_bool = true;
+  msg.explicit_string = "stale";
+  msg.explicit_bytes = {0xff};
+  msg.explicit_double = 99.5;
+  msg.status = stale_status;
+  msg.implicit_count = 999;
+  msg.implicit_flag = true;
+  msg.child = ChildT{.id = 999, .note = "stale"};
+  msg.delimited_child = ChildT{.id = 999, .note = "stale"};
+  msg.packed_vals = {999};
+  msg.expanded_vals = {999};
+  msg.scores = {{"stale", 999}};
+  msg.set_choice_text("stale");
+
+  auto dec = msg.unmarshal_omnibuf(req.omnibuf_payload);
+  if (!dec) {
+    resp.parse_error = dec.error();
+    return resp;
+  }
+
+  OpaqueT op;
+  op.unmarshal(req.omnibuf_payload);
+  const auto op_dbl = op.get_explicit_double();
+  const bool dbl_match =
+      (op_dbl.has_value() == msg.explicit_double.has_value()) &&
+      (!op_dbl.has_value() ||
+       omnibuf::float64_to_bits(*op_dbl) == omnibuf::float64_to_bits(*msg.explicit_double));
+
+  const ChildT want_child = msg.child.value_or(ChildT{});
+  const auto op_child = op.get_child();
+  const auto op_try_child = op.try_get_child();
+  const ChildT want_delim = msg.delimited_child.value_or(ChildT{});
+  const auto op_delim = op.get_delimited_child();
+  const auto op_try_delim = op.try_get_delimited_child();
+  const ChildT want_choice_child =
+      (msg.has_choice_child() && msg.choice_child.has_value()) ? *msg.choice_child : ChildT{};
+  const auto op_choice_child = op.get_choice_child();
+  const auto op_try_choice_child = op.try_get_choice_child();
+
+  if (op.get_explicit_int() != msg.explicit_int ||
+      op.get_explicit_bool() != msg.explicit_bool ||
+      op.get_explicit_string() != msg.explicit_string ||
+      op.get_explicit_bytes() != msg.explicit_bytes || !dbl_match ||
+      op.get_status() != msg.status || op.get_implicit_count() != msg.implicit_count ||
+      op.get_implicit_flag() != msg.implicit_flag || !op_try_child.ok() ||
+      op_try_child.value().has_value() != msg.child.has_value() ||
+      op_child.get_id() != want_child.id || op_child.get_note() != want_child.note ||
+      !op_try_delim.ok() ||
+      op_try_delim.value().has_value() != msg.delimited_child.has_value() ||
+      op_delim.get_id() != want_delim.id || op_delim.get_note() != want_delim.note ||
+      op.packed_vals_len() != msg.packed_vals.size() || op.get_packed_vals() != msg.packed_vals ||
+      op.expanded_vals_len() != msg.expanded_vals.size() ||
+      op.get_expanded_vals() != msg.expanded_vals || op.get_scores() != msg.scores ||
+      op.get_choice_int() != (msg.has_choice_int() ? msg.choice_int : 0) ||
+      op.get_choice_text() != (msg.has_choice_text() ? msg.choice_text : std::string{}) ||
+      op.get_choice_flag() != (msg.has_choice_flag() ? msg.choice_flag : false) ||
+      !op_try_choice_child.ok() ||
+      op_try_choice_child.value().has_value() !=
+          (msg.has_choice_child() && msg.choice_child.has_value()) ||
+      op_choice_child.get_id() != want_choice_child.id ||
+      op_choice_child.get_note() != want_choice_child.note) {
+    resp.parse_error =
+        "opaque " + std::string(type_label) + " getter mismatch with decoded struct";
+    return resp;
+  }
+
+  auto enc = msg.try_marshal_omnibuf(
+      {.deterministic = true, .self_describing = req.self_describing});
+  if (!enc) {
+    resp.serialize_error = enc.error();
+    return resp;
+  }
+  resp.omnibuf_payload = std::move(enc.value());
+  return resp;
+}
+
 ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) {
   ipc::ConformanceResponse resp;
 
@@ -756,6 +843,33 @@ ipc::ConformanceResponse handle_plugin_tier(const ipc::ConformanceRequest& req) 
     return resp;
   }
 
+  if (req.message_type == "omnibuf.conformance.TestEditions2023") {
+    return handle_editions_plugin<omnibuf::conformance::TestEditions2023,
+                                  omnibuf::conformance::Editions2023Child,
+                                  omnibuf::conformance::Editions2023Status,
+                                  omnibuf::conformance::OpaqueTestEditions2023>(
+        req, omnibuf::conformance::Editions2023Status::EDITIONS2023_STATUS_PAUSED,
+        "TestEditions2023");
+  }
+
+  if (req.message_type == "omnibuf.conformance.TestEditions2024") {
+    return handle_editions_plugin<omnibuf::conformance::TestEditions2024,
+                                  omnibuf::conformance::Editions2024Child,
+                                  omnibuf::conformance::Editions2024Status,
+                                  omnibuf::conformance::OpaqueTestEditions2024>(
+        req, omnibuf::conformance::Editions2024Status::EDITIONS2024_STATUS_PAUSED,
+        "TestEditions2024");
+  }
+
+  if (req.message_type == "omnibuf.conformance.TestEditions2026") {
+    return handle_editions_plugin<omnibuf::conformance::TestEditions2026,
+                                  omnibuf::conformance::Editions2026Child,
+                                  omnibuf::conformance::Editions2026Status,
+                                  omnibuf::conformance::OpaqueTestEditions2026>(
+        req, omnibuf::conformance::Editions2026Status::EDITIONS2026_STATUS_PAUSED,
+        "TestEditions2026");
+  }
+
   resp.skipped = "unsupported message_type in plugin tier: " + req.message_type;
   return resp;
 }
@@ -898,7 +1012,10 @@ bool load_descriptors(omnibuf::proto::DescriptorPool& pool, const char* argv0) {
   for (const auto& p : combined_candidates) {
     if (std::filesystem::exists(p) && pool.load_file(p.string()).ok()) {
       return pool.find_message("omnibuf.bench.PeerUpdate") != nullptr &&
-             pool.find_message("omnibuf.conformance.TestAllTypes") != nullptr;
+             pool.find_message("omnibuf.conformance.TestAllTypes") != nullptr &&
+             pool.find_message("omnibuf.conformance.TestEditions2023") != nullptr &&
+             pool.find_message("omnibuf.conformance.TestEditions2024") != nullptr &&
+             pool.find_message("omnibuf.conformance.TestEditions2026") != nullptr;
     }
   }
   return false;

@@ -1,0 +1,38 @@
+edition = "2024";
+
+package omnibuf.editions.e2024;
+
+option features.default_symbol_visibility = STRICT;
+option features.enforce_naming_style = STYLE2024;
+
+export enum E24State {
+  E24_STATE_UNSPECIFIED = 0;
+  E24_STATE_READY = 1;
+}
+
+local message LocalNote {
+  string text = 1;
+  int32 code = 2;
+}
+
+export message Edition2024Record {
+  int32 id = 1;
+  bool enabled = 2;
+  string label = 3;
+  bytes blob = 4;
+  E24State state = 5;
+  int32 implicit_metric = 6 [features.field_presence = IMPLICIT];
+
+  LocalNote note = 7 [features.message_encoding = DELIMITED];
+  repeated LocalNote notes = 8 [features.message_encoding = DELIMITED];
+  repeated int32 expanded_vals = 9 [features.repeated_field_encoding = EXPANDED];
+  map<string, int32> counters = 10;
+  map<string, LocalNote> by_key = 11;
+
+  oneof body {
+    int32 code = 12;
+    string msg = 13;
+    bool ok = 14;
+    LocalNote item = 15;
+  }
+}

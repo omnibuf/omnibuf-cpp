@@ -1,8 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -55,6 +59,26 @@ enum class FieldLabel : uint32_t {
   Repeated = 3,
 };
 
+struct EditionFeatures {
+  uint32_t presence = 0;                 // 1=EXPLICIT, 2=IMPLICIT, 3=LEGACY_REQUIRED
+  uint32_t enum_type = 0;                // 1=OPEN, 2=CLOSED
+  uint32_t repeated_field_encoding = 0;  // 1=PACKED, 2=EXPANDED
+  uint32_t utf8 = 0;                     // 2=VERIFY, 3=NONE
+  uint32_t message_encoding = 0;         // 1=LENGTH_PREFIXED, 2=DELIMITED
+  uint32_t json_format = 0;              // 1=ALLOW, 2=LEGACY_BEST_EFFORT
+
+  [[nodiscard]] EditionFeatures inherit(const EditionFeatures& own) const noexcept {
+    return {
+        own.presence ? own.presence : presence,
+        own.enum_type ? own.enum_type : enum_type,
+        own.repeated_field_encoding ? own.repeated_field_encoding : repeated_field_encoding,
+        own.utf8 ? own.utf8 : utf8,
+        own.message_encoding ? own.message_encoding : message_encoding,
+        own.json_format ? own.json_format : json_format,
+    };
+  }
+};
+
 struct FieldDescriptorProto {
   std::string name{};
   std::string extendee{};
@@ -67,6 +91,7 @@ struct FieldDescriptorProto {
   std::string json_name{};
   std::optional<uint32_t> oneof_index{};
   bool proto3_optional = false;
+  EditionFeatures features{};
 };
 
 struct EnumValueDescriptorProto {
@@ -77,10 +102,13 @@ struct EnumValueDescriptorProto {
 struct EnumDescriptorProto {
   std::string name{};
   std::vector<EnumValueDescriptorProto> values{};
+  EditionFeatures features{};
+  bool is_closed = false;
 };
 
 struct OneofDescriptorProto {
   std::string name{};
+  EditionFeatures features{};
 };
 
 struct DescriptorProto {
@@ -91,6 +119,7 @@ struct DescriptorProto {
   std::vector<OneofDescriptorProto> oneof_decls{};
   bool map_entry = false;
   bool has_extensions = false;
+  EditionFeatures features{};
 };
 
 struct FileDescriptorProto {
@@ -101,6 +130,8 @@ struct FileDescriptorProto {
   std::vector<EnumDescriptorProto> enum_types{};
   std::string syntax{};
   bool has_extensions = false;
+  EditionFeatures features{};
+  uint32_t edition = 0;
 };
 
 struct FileDescriptorSet {
@@ -192,6 +223,82 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
   out.insert(out.end(), s.begin(), s.end());
 }
 
+[[nodiscard]] inline bool is_protobuf_option_extendee(std::string_view extendee) noexcept {
+  if (!extendee.empty() && extendee.front() == '.') {
+    extendee.remove_prefix(1);
+  }
+  return extendee == "google.protobuf.FileOptions" ||
+         extendee == "google.protobuf.MessageOptions" ||
+         extendee == "google.protobuf.FieldOptions" ||
+         extendee == "google.protobuf.OneofOptions" ||
+         extendee == "google.protobuf.EnumOptions" ||
+         extendee == "google.protobuf.EnumValueOptions" ||
+         extendee == "google.protobuf.ExtensionRangeOptions" ||
+         extendee == "google.protobuf.ServiceOptions" ||
+         extendee == "google.protobuf.MethodOptions" ||
+         extendee == "google.protobuf.FeatureSet";
+}
+
+[[nodiscard]] inline Result<EditionFeatures> parse_features(std::span<const uint8_t> b,
+                                                            uint32_t option) {
+  EditionFeatures out;
+  size_t pos = 0;
+  while (pos < b.size()) {
+    auto tag = read_pb_varint(b, pos);
+    if (!tag) return Error{tag.error()};
+    pos = tag.value().next_pos;
+    if ((tag.value().val >> 3) == option && (tag.value().val & 7) == 2) {
+      auto sub = read_pb_bytes(b, pos);
+      if (!sub) return Error{sub.error()};
+      pos = sub.value().next_pos;
+      auto data = sub.value().slice;
+      size_t fp = 0;
+      while (fp < data.size()) {
+        auto ft = read_pb_varint(data, fp);
+        if (!ft) return Error{ft.error()};
+        fp = ft.value().next_pos;
+        if ((ft.value().val & 7) == 0) {
+          auto value = read_pb_varint(data, fp);
+          if (!value) return Error{value.error()};
+          fp = value.value().next_pos;
+          const auto v = static_cast<uint32_t>(value.value().val);
+          switch (ft.value().val >> 3) {
+            case 1:
+              out.presence = v;
+              break;
+            case 2:
+              out.enum_type = v;
+              break;
+            case 3:
+              out.repeated_field_encoding = v;
+              break;
+            case 4:
+              out.utf8 = v;
+              break;
+            case 5:
+              out.message_encoding = v;
+              break;
+            case 6:
+              out.json_format = v;
+              break;
+            default:
+              break;
+          }
+        } else {
+          auto skip = skip_pb_field(data, fp, static_cast<uint32_t>(ft.value().val & 7));
+          if (!skip) return Error{skip.error()};
+          fp = skip.value();
+        }
+      }
+    } else {
+      auto skip = skip_pb_field(b, pos, static_cast<uint32_t>(tag.value().val & 7));
+      if (!skip) return Error{skip.error()};
+      pos = skip.value();
+    }
+  }
+  return out;
+}
+
 [[nodiscard]] inline Result<FieldDescriptorProto> parse_field_descriptor(
     std::span<const uint8_t> b) {
   FieldDescriptorProto out;
@@ -202,6 +309,15 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
     pos = tag_res.value().next_pos;
     const uint32_t fnum = static_cast<uint32_t>(tag_res.value().val >> 3);
     const uint32_t wt = static_cast<uint32_t>(tag_res.value().val & 7u);
+    if (wt == 2 && fnum == 8) {
+      auto sub = read_pb_bytes(b, pos);
+      if (!sub) return Error{sub.error()};
+      pos = sub.value().next_pos;
+      auto features = parse_features(sub.value().slice, 21);
+      if (!features) return Error{features.error()};
+      out.features = out.features.inherit(features.value());
+      continue;
+    }
     if (wt == 2 && (fnum == 1 || fnum == 2 || fnum == 6 || fnum == 7 || fnum == 10)) {
       auto s_res = read_pb_bytes(b, pos);
       if (!s_res) return Error{s_res.error()};
@@ -255,6 +371,15 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
     pos = tag_res.value().next_pos;
     const uint32_t fnum = static_cast<uint32_t>(tag_res.value().val >> 3);
     const uint32_t wt = static_cast<uint32_t>(tag_res.value().val & 7u);
+    if (wt == 2 && fnum == 3) {
+      auto sub = read_pb_bytes(b, pos);
+      if (!sub) return Error{sub.error()};
+      pos = sub.value().next_pos;
+      auto features = parse_features(sub.value().slice, 7);
+      if (!features) return Error{features.error()};
+      out.features = out.features.inherit(features.value());
+      continue;
+    }
     if (wt == 2 && fnum == 1) {
       auto s_res = read_pb_bytes(b, pos);
       if (!s_res) return Error{s_res.error()};
@@ -334,6 +459,9 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
         if (!ed) return Error{ed.error()};
         out.enum_types.push_back(std::move(ed.value()));
       } else if (fnum == 7) {
+        auto features = parse_features(sp, 12);
+        if (!features) return Error{features.error()};
+        out.features = out.features.inherit(features.value());
         // MessageOptions: field #7 is bool map_entry
         size_t op = 0;
         while (op < sp.size()) {
@@ -362,7 +490,14 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
           op = ot.value().next_pos;
           const uint32_t ofn = static_cast<uint32_t>(ot.value().val >> 3);
           const uint32_t owt = static_cast<uint32_t>(ot.value().val & 7u);
-          if (owt == 2 && ofn == 1) {
+          if (owt == 2 && ofn == 2) {
+            auto sub = read_pb_bytes(sp, op);
+            if (!sub) return Error{sub.error()};
+            op = sub.value().next_pos;
+            auto features = parse_features(sub.value().slice, 1);
+            if (!features) return Error{features.error()};
+            od.features = od.features.inherit(features.value());
+          } else if (owt == 2 && ofn == 1) {
             auto os = read_pb_bytes(sp, op);
             if (!os) return Error{os.error()};
             op = os.value().next_pos;
@@ -375,6 +510,15 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
           }
         }
         out.oneof_decls.push_back(std::move(od));
+      }
+    } else if (wt == 2 && fnum == 6) {
+      auto s_res = read_pb_bytes(b, pos);
+      if (!s_res) return Error{s_res.error()};
+      pos = s_res.value().next_pos;
+      auto ext_fd = parse_field_descriptor(s_res.value().slice);
+      if (!ext_fd) return Error{ext_fd.error()};
+      if (!is_protobuf_option_extendee(ext_fd.value().extendee)) {
+        out.has_extensions = true;
       }
     } else {
       if (fnum == 5 || fnum == 6) {
@@ -390,6 +534,232 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
 
 }  // namespace detail
 
+[[nodiscard]] inline std::string_view trim_proto_leading_dot(std::string_view s) noexcept {
+  if (!s.empty() && s.front() == '.') {
+    s.remove_prefix(1);
+  }
+  return s;
+}
+
+[[nodiscard]] inline bool is_zero_float_default(std::string_view sv) noexcept {
+  if (sv.empty()) return true;
+  if (sv.back() == 'f' || sv.back() == 'F') {
+    sv.remove_suffix(1);
+  }
+  if (sv.empty()) return false;
+  if (sv.front() == '-') return false;
+  for (char c : sv) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isspace(uc) || c == 'x' || c == 'X') return false;
+  }
+  std::string tmp(sv);
+  char* end = nullptr;
+  errno = 0;
+  const double v = std::strtod(tmp.c_str(), &end);
+  if (errno != 0 || end != tmp.c_str() + tmp.size()) return false;
+  return v == 0.0 && !std::signbit(v);
+}
+
+[[nodiscard]] inline bool is_zero_scalar_default(const FieldDescriptorProto& f) noexcept {
+  if (f.default_value.empty()) return true;
+  switch (f.type) {
+    case FieldType::Bool:
+      return f.default_value == "false";
+    case FieldType::Int32:
+    case FieldType::Int64:
+    case FieldType::Uint32:
+    case FieldType::Uint64:
+    case FieldType::Sint32:
+    case FieldType::Sint64:
+    case FieldType::Fixed32:
+    case FieldType::Fixed64:
+    case FieldType::Sfixed32:
+    case FieldType::Sfixed64:
+      return f.default_value == "0";
+    case FieldType::Float:
+    case FieldType::Double:
+      return is_zero_float_default(f.default_value);
+    case FieldType::Enum:
+      return f.default_value == "0";
+    case FieldType::String:
+    case FieldType::Bytes:
+    case FieldType::Message:
+    default:
+      return false;
+  }
+}
+
+[[nodiscard]] inline bool is_zero_enum_default(std::string_view def_val,
+                                               const EnumDescriptorProto* enum_desc) noexcept {
+  if (def_val.empty() || def_val == "0") return true;
+  if (enum_desc == nullptr) return false;
+  for (const auto& ev : enum_desc->values) {
+    if (ev.name == def_val) {
+      return ev.number == 0;
+    }
+  }
+  return false;
+}
+
+namespace detail {
+
+inline void mark_message_enums_closed(DescriptorProto& msg) noexcept {
+  for (auto& e : msg.enum_types) {
+    e.is_closed = true;
+  }
+  for (auto& nested : msg.nested_types) {
+    mark_message_enums_closed(nested);
+  }
+}
+
+inline void collect_local_enums(const std::string& prefix,
+                                const DescriptorProto& msg,
+                                std::unordered_map<std::string, const EnumDescriptorProto*>& out) {
+  const std::string full = prefix.empty() ? msg.name : (prefix + "." + msg.name);
+  for (const auto& e : msg.enum_types) {
+    out[full + "." + e.name] = &e;
+  }
+  for (const auto& nested : msg.nested_types) {
+    collect_local_enums(full, nested, out);
+  }
+}
+
+inline Result<void> resolve_edition_message_impl(
+    DescriptorProto& msg,
+    EditionFeatures parent,
+    const std::string& scope_prefix,
+    const std::unordered_map<std::string, const EnumDescriptorProto*>& local_enums) {
+  if (msg.has_extensions) {
+    return Error{"omnibuf: editions non-option extensions are not supported"};
+  }
+  const std::string full = scope_prefix.empty() ? msg.name : (scope_prefix + "." + msg.name);
+  const auto features = parent.inherit(msg.features);
+  for (auto& e : msg.enum_types) {
+    if (features.inherit(e.features).enum_type != 1) {
+      e.is_closed = true;
+      return Error{"omnibuf: editions CLOSED enums are not supported"};
+    }
+    e.is_closed = false;
+  }
+  std::unordered_map<std::string, EditionFeatures> map_field_features;
+  for (auto& f : msg.fields) {
+    if (!f.extendee.empty() && !is_protobuf_option_extendee(f.extendee)) {
+      return Error{"omnibuf: editions non-option extensions are not supported"};
+    }
+    auto resolved = features;
+    if (f.oneof_index) {
+      if (*f.oneof_index >= msg.oneof_decls.size()) return Error{"omnibuf: invalid oneof index"};
+      resolved = resolved.inherit(msg.oneof_decls[*f.oneof_index].features);
+    }
+    resolved = resolved.inherit(f.features);
+    if (f.label == FieldLabel::Required) {
+      return Error{"omnibuf: editions LEGACY_REQUIRED is not supported"};
+    }
+    if (resolved.presence != 1 && resolved.presence != 2) {
+      return Error{"omnibuf: editions LEGACY_REQUIRED is not supported"};
+    }
+    if (resolved.repeated_field_encoding != 1 && resolved.repeated_field_encoding != 2) {
+      return Error{"omnibuf: unsupported editions repeated_field_encoding"};
+    }
+    if (resolved.message_encoding != 1 && resolved.message_encoding != 2) {
+      return Error{"omnibuf: unsupported editions message_encoding"};
+    }
+    if (resolved.json_format != 1 && resolved.json_format != 2) {
+      return Error{"omnibuf: unsupported editions json_format"};
+    }
+    if (f.type == FieldType::String && resolved.utf8 != 2) {
+      return Error{"omnibuf: editions UTF-8 NONE is not supported"};
+    }
+    if (f.type == FieldType::Group) f.type = FieldType::Message;
+    if (!f.default_value.empty()) {
+      if (f.type == FieldType::Enum) {
+        if (f.default_value != "0") {
+          const std::string target(trim_proto_leading_dot(f.type_name));
+          auto it = local_enums.find(target);
+          if (it != local_enums.end() && !is_zero_enum_default(f.default_value, it->second)) {
+            return Error{"omnibuf: editions custom default values are not supported"};
+          }
+        }
+      } else if (!is_zero_scalar_default(f)) {
+        return Error{"omnibuf: editions custom default values are not supported"};
+      }
+    }
+    if (!f.oneof_index && f.label != FieldLabel::Repeated && !msg.map_entry &&
+        f.type != FieldType::Message) {
+      f.proto3_optional = (resolved.presence == 1);
+    }
+    if (f.type == FieldType::Message && !f.type_name.empty()) {
+      map_field_features[std::string(trim_proto_leading_dot(f.type_name))] = resolved;
+    }
+  }
+  for (auto& nested : msg.nested_types) {
+    EditionFeatures nested_parent = features;
+    if (nested.map_entry) {
+      const std::string nested_full = full + "." + nested.name;
+      auto it = map_field_features.find(nested_full);
+      if (it == map_field_features.end()) {
+        it = map_field_features.find(nested.name);
+      }
+      if (it != map_field_features.end()) {
+        nested_parent = it->second;
+      }
+    }
+    auto result = resolve_edition_message_impl(nested, nested_parent, full, local_enums);
+    if (!result) return result;
+  }
+  return {};
+}
+
+}  // namespace detail
+
+inline Result<void> resolve_edition_message(DescriptorProto& msg, EditionFeatures parent) {
+  std::unordered_map<std::string, const EnumDescriptorProto*> local_enums;
+  detail::collect_local_enums("", msg, local_enums);
+  return detail::resolve_edition_message_impl(msg, parent, "", local_enums);
+}
+
+inline Result<void> resolve_edition_file(FileDescriptorProto& file) {
+  if (file.syntax != "editions") {
+    if (file.edition == 0 && (file.syntax.empty() || file.syntax == "proto2")) {
+      for (auto& e : file.enum_types) {
+        e.is_closed = true;
+      }
+      for (auto& msg : file.message_types) {
+        detail::mark_message_enums_closed(msg);
+      }
+    }
+    return {};
+  }
+  if (file.edition != 1000 && file.edition != 1001 && file.edition != 1002) {
+    return Error{"omnibuf: unsupported protobuf edition"};
+  }
+  if (file.has_extensions) {
+    return Error{"omnibuf: editions non-option extensions are not supported"};
+  }
+  // Edition 2023/2024/2026 runtime feature defaults:
+  // EXPLICIT(1), OPEN(1), PACKED(1), VERIFY(2), LENGTH_PREFIXED(1), ALLOW(1).
+  const auto features = EditionFeatures{1, 1, 1, 2, 1, 1}.inherit(file.features);
+  std::unordered_map<std::string, const EnumDescriptorProto*> local_enums;
+  for (auto& e : file.enum_types) {
+    if (features.inherit(e.features).enum_type != 1) {
+      e.is_closed = true;
+      return Error{"omnibuf: editions CLOSED enums are not supported"};
+    }
+    e.is_closed = false;
+    const std::string full = file.package.empty() ? e.name : (file.package + "." + e.name);
+    local_enums[full] = &e;
+  }
+  for (const auto& msg : file.message_types) {
+    detail::collect_local_enums(file.package, msg, local_enums);
+  }
+  for (auto& msg : file.message_types) {
+    auto result = detail::resolve_edition_message_impl(msg, features, file.package, local_enums);
+    if (!result) return result;
+  }
+  file.syntax = "proto3";
+  return {};
+}
+
 [[nodiscard]] inline Result<FileDescriptorProto> parse_file_descriptor_proto(
     std::span<const uint8_t> b) {
   FileDescriptorProto out;
@@ -400,6 +770,22 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
     pos = tag_res.value().next_pos;
     const uint32_t fnum = static_cast<uint32_t>(tag_res.value().val >> 3);
     const uint32_t wt = static_cast<uint32_t>(tag_res.value().val & 7u);
+    if (wt == 2 && fnum == 8) {
+      auto sub = detail::read_pb_bytes(b, pos);
+      if (!sub) return Error{sub.error()};
+      pos = sub.value().next_pos;
+      auto features = detail::parse_features(sub.value().slice, 50);
+      if (!features) return Error{features.error()};
+      out.features = out.features.inherit(features.value());
+      continue;
+    }
+    if (wt == 0 && fnum == 14) {
+      auto value = detail::read_pb_varint(b, pos);
+      if (!value) return Error{value.error()};
+      pos = value.value().next_pos;
+      out.edition = static_cast<uint32_t>(value.value().val);
+      continue;
+    }
     if (wt == 2 && (fnum == 1 || fnum == 2 || fnum == 3 || fnum == 4 || fnum == 5 || fnum == 12)) {
       auto s_res = detail::read_pb_bytes(b, pos);
       if (!s_res) return Error{s_res.error()};
@@ -422,6 +808,15 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
       } else if (fnum == 12) {
         out.syntax.assign(reinterpret_cast<const char*>(sp.data()), sp.size());
       }
+    } else if (wt == 2 && fnum == 7) {
+      auto s_res = detail::read_pb_bytes(b, pos);
+      if (!s_res) return Error{s_res.error()};
+      pos = s_res.value().next_pos;
+      auto ext_fd = detail::parse_field_descriptor(s_res.value().slice);
+      if (!ext_fd) return Error{ext_fd.error()};
+      if (!detail::is_protobuf_option_extendee(ext_fd.value().extendee)) {
+        out.has_extensions = true;
+      }
     } else {
       if (fnum == 7) {
         out.has_extensions = true;
@@ -431,6 +826,8 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
       pos = sk.value();
     }
   }
+  auto resolved = resolve_edition_file(out);
+  if (!resolved) return Error{resolved.error()};
   return out;
 }
 
@@ -497,13 +894,18 @@ inline void write_pb_string_field(std::vector<uint8_t>& out,
     std::span<const GeneratedFile> files,
     std::string_view error_msg = {}) {
   std::vector<uint8_t> out;
+  // Advertise FEATURE_PROTO3_OPTIONAL (1) | FEATURE_SUPPORTS_EDITIONS (2) = 3,
+  // covering EDITION_2023 (1000) through EDITION_2026 (1002).
+  detail::write_pb_varint(out, (2ULL << 3) | 0u);
+  detail::write_pb_varint(out, 3ULL);
+  detail::write_pb_varint(out, (3ULL << 3) | 0u);
+  detail::write_pb_varint(out, 1000ULL);
+  detail::write_pb_varint(out, (4ULL << 3) | 0u);
+  detail::write_pb_varint(out, 1002ULL);
   if (!error_msg.empty()) {
     detail::write_pb_string_field(out, 1, error_msg);
     return out;
   }
-  // supported_features = FEATURE_PROTO3_OPTIONAL (1), field #2, varint
-  detail::write_pb_varint(out, (2ULL << 3) | 0u);
-  detail::write_pb_varint(out, 1ULL);
 
   for (const auto& f : files) {
     std::vector<uint8_t> file_buf;
@@ -654,18 +1056,30 @@ class DynamicMessage {
 class DescriptorPool {
  public:
   Result<void> add_file_descriptor_set(const FileDescriptorSet& fds) {
+    FileDescriptorSet resolved_fds = fds;
+    for (auto& file : resolved_fds.files) {
+      auto rr = resolve_edition_file(file);
+      if (!rr) return rr;
+    }
+
     struct RawEntry {
       DescriptorProto proto;
       std::string syntax;
+      bool is_edition = false;
     };
     std::unordered_map<std::string, RawEntry> raw_map;
+    std::unordered_map<std::string, const EnumDescriptorProto*> enum_map;
 
     auto register_rec = [&](auto& self,
                             const std::string& prefix,
                             const DescriptorProto& d,
-                            const std::string& syntax) -> void {
+                            const std::string& syntax,
+                            bool is_edition) -> void {
       const std::string full = prefix.empty() ? d.name : (prefix + "." + d.name);
-      raw_map[full] = RawEntry{d, syntax};
+      raw_map[full] = RawEntry{d, syntax, is_edition};
+      for (const auto& e : d.enum_types) {
+        enum_map[full + "." + e.name] = &e;
+      }
       if (!d.map_entry && messages_.find(full) == messages_.end()) {
         auto md = std::make_unique<MessageDescriptor>();
         md->full_name = full;
@@ -673,19 +1087,24 @@ class DescriptorPool {
         messages_[full] = std::move(md);
       }
       for (const auto& nested : d.nested_types) {
-        self(self, full, nested, syntax);
+        self(self, full, nested, syntax, is_edition);
       }
     };
 
-    for (const auto& file : fds.files) {
+    for (const auto& file : resolved_fds.files) {
       if (file.has_extensions) {
         return Error{"omnibuf::proto: proto2 extensions are not supported"};
       }
       if (!is_valid_utf8(file.name) || !is_valid_utf8(file.package)) {
         return Error{"omnibuf::proto: invalid UTF-8 in file descriptor"};
       }
+      const bool is_edition = (file.edition != 0);
+      for (const auto& e : file.enum_types) {
+        const std::string e_full = file.package.empty() ? e.name : (file.package + "." + e.name);
+        enum_map[e_full] = &e;
+      }
       for (const auto& msg : file.message_types) {
-        register_rec(register_rec, file.package, msg, file.syntax);
+        register_rec(register_rec, file.package, msg, file.syntax, is_edition);
       }
     }
 
@@ -704,7 +1123,9 @@ class DescriptorPool {
       if (!is_valid_utf8(dp.name)) {
         return Error{"omnibuf::proto: invalid UTF-8 in message name"};
       }
-      const bool is_proto2 = (raw_it->second.syntax == "proto2" || raw_it->second.syntax.empty());
+      const bool is_edition = raw_it->second.is_edition;
+      const bool is_proto2 =
+          !is_edition && (raw_it->second.syntax == "proto2" || raw_it->second.syntax.empty());
 
       for (const auto& f : dp.fields) {
         if (!is_valid_utf8(f.name)) {
@@ -733,6 +1154,22 @@ class DescriptorPool {
         }
         if (is_proto2 && !f.default_value.empty()) {
           return Error{"omnibuf::proto: proto2 custom default values are not supported"};
+        }
+        if (is_edition) {
+          if (f.type == FieldType::Enum) {
+            auto eit = enum_map.find(clean_name(f.type_name));
+            if (eit != enum_map.end() && eit->second->is_closed) {
+              return Error{"omnibuf: editions CLOSED enums are not supported"};
+            }
+            if (!f.default_value.empty()) {
+              const EnumDescriptorProto* ed = (eit != enum_map.end()) ? eit->second : nullptr;
+              if (!is_zero_enum_default(f.default_value, ed)) {
+                return Error{"omnibuf: editions custom default values are not supported"};
+              }
+            }
+          } else if (!f.default_value.empty() && !is_zero_scalar_default(f)) {
+            return Error{"omnibuf: editions custom default values are not supported"};
+          }
         }
         FieldDesc fd;
         fd.number = f.number;
@@ -766,6 +1203,12 @@ class DescriptorPool {
               if (mf.number == 2 && mf.has_type) {
                 fd.map_val_type = mf.type;
                 has_v = true;
+                if (is_edition && mf.type == FieldType::Enum) {
+                  auto eit = enum_map.find(clean_name(mf.type_name));
+                  if (eit != enum_map.end() && eit->second->is_closed) {
+                    return Error{"omnibuf: editions CLOSED enums are not supported"};
+                  }
+                }
                 if (mf.type == FieldType::Message) {
                   auto vit = messages_.find(clean_name(mf.type_name));
                   if (vit == messages_.end()) {

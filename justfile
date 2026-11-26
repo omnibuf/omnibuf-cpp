@@ -28,7 +28,7 @@ test: build
 # Build and run unit test suites with AddressSanitizer and UndefinedBehaviorSanitizer
 test-asan:
     cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DOMNIBUF_ENABLE_SANITIZERS=ON
-    cmake --build build-san --target omnibuf_tests opaque_test wire_and_traits_test grpc_codec_test codegen_plugin_test protoc-gen-omnibuf-cpp -j
+    cmake --build build-san --target omnibuf_tests opaque_test wire_and_traits_test grpc_codec_test codegen_plugin_test editions_e2e_test protoc-gen-omnibuf-cpp -j
     ctest --test-dir build-san --output-on-failure
 
 # Run the language-independent 758-case OmniBuf conformance suite across all 4 tiers
@@ -42,7 +42,7 @@ conformance adapter="./build/conformance-cpp": build
     elif command -v conformance-runner >/dev/null 2>&1; then
         RUNNER="conformance-runner"
     elif command -v go >/dev/null 2>&1; then
-        exec go run github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab "{{adapter}}"
+        exec go run github.com/omnibuf/omnibuf-go/cmd/conformance-runner@v0.2.11 "{{adapter}}"
     else
         echo "conformance-runner binary not found; set CONFORMANCE_RUNNER or install conformance-runner" >&2
         exit 1
