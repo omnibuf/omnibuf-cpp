@@ -1,6 +1,9 @@
 # omnibuf-cpp
 
+[![CI](https://github.com/omnibuf/omnibuf-cpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/omnibuf/omnibuf-cpp/actions/workflows/ci.yml?query=branch%3Amain)
 [![OmniBuf Spec: v1 DRAFT-1](https://img.shields.io/badge/OmniBuf%20Spec-v1%20DRAFT--1-FF4F18)](https://omnibuf.com/spec)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
+[![Website](https://img.shields.io/badge/website-omnibuf.com-111111?style=flat&labelColor=111111&color=D4FF33)](https://omnibuf.com/cpp)
 
 Header-only C++20 library (`include/omnibuf/`) and `protoc-gen-omnibuf-cpp` code generator for [OmniBuf Wire Specification v1 DRAFT-1](https://omnibuf.com/spec). Full docs live at [omnibuf.com/cpp](https://omnibuf.com/cpp).
 
